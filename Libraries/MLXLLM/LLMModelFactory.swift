@@ -472,6 +472,7 @@ public final class LLMModelFactory: ModelFactory {
 
     public func _load(
         hub: HubApi, configuration: ModelConfiguration,
+        lazy: Bool,
         progressHandler: @Sendable @escaping (Progress) -> Void
     ) async throws -> ModelContext {
         // download weights and config
@@ -502,7 +503,8 @@ public final class LLMModelFactory: ModelFactory {
         // apply the weights to the bare model
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization)
+            perLayerQuantization: baseConfig.perLayerQuantization,
+            lazy: lazy)
 
         let tokenizer = try await loadTokenizer(configuration: configuration, hub: hub)
 

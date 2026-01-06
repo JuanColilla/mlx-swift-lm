@@ -85,6 +85,7 @@ public final class ChatSession {
     ///   - images: list of images (for use with VLMs)
     ///   - videos: list of videos (for use with VLMs)
     /// - Returns: the model's response
+    nonisolated(nonsending)
     public func respond(
         to prompt: String,
         images: [UserInput.Image],
@@ -136,6 +137,7 @@ public final class ChatSession {
     ///   - image: optional image (for use with VLMs)
     ///   - video: optional video (for use with VLMs)
     /// - Returns: the model's response
+    nonisolated(nonsending)
     public func respond(
         to prompt: String,
         image: UserInput.Image? = nil,
@@ -206,6 +208,7 @@ public final class ChatSession {
 
     // MARK: - Private
 
+    nonisolated(nonsending)
     private func performStreaming(
         continuation: AsyncThrowingStream<String, Error>.Continuation
     ) async throws {
@@ -244,3 +247,4 @@ public final class ChatSession {
         }
     }
 }
+

@@ -90,6 +90,7 @@ public protocol ModelFactory: Sendable {
 
     func _load(
         hub: HubApi, configuration: ModelConfiguration,
+        lazy: Bool,
         progressHandler: @Sendable @escaping (Progress) -> Void
     ) async throws -> sending ModelContext
 
@@ -139,9 +140,10 @@ extension ModelFactory {
     /// - ``loadModelContainer(hub:id:progressHandler:)``
     public func load(
         hub: HubApi = defaultHubApi, configuration: ModelConfiguration,
+        lazy: Bool = false,
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
     ) async throws -> sending ModelContext {
-        try await _load(hub: hub, configuration: configuration, progressHandler: progressHandler)
+        try await _load(hub: hub, configuration: configuration, lazy: lazy, progressHandler: progressHandler)
     }
 
     /// Load a model identified by a ``ModelConfiguration`` and produce a ``ModelContainer``.
@@ -158,7 +160,7 @@ extension ModelFactory {
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
     ) async throws -> ModelContainer {
         let context = try await _load(
-            hub: hub, configuration: configuration, progressHandler: progressHandler)
+            hub: hub, configuration: configuration, lazy: false, progressHandler: progressHandler)
         return ModelContainer(context: context)
     }
 

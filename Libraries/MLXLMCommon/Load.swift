@@ -64,7 +64,8 @@ public func downloadModel(
 public func loadWeights(
     modelDirectory: URL, model: LanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
-    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    lazy: Bool = false
 ) throws {
     // load the weights
     var weights = [String: MLXArray]()
@@ -101,5 +102,7 @@ public func loadWeights(
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.all])
 
-    eval(model)
+    if !lazy {
+        eval(model)
+    }
 }
