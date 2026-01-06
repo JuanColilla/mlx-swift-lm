@@ -217,3 +217,10 @@ extension LanguageModel where Self: KVCacheDimensionProvider {
         }
     }
 }
+
+/// expose common protocol for transformers so that model layers can be parallelized
+public protocol TransformerLayer: Module {
+    func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray
+}

@@ -259,7 +259,7 @@ class LFM2MLP: Module, UnaryLayer {
     }
 }
 
-class LFM2DecoderLayer: Module {
+class LFM2DecoderLayer: Module, TransformerLayer {
     let isAttentionLayer: Bool
 
     @ModuleInfo(key: "self_attn") var attention: LFM2Attention?
@@ -308,7 +308,7 @@ public class LFM2ModelInner: Module {
     let vocabularySize: Int
     let numHiddenLayers: Int
 
-    fileprivate let layers: [LFM2DecoderLayer]
+    public var layers: [TransformerLayer]
 
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo(key: "embedding_norm") var embeddingNorm: RMSNorm

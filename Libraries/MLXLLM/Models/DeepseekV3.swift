@@ -418,7 +418,7 @@ class DeepseekV3MoE: Module, UnaryLayer {
     }
 }
 
-class DeepseekV3DecoderLayer: Module {
+class DeepseekV3DecoderLayer: Module, TransformerLayer {
     @ModuleInfo(key: "self_attn") var selfAttn: DeepseekV3Attention
     var mlp: UnaryLayer
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
@@ -456,10 +456,10 @@ public class DeepseekV3ModelInner: Module {
     var config: DeepseekV3Configuration
     var vocabSize: Int
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
-    var layers: [DeepseekV3DecoderLayer]
+    public var layers: [TransformerLayer]
     var startIdx: Int
-    var endIdx: Int
-    var numLayers: Int
+    public var endIdx: Int
+    public var numLayers: Int
     @ModuleInfo(key: "norm") var norm: RMSNorm
     var pipelineRank: Int
     var pipelineSize: Int

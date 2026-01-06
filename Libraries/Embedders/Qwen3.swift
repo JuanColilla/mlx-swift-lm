@@ -108,7 +108,7 @@ private class MLP: Module, UnaryLayer {
     }
 }
 
-private class TransformerBlock: Module {
+private class TransformerBlock: Module, TransformerLayer {
     @ModuleInfo(key: "self_attn") var attention: Attention
     let mlp: MLP
 

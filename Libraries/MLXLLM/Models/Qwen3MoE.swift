@@ -151,7 +151,7 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
     }
 }
 
-class Qwen3MoeDecoderLayer: Module {
+class Qwen3MoeDecoderLayer: Module, TransformerLayer {
     let args: Qwen3MoEConfiguration
     let layerIdx: Int
 
@@ -194,7 +194,7 @@ class Qwen3MoeDecoderLayer: Module {
 public class Qwen3MoEModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    fileprivate let layers: [Qwen3MoeDecoderLayer]
+    public let layers: [TransformerLayer]
     let norm: RMSNorm
     let args: Qwen3MoEConfiguration
 
