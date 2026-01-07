@@ -194,7 +194,7 @@ class Qwen3MoeDecoderLayer: Module, TransformerLayer {
 public class Qwen3MoEModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    public let layers: [TransformerLayer]
+    public var layers: [TransformerLayer]
     let norm: RMSNorm
     let args: Qwen3MoEConfiguration
 

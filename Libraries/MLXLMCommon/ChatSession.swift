@@ -26,7 +26,7 @@ public final class ChatSession {
     }
 
     private let model: Model
-    private var messages: [Chat.Message]
+    public var messages: [Chat.Message] // expose for synchronization
     private var cache: [KVCache]
     private let processing: UserInput.Processing
     private let generateParameters: GenerateParameters
