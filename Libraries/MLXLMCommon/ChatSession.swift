@@ -31,6 +31,7 @@ public final class ChatSession {
     private let processing: UserInput.Processing
     private let generateParameters: GenerateParameters
     private let additionalContext: [String: any Sendable]?
+    public private(set) var lastGenerationInfo: GenerateCompletionInfo?
 
     /// Initialize the `ChatSession`.
     ///
@@ -108,6 +109,9 @@ public final class ChatSession {
             ) {
                 if let chunk = generation.chunk {
                     output += chunk
+                }
+                else if let info = generation.info {
+                    lastGenerationInfo = info
                 }
             }
 
@@ -228,6 +232,9 @@ public final class ChatSession {
                 if let chunk = item.chunk {
                     fullResponse += chunk
                     continuation.yield(chunk)
+                }
+                else if let info = item.info {
+                    lastGenerationInfo = info
                 }
             }
 

@@ -358,6 +358,7 @@ public class LFM2Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public let model: LFM2ModelInner
     let configuration: LFM2Configuration
+    public var shardOffset: Int = 0
 
     public init(_ args: LFM2Configuration) {
         self.configuration = args
@@ -395,7 +396,7 @@ public class LFM2Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         (0 ..< configuration.hiddenLayers).map { layerIdx in
-            if configuration.fullAttnIdxs.contains(layerIdx) {
+            if configuration.fullAttnIdxs.contains(layerIdx+shardOffset) {
                 KVCacheSimple()
             } else {
                 MambaCache()
