@@ -81,7 +81,7 @@ public protocol KVCache: Evaluatable {
 /// if let quantizedCache = cache as? QuantizedKVCacheProtocol {
 ///     let (qKeys, qValues) = quantizedCache.updateQuantized(keys: k, values: v)
 ///     // Use native quantized operations
-///     let scores = quantizedMatmul(queries, w: qKeys.0, scales: qKeys.1, biases: qKeys.2, ...)
+///     let scores = quantizedMM(queries, w: qKeys.0, scales: qKeys.1, biases: qKeys.2, ...)
 /// } else {
 ///     // Regular path
 ///     let (k, v) = cache.update(keys: k, values: v)
@@ -193,6 +193,31 @@ public func createCausalMask(
     }
 
     return mask
+}
+
+/// Create an attention mask matching mlx-lm's create_attention_mask helper.
+///
+/// This returns `.causal` when a symbolic mask is sufficient, avoiding
+/// materializing a full mask array.
+public func makeAttentionMask(
+    n: Int,
+    cache: KVCache?,
+    windowSize: Int? = nil,
+    returnArray: Bool = false
+) -> MLXFast.ScaledDotProductAttentionMaskMode {
+    if let cache {
+        return cache.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+    }
+
+    if n == 1 {
+        return .none
+    }
+
+    if returnArray || (windowSize != nil && n > windowSize!) {
+        return .array(createCausalMask(n: n, offset: 0, windowSize: windowSize))
+    }
+
+    return .causal
 }
 
 /// Create an attention mask using the parameters from the KVCache.
@@ -1466,7 +1491,7 @@ public func quantizedScaledDotProductAttention(
     }
 
     // Compute attention scores using quantized matmul
-    var scores = quantizedMatmul(
+    var scores = quantizedMM(
         scaledQueries, qKeys.0, scales: qKeys.1, biases: qKeys.2,
         transpose: true, groupSize: groupSize, bits: bits,
         mode: mode
@@ -1506,7 +1531,7 @@ public func quantizedScaledDotProductAttention(
     let attentionWeights = softmax(scores, axis: -1)
 
     // Compute output using quantized matmul
-    var output = quantizedMatmul(
+    var output = quantizedMM(
         attentionWeights, qValues.0, scales: qValues.1, biases: qValues.2,
         transpose: false, groupSize: groupSize, bits: bits,
         mode: mode
