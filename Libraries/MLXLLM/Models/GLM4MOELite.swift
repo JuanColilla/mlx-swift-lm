@@ -568,6 +568,16 @@ public class GLM4MoELiteModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 }
 
+public struct GLM4MoELiteRopeParameters: Codable, Sendable {
+    var ropeTheta: Float
+    var partialRotaryFactor: Float?
+
+    enum CodingKeys: String, CodingKey  {
+        case ropeTheta = "rope_theta"
+        case partialRotaryFactor = "partial_rotary_factor"
+    }
+}
+
 public struct GLM4MoELiteConfiguration: Codable, Sendable {
     var modelType: String
     var vocabularySize: Int
@@ -603,6 +613,7 @@ public struct GLM4MoELiteConfiguration: Codable, Sendable {
     var partialRotaryFactor: Float
     var tieWordEmbeddings: Bool
     var numNextnPredictLayers: Int
+    var ropeParameters: GLM4MoELiteRopeParameters?
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -639,6 +650,7 @@ public struct GLM4MoELiteConfiguration: Codable, Sendable {
         case partialRotaryFactor = "partial_rotary_factor"
         case tieWordEmbeddings = "tie_word_embeddings"
         case numNextnPredictLayers = "num_nextn_predict_layers"
+        case ropeParameters = "rope_parameters"
     }
 
     public init(from decoder: Decoder) throws {
@@ -677,7 +689,19 @@ public struct GLM4MoELiteConfiguration: Codable, Sendable {
             try container.decodeIfPresent(Int.self, forKey: .firstKDenseReplace) ?? 1
         self.maxPositionEmbeddings = try container.decode(Int.self, forKey: .maxPositionEmbeddings)
         self.rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
-        self.ropeTheta = try container.decode(Float.self, forKey: .ropeTheta)
+        if let ropeParameters = try container.decodeIfPresent(
+            GLM4MoELiteRopeParameters.self,
+            forKey: .ropeParameters
+        ) {
+            self.ropeParameters = ropeParameters
+            self.ropeTheta = ropeParameters.ropeTheta
+            self.partialRotaryFactor = ropeParameters.partialRotaryFactor ?? 1.0
+        } else {
+            self.ropeTheta = try container.decode(Float.self, forKey: .ropeTheta)
+            self.partialRotaryFactor =
+            try container.decodeIfPresent(Float.self, forKey: .partialRotaryFactor) ?? 1.0
+        }
+
         self.ropeScaling = try container.decodeIfPresent(
             [String: StringOrNumber].self, forKey: .ropeScaling)
         self.ropeTraditional =
@@ -685,8 +709,6 @@ public struct GLM4MoELiteConfiguration: Codable, Sendable {
         self.attentionBias = try container.decode(Bool.self, forKey: .attentionBias)
         self.attentionDropout =
             try container.decodeIfPresent(Float.self, forKey: .attentionDropout) ?? 0.0
-        self.partialRotaryFactor =
-            try container.decodeIfPresent(Float.self, forKey: .partialRotaryFactor) ?? 1.0
         self.tieWordEmbeddings =
             try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings)
             ?? false
