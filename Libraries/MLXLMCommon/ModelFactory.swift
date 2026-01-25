@@ -95,7 +95,7 @@ public protocol ModelFactory: Sendable {
         hub: HubApi, configuration: ModelConfiguration,
         lazy: Bool,
         progressHandler: @Sendable @escaping (Progress) -> Void
-    ) async throws -> sending ModelContext
+    ) async throws -> ModelContext
 
     func _loadContainer(
         hub: HubApi, configuration: ModelConfiguration,
