@@ -281,7 +281,7 @@ class GLM4MoELiteMoE: Module, UnaryLayer {
     }
 }
 
-class GLM4MoELiteDecoderLayer: Module {
+class GLM4MoELiteDecoderLayer: Module, TransformerLayer {
     @ModuleInfo(key: "self_attn") var attention: GLM4MoELiteAttention
     let mlp: UnaryLayer
 
@@ -319,7 +319,7 @@ class GLM4MoELiteDecoderLayer: Module {
 public class GLM4MoELiteModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    let layers: [GLM4MoELiteDecoderLayer]
+    public var layers: [TransformerLayer]
     let norm: RMSNorm
 
     init(_ config: GLM4MoELiteConfiguration) {
