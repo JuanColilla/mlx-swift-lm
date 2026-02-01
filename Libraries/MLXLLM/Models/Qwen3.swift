@@ -12,14 +12,18 @@ import MLXNN
 
 // port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3.py
 
-class Qwen3Attention: Module {
+public class Qwen3Attention: Module {
     let args: Qwen3Configuration
     let scale: Float
+    
+    /// Mutable head counts for tensor parallel sharding
+    public var nHeads: Int
+    public var nKvHeads: Int
 
-    @ModuleInfo(key: "q_proj") var wq: Linear
-    @ModuleInfo(key: "k_proj") var wk: Linear
-    @ModuleInfo(key: "v_proj") var wv: Linear
-    @ModuleInfo(key: "o_proj") var wo: Linear
+    @ModuleInfo(key: "q_proj") var wq: Module & UnaryLayer
+    @ModuleInfo(key: "k_proj") var wk: Module & UnaryLayer
+    @ModuleInfo(key: "v_proj") var wv: Module & UnaryLayer
+    @ModuleInfo(key: "o_proj") var wo: Module & UnaryLayer
 
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
@@ -28,6 +32,8 @@ class Qwen3Attention: Module {
 
     public init(_ args: Qwen3Configuration) {
         self.args = args
+        self.nHeads = args.attentionHeads
+        self.nKvHeads = args.kvHeads
 
         let dim = args.hiddenSize
         let heads = args.attentionHeads
@@ -67,14 +73,15 @@ class Qwen3Attention: Module {
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
 
+        // Fatal error: [matmul] Last dimension of first input with shape (1,20,2560) must match second to last dimension of second input with shape (320,2048).
         var queries = wq(x)
         var keys = wk(x)
         var values = wv(x)
 
         // prepare the queries, keys and values for the attention computation
-        queries = qNorm(queries.reshaped(B, L, args.attentionHeads, -1)).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        queries = qNorm(queries.reshaped(B, L, nHeads, -1)).transposed(0, 2, 1, 3)
+        keys = kNorm(keys.reshaped(B, L, nKvHeads, -1)).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, nKvHeads, -1).transposed(0, 2, 1, 3)
 
         // Apply RoPE positioning
         if let cache {
@@ -99,12 +106,21 @@ class Qwen3Attention: Module {
 
         return wo(output)
     }
+    
+    /// Apply tensor parallel sharding to attention weights
+    public func shard(group: DistributedGroup) {
+        let N = Int(group.size)
+        nHeads /= N
+        nKvHeads /= N
+
+        try! shardLinearLeafs(model: self, sharding: { $0 == "o_proj" ? "sharded-to-all" : "all-to-sharded" }, group: group)
+    }
 }
 
-class Qwen3MLP: Module, UnaryLayer {
-    @ModuleInfo(key: "gate_proj") var gate: Linear
-    @ModuleInfo(key: "down_proj") var down: Linear
-    @ModuleInfo(key: "up_proj") var up: Linear
+public class Qwen3MLP: Module, UnaryLayer {
+    @ModuleInfo(key: "gate_proj") var gate: Module & UnaryLayer
+    @ModuleInfo(key: "down_proj") var down: Module & UnaryLayer
+    @ModuleInfo(key: "up_proj") var up: Module & UnaryLayer
 
     public init(dimensions: Int, hiddenDimensions: Int) {
         _gate.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
@@ -115,11 +131,16 @@ class Qwen3MLP: Module, UnaryLayer {
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         down(silu(gate(x)) * up(x))
     }
+    
+    /// Apply tensor parallel sharding to MLP weights
+    public func shard(group: DistributedGroup) {
+        try! shardLinearLeafs(model: self, sharding: { $0 == "down_proj" ? "sharded-to-all" : "all-to-sharded" }, group: group)
+    }
 }
 
-class Qwen3TransformerBlock: Module, TransformerLayer {
-    @ModuleInfo(key: "self_attn") var attention: Qwen3Attention
-    let mlp: Qwen3MLP
+public class Qwen3TransformerBlock: Module, TransformerLayer {
+    @ModuleInfo(key: "self_attn") public var attention: Qwen3Attention
+    public let mlp: Qwen3MLP
 
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm

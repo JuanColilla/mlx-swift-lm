@@ -97,10 +97,10 @@ private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray = compile
     swiglu(xLinear, xGlu)
 }
 
-class SwiGLUSwitchGLU: Module {
-    @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear
-    @ModuleInfo(key: "up_proj") var upProj: SwitchLinear
-    @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
+public class SwiGLUSwitchGLU: Module {
+    @ModuleInfo(key: "gate_proj") public var gateProj: SwitchLinear
+    @ModuleInfo(key: "up_proj") public var upProj: SwitchLinear
+    @ModuleInfo(key: "down_proj") public var downProj: SwitchLinear
 
     let inputDims: Int
     let hiddenDims: Int
@@ -151,20 +151,30 @@ class SwiGLUSwitchGLU: Module {
 
         return x.squeezed(axis: -2)
     }
+    
+    /// Apply tensor parallel sharding to MoE weights in-place
+    public func shard(group: DistributedGroup) {
+        try? shardInPlace(module: gateProj, sharding: .left("all-to-sharded"), group: group)
+        try? shardInPlace(module: upProj, sharding: .left("all-to-sharded"), group: group)
+        try? shardInPlace(module: downProj, sharding: .left("sharded-to-all"), group: group)
+    }
 }
 
-class AttentionBlock: Module {
+public class AttentionBlock: Module {
     let headDim: Int
-    let numAttentionHeads: Int
-    let numKeyValueHeads: Int
+    var numAttentionHeads: Int
+    var numKeyValueHeads: Int
     let numKeyValueGroups: Int
     let smScale: Float
+    
+    /// Distributed group for tensor parallel sharding
+    public var shardingGroup: DistributedGroup?
 
     @ParameterInfo(key: "sinks") var sinks: MLXArray
-    @ModuleInfo(key: "q_proj") var qProj: Linear
-    @ModuleInfo(key: "k_proj") var kProj: Linear
-    @ModuleInfo(key: "v_proj") var vProj: Linear
-    @ModuleInfo(key: "o_proj") var oProj: Linear
+    @ModuleInfo(key: "q_proj") public var qProj: Module & UnaryLayer
+    @ModuleInfo(key: "k_proj") public var kProj: Module & UnaryLayer
+    @ModuleInfo(key: "v_proj") public var vProj: Module & UnaryLayer
+    @ModuleInfo(key: "o_proj") public var oProj: Module & UnaryLayer
 
     let rope: YarnRoPE
     private var cachedSinksActive: Bool?
@@ -267,14 +277,30 @@ class AttentionBlock: Module {
 
         return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
     }
+    
+    /// Apply tensor parallel sharding to attention weights
+    public func shard(group: DistributedGroup) {
+        let N = Int(group.size)
+        numAttentionHeads /= N
+        numKeyValueHeads /= N
+        shardingGroup = group
+        
+        _qProj.wrappedValue = AllToShardedLinear.fromLinear(qProj as! Linear, group: group)
+        _kProj.wrappedValue = AllToShardedLinear.fromLinear(kProj as! Linear, group: group)
+        _vProj.wrappedValue = AllToShardedLinear.fromLinear(vProj as! Linear, group: group)
+        _oProj.wrappedValue = ShardedToAllLinear.fromLinear(oProj as! Linear, group: group)
+    }
 }
 
-class MLPBlock: Module {
+public class MLPBlock: Module {
     let hiddenSize: Int
     let numLocalExperts: Int
     let numExpertsPerTok: Int
+    
+    /// Distributed group for tensor parallel sharding
+    public var shardingGroup: DistributedGroup?
 
-    @ModuleInfo(key: "experts") var experts: SwiGLUSwitchGLU
+    @ModuleInfo(key: "experts") public var experts: SwiGLUSwitchGLU
     @ModuleInfo(key: "router") var router: Linear
 
     public init(_ config: GPTOSSConfiguration) {
@@ -292,21 +318,40 @@ class MLPBlock: Module {
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // Aggregate gradients for tensor parallel (identity if not sharded)
+        var x = x
+        if let group = shardingGroup {
+            x = sumGradients(group: group)(x)
+        }
+        
         let g = router(x)
         let (experts, indices) = mlxTopK(g, k: numExpertsPerTok, axis: -1)
         let stopIndices = MLX.stopGradient(indices)
         let expertWeights = softmax(experts, axis: -1, precise: true)
 
-        var x = self.experts(x, stopIndices)
+        var result = self.experts(x, stopIndices)
 
-        x = x * expandedDimensions(expertWeights, axis: -1)
-        return x.sum(axis: -2)
+        result = result * expandedDimensions(expertWeights, axis: -1)
+        result = result.sum(axis: -2)
+        
+        // Aggregate results across all devices for tensor parallel
+        if let group = shardingGroup {
+            result = group.allSum(result)
+        }
+        
+        return result
+    }
+    
+    /// Apply tensor parallel sharding to MoE weights
+    public func shard(group: DistributedGroup) {
+        shardingGroup = group
+        experts.shard(group: group)
     }
 }
 
-class GPTOSSTransformerBlock: Module, TransformerLayer {
-    @ModuleInfo(key: "self_attn") var selfAttn: AttentionBlock
-    @ModuleInfo(key: "mlp") var mlp: MLPBlock
+public class GPTOSSTransformerBlock: Module, TransformerLayer {
+    @ModuleInfo(key: "self_attn") public var selfAttn: AttentionBlock
+    @ModuleInfo(key: "mlp") public var mlp: MLPBlock
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 

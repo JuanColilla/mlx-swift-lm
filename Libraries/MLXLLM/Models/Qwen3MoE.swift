@@ -12,14 +12,18 @@ import MLXNN
 
 // port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3_moe.py
 
-class Qwen3MoEAttention: Module {
+public class Qwen3MoEAttention: Module {
     let args: Qwen3MoEConfiguration
     let scale: Float
+    
+    /// Mutable head counts for tensor parallel sharding
+    public var nHeads: Int
+    public var nKvHeads: Int
 
-    @ModuleInfo(key: "q_proj") var wq: Linear
-    @ModuleInfo(key: "k_proj") var wk: Linear
-    @ModuleInfo(key: "v_proj") var wv: Linear
-    @ModuleInfo(key: "o_proj") var wo: Linear
+    @ModuleInfo(key: "q_proj") var wq: Module & UnaryLayer
+    @ModuleInfo(key: "k_proj") var wk: Module & UnaryLayer
+    @ModuleInfo(key: "v_proj") var wv: Module & UnaryLayer
+    @ModuleInfo(key: "o_proj") var wo: Module & UnaryLayer
 
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
@@ -28,6 +32,8 @@ class Qwen3MoEAttention: Module {
 
     public init(_ args: Qwen3MoEConfiguration, layerIdx: Int) {
         self.args = args
+        self.nHeads = args.attentionHeads
+        self.nKvHeads = args.kvHeads
 
         let dim = args.hiddenSize
         let heads = args.attentionHeads
@@ -72,9 +78,9 @@ class Qwen3MoEAttention: Module {
         var values = wv(x)
 
         // prepare the queries, keys and values for the attention computation
-        queries = qNorm(queries.reshaped(B, L, args.attentionHeads, -1)).transposed(0, 2, 1, 3)
-        keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        queries = qNorm(queries.reshaped(B, L, nHeads, -1)).transposed(0, 2, 1, 3)
+        keys = kNorm(keys.reshaped(B, L, nKvHeads, -1)).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, nKvHeads, -1).transposed(0, 2, 1, 3)
 
         if let cache {
             queries = rope(queries, offset: cache.offset)
@@ -97,12 +103,24 @@ class Qwen3MoEAttention: Module {
 
         return wo(output)
     }
+    
+    /// Apply tensor parallel sharding to attention weights
+    public func shard(group: DistributedGroup) {
+        let N = Int(group.size)
+        nHeads /= N
+        nKvHeads /= N
+        
+        _wq.wrappedValue = AllToShardedLinear.fromLinear(wq as! Linear, group: group)
+        _wk.wrappedValue = AllToShardedLinear.fromLinear(wk as! Linear, group: group)
+        _wv.wrappedValue = AllToShardedLinear.fromLinear(wv as! Linear, group: group)
+        _wo.wrappedValue = ShardedToAllLinear.fromLinear(wo as! Linear, group: group)
+    }
 }
 
-class Qwen3MoEMLP: Module, UnaryLayer {
-    @ModuleInfo(key: "gate_proj") var gate: Linear
-    @ModuleInfo(key: "down_proj") var down: Linear
-    @ModuleInfo(key: "up_proj") var up: Linear
+public class Qwen3MoEMLP: Module, UnaryLayer {
+    @ModuleInfo(key: "gate_proj") public var gate: Module & UnaryLayer
+    @ModuleInfo(key: "down_proj") public var down: Module & UnaryLayer
+    @ModuleInfo(key: "up_proj") public var up: Module & UnaryLayer
 
     public init(dimensions: Int, hiddenDimensions: Int) {
         _gate.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
@@ -113,12 +131,22 @@ class Qwen3MoEMLP: Module, UnaryLayer {
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         down(silu(gate(x)) * up(x))
     }
+    
+    /// Apply tensor parallel sharding to MLP weights
+    public func shard(group: DistributedGroup) {
+        _gate.wrappedValue = AllToShardedLinear.fromLinear(gate as! Linear, group: group)
+        _up.wrappedValue = AllToShardedLinear.fromLinear(up as! Linear, group: group)
+        _down.wrappedValue = ShardedToAllLinear.fromLinear(down as! Linear, group: group)
+    }
 }
 
-class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
+public class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
     let numExperts: Int
     let topK: Int
     let normTopkProb: Bool
+    
+    /// Distributed group for tensor parallel sharding
+    public var shardingGroup: DistributedGroup?
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -134,7 +162,13 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
         )
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // Aggregate gradients for tensor parallel (identity if not sharded)
+        var x = x
+        if let group = shardingGroup {
+            x = sumGradients(group: group)(x)
+        }
+        
         let gates = gate(x)
         let softGates = MLX.softmax(gates, axis: -1, precise: true)
 
@@ -147,19 +181,34 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
         }
 
         let y = switchMLP(x, inds)
-        return (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        var result = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        
+        // Aggregate results across all devices for tensor parallel
+        if let group = shardingGroup {
+            result = group.allSum(result)
+        }
+        
+        return result
+    }
+    
+    /// Apply tensor parallel sharding to MoE weights
+    public func shard(group: DistributedGroup) {
+        shardingGroup = group
+        try? shardInPlace(module: switchMLP.gateProj, sharding: .left("all-to-sharded"), group: group)
+        try? shardInPlace(module: switchMLP.upProj, sharding: .left("all-to-sharded"), group: group)
+        try? shardInPlace(module: switchMLP.downProj, sharding: .left("sharded-to-all"), group: group)
     }
 }
 
-class Qwen3MoeDecoderLayer: Module, TransformerLayer {
+public class Qwen3MoeDecoderLayer: Module, TransformerLayer {
     let args: Qwen3MoEConfiguration
     let layerIdx: Int
 
-    @ModuleInfo(key: "self_attn") var selfAttn: Qwen3MoEAttention
+    @ModuleInfo(key: "self_attn") public var selfAttn: Qwen3MoEAttention
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
-    fileprivate let mlp: UnaryLayer
+    public var mlp: UnaryLayer
 
     init(_ args: Qwen3MoEConfiguration, layerIdx: Int) {
         self.args = args
@@ -180,7 +229,7 @@ class Qwen3MoeDecoderLayer: Module, TransformerLayer {
         }
     }
 
-    func callAsFunction(
+    public func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         var r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
