@@ -12,6 +12,37 @@ import MLXNN
 
 // port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3.py
 
+private enum TensorParallelLinearSharding {
+    case allToSharded
+    case shardedToAll
+}
+
+private func shardProjection(
+    _ projection: Module & UnaryLayer,
+    sharding: TensorParallelLinearSharding,
+    group: DistributedGroup
+) -> Module & UnaryLayer {
+    switch (projection, sharding) {
+    case (let linear as Linear, .allToSharded):
+        return AllToShardedLinear.fromLinear(linear, group: group)
+    case (let linear as Linear, .shardedToAll):
+        return ShardedToAllLinear.fromLinear(linear, group: group)
+    case (let quantized as QuantizedLinear, .allToSharded):
+        return QuantizedAllToShardedLinear.fromQuantizedLinear(quantized, group: group)
+    case (let quantized as QuantizedLinear, .shardedToAll):
+        return QuantizedShardedToAllLinear.fromQuantizedLinear(quantized, group: group)
+    case (is AllToShardedLinear, .allToSharded),
+        (is QuantizedAllToShardedLinear, .allToSharded),
+        (is ShardedToAllLinear, .shardedToAll),
+        (is QuantizedShardedToAllLinear, .shardedToAll):
+        // Already sharded with the requested strategy.
+        return projection
+    default:
+        fatalError(
+            "Unsupported projection type \(type(of: projection)) for sharding strategy \(sharding)")
+    }
+}
+
 public class Qwen3Attention: Module {
     let args: Qwen3Configuration
     let scale: Float
@@ -73,7 +104,6 @@ public class Qwen3Attention: Module {
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
 
-        // Fatal error: [matmul] Last dimension of first input with shape (1,20,2560) must match second to last dimension of second input with shape (320,2048).
         var queries = wq(x)
         var keys = wk(x)
         var values = wv(x)
@@ -109,9 +139,18 @@ public class Qwen3Attention: Module {
     
     /// Apply tensor parallel sharding to attention weights
     public func shard(group: DistributedGroup) {
-        let N = Int(group.size)
-        nHeads /= N
-        nKvHeads /= N
+        let worldSize = Int(group.size)
+        precondition(
+            nHeads % worldSize == 0,
+            "Qwen3Attention.nHeads (\(nHeads)) must be divisible by tensor parallel size (\(worldSize))"
+        )
+        precondition(
+            nKvHeads % worldSize == 0,
+            "Qwen3Attention.nKvHeads (\(nKvHeads)) must be divisible by tensor parallel size (\(worldSize))"
+        )
+
+        nHeads /= worldSize
+        nKvHeads /= worldSize
 
         try! shardLinearLeafs(model: self, sharding: { $0 == "o_proj" ? "sharded-to-all" : "all-to-sharded" }, group: group)
     }
