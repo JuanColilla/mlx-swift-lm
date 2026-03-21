@@ -232,7 +232,7 @@ class LlamaMLP: Module, UnaryLayer {
 
 class LlamaTransformerBlock: Module, TransformerLayer {
     @ModuleInfo(key: "self_attn") var attention: LlamaAttention
-    @ModuleInfo(key: "mlp") var mlp: LlamaMLP
+    @ModuleInfo(key: "mlp") var mlp: Module & UnaryLayer
 
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
