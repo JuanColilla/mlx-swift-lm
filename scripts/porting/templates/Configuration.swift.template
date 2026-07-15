@@ -1,0 +1,76 @@
+// Template stub for porting a model from Python mlx-lm.
+// See DOCS/porting-from-mlx-lm-playbook.md step 2 before filling this in.
+// Rename to <<ModelName>>.swift and remove this header once complete.
+//
+// Reference: this mirrors the CodingKeys + manual init(from:) pattern in
+// Libraries/MLXLLM/Models/Mixtral.swift:8-61 and Models/Mamba2.swift:8-71.
+
+import Foundation
+
+public struct <<ModelName>>Configuration: Codable, Sendable {
+    // model_type from the Python config.json — required, must match the
+    // key you will register in LLMTypeRegistry.shared.
+    var modelType: String = "<<model_type_from_python_config>>"
+
+    // TODO: one property per config.json field you actually read.
+    // Fields WITHOUT a Python default become required (decode, not decodeIfPresent).
+    var vocabularySize: Int = <<default_or_remove>>
+    var hiddenSize: Int
+    var hiddenLayers: Int
+    var attentionHeads: Int
+    var kvHeads: Int = <<default_or_remove>>
+    var rmsNormEps: Float = <<default>>
+    var ropeTheta: Float = <<default>>
+
+    // Derived-only properties (never appear in config.json) go here as
+    // computed properties, NOT in CodingKeys. Example: Mixtral.swift:23.
+    // var headDim: Int { hiddenSize / attentionHeads }
+
+    enum CodingKeys: String, CodingKey {
+        case modelType = "model_type"
+        case vocabularySize = "vocab_size"
+        case hiddenSize = "hidden_size"
+        case hiddenLayers = "num_hidden_layers"
+        case attentionHeads = "num_attention_heads"
+        case kvHeads = "num_key_value_heads"
+        case rmsNormEps = "rms_norm_eps"
+        case ropeTheta = "rope_theta"
+        // TODO: add one CodingKeys case per property above.
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.modelType =
+            try container.decodeIfPresent(String.self, forKey: .modelType)
+            ?? "<<model_type_from_python_config>>"
+
+        // Required fields (no Python default): use decode(_:forKey:), let
+        // it throw if missing — that is a real config bug.
+        self.hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        self.hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+        self.attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+
+        // Optional fields with a Python default: decodeIfPresent ?? default.
+        self.vocabularySize =
+            try container.decodeIfPresent(Int.self, forKey: .vocabularySize) ?? <<default>>
+        // Defaults that depend on an already-decoded field (decode order matters):
+        // e.g. kvHeads falls back to attentionHeads — see Mixtral.swift:50.
+        self.kvHeads =
+            try container.decodeIfPresent(Int.self, forKey: .kvHeads) ?? attentionHeads
+        self.rmsNormEps =
+            try container.decodeIfPresent(Float.self, forKey: .rmsNormEps) ?? <<default>>
+        self.ropeTheta =
+            try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? <<default>>
+    }
+}
+
+// If the config has invariants that must hold after decoding (dimension
+// relationships, expected list sizes, etc.), conform to
+// ModelConfigurationValidating (Libraries/MLXLMCommon/ModelFactory.swift:59-61)
+// instead of leaving them unchecked:
+//
+// extension <<ModelName>>Configuration: ModelConfigurationValidating {
+//     public func validateModelConfiguration() throws {
+//         // TODO: throw if an invariant is violated.
+//     }
+// }
