@@ -8,6 +8,7 @@ Esta carpeta resume una investigacion tecnica del framework `mlx-swift-lm` en la
 
 - [Rendimiento y generacion](performance-and-generation.md): prefill, decode, speculative decoding, MTP, sampling y medicion.
 - [Compatibilidad y modelos](compatibility-and-models.md): arquitecturas soportadas, VLM, embeddings, cuantizaciones y portabilidad.
+- [Compatibilidad de Bonsai 1-bit](bonsai-1bit-compatibility.md): port affine-only, revisiones exactas, validacion y rollback.
 - [Memoria y KV cache](memory-kv-cache.md): cache rotatoria, cache cuantizada, wired memory, limites Apple y patrones de uso.
 - [Playbook de implementacion](implementation-playbook.md): recetas practicas para exprimir el framework en apps y herramientas.
 - [Tech debt e investigacion](tech-debt-and-research-backlog.md): backlog priorizado de mejoras, deuda tecnica y experimentos.
