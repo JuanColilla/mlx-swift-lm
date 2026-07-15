@@ -134,11 +134,11 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     #expect(copied.metaState == cache.metaState)
 }
 
-@Test func testEmptyKVCacheSimpleToQuantizedPreservesRequestedQuantizationMetadata() throws {
+@Test func testEmptyKVCacheSimpleQuantizedPreservesRequestedQuantizationMetadata() throws {
     let cache = KVCacheSimple()
     cache.offset = 7
 
-    let quantized = try cache.toQuantized(groupSize: 128, bits: 4)
+    let quantized = try cache.quantized(groupSize: 128, bits: 4)
 
     #expect(quantized.offset == 7)
     #expect(quantized.groupSize == 128)
@@ -744,15 +744,15 @@ private func writeCorruptSimpleCacheFile(className: String, arrayCount: Int, met
     }
 }
 
-@Test func testRotatingKVCacheToQuantizedThrowsInsteadOfCrashing() throws {
+@Test func testRotatingKVCacheQuantizedThrowsInsteadOfCrashing() throws {
     let cache = RotatingKVCache(maxSize: 32)
 
     #expect(throws: KVCacheError.self) {
-        _ = try cache.toQuantized()
+        _ = try cache.quantized()
     }
 }
 
-@Test func testKVCacheSimpleToQuantizedThrowsOnIncompatibleHeadDim() throws {
+@Test func testKVCacheSimpleQuantizedThrowsOnIncompatibleHeadDim() throws {
     let cache = KVCacheSimple()
     _ = cache.update(
         keys: MLXArray.zeros([1, 2, 4, 5], dtype: .float32),
@@ -761,6 +761,6 @@ private func writeCorruptSimpleCacheFile(className: String, arrayCount: Int, met
 
     // Head dim 5 is not divisible by any of the supported group sizes (32, 64, 128).
     #expect(throws: KVCacheError.self) {
-        _ = try cache.toQuantized(groupSize: 64, bits: 4)
+        _ = try cache.quantized(groupSize: 64, bits: 4)
     }
 }

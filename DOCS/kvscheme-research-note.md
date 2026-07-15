@@ -5,13 +5,16 @@ Explorar WHT, product quantization o compresión híbrida si MLX Swift lo permit
 eficientemente."
 
 Esta nota es investigación, no implementación. No hay código de producción aquí,
-siguiendo el mismo estándar de honestidad que `RotatingKVCache.toQuantized(...)`
+siguiendo el mismo estándar de honestidad que `RotatingKVCache.quantized(...)`
 (`Libraries/MLXLMCommon/KVCache.swift:798-808`), que lanza
 `KVCacheError("RotatingKVCache quantization not yet implemented ...")` en vez de
 fingir soporte.
 
-## 1. Qué expone hoy mlx-swift (checkout en `.build/checkouts/mlx-swift`, tag declarado
-en `Package.swift:39` — `https://github.com/ml-explore/mlx-swift`, `.upToNextMinor(from: "0.31.4")`)
+## 1. Qué expone hoy mlx-swift
+
+La pasada de release fija el checkout en
+`JuanColilla/mlx-swift@5e27a4cb2604599c72615cf058e09801c123b831`;
+ver `Package.swift` y `DOCS/bonsai-1bit-compatibility.md`.
 
 ### 1.1 Primitivas de cuantización afín
 
@@ -182,7 +185,7 @@ Forma más pequeña de prototipar WHT sin tocar la API pública:
    verificación adicional de que el head_dim cumple la restricción `m·2^k` de
    `hadamardTransform` — si no la cumple, hacer fallback a affine puro (mismo patrón
    defensivo que ya usa `maybeQuantizeKVCache` al descartar caches no cuantizables).
-4. No tocar `RotatingKVCache` en esta primera vuelta — su `toQuantized` ya declara
+4. No tocar `RotatingKVCache` en esta primera vuelta — su `quantized` ya declara
    explícitamente que no está implementado; un esquema WHT debería nacer solo para
    `KVCacheSimple → QuantizedKVCache`-equivalente, igual que affine4/8 hoy.
 

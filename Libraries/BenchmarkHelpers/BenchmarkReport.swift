@@ -118,22 +118,22 @@ public struct BenchmarkReport: Codable, Sendable {
     public static func currentPlatformDescription() -> String {
         let info = ProcessInfo.processInfo
         #if arch(arm64)
-            let arch = "arm64"
+        let arch = "arm64"
         #elseif arch(x86_64)
-            let arch = "x86_64"
+        let arch = "x86_64"
         #else
-            let arch = "unknown-arch"
+        let arch = "unknown-arch"
         #endif
         #if os(macOS)
-            return "macOS \(info.operatingSystemVersionString) \(arch)"
+        return "macOS \(info.operatingSystemVersionString) \(arch)"
         #elseif os(iOS)
-            return "iOS \(info.operatingSystemVersionString) \(arch)"
+        return "iOS \(info.operatingSystemVersionString) \(arch)"
         #elseif os(tvOS)
-            return "tvOS \(info.operatingSystemVersionString) \(arch)"
+        return "tvOS \(info.operatingSystemVersionString) \(arch)"
         #elseif os(visionOS)
-            return "visionOS \(info.operatingSystemVersionString) \(arch)"
+        return "visionOS \(info.operatingSystemVersionString) \(arch)"
         #else
-            return "unknown-platform \(arch)"
+        return "unknown-platform \(arch)"
         #endif
     }
 

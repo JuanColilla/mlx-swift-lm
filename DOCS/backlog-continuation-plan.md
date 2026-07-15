@@ -1,123 +1,116 @@
-# Plan de continuación — backlog de mejoras (rama `docs/improvement-backlog-review`)
+# Plan de continuación — backlog de mejoras
 
-> Documento de handoff. Objetivo: que otra sesión (con este mismo agente u
-> otro) pueda retomar exactamente donde se dejó, sin tener que
-> re-investigar el entorno ni releer los 19 commits para reconstruir el
-> estado. Generado el 2026-07-15 al cerrar la sesión por presupuesto de
-> tokens, no por falta de trabajo pendiente identificado.
+Fecha de actualización: 2026-07-15.
 
-## Estado exacto al cerrar
+## Estado de release
 
-- Rama: `docs/improvement-backlog-review`, creada desde `origin/main` en
-  `f97da4e`. 19 commits por delante (`git log --oneline f97da4e..HEAD`).
-  Árbol de trabajo limpio (`git status --short` sin salida). **Nada
-  pusheado a remoto.**
-- De los 15 items de `DOCS/tech-debt-and-research-backlog.md`: 5 tienen
-  código verificado (build + tests reales pasando), 10 tienen solo
-  investigación/nota de alcance. El desglose completo, item por item, está
-  en `DOCS/README.md`, sección "Implementación del backlog (2026-07-15)" —
-  **leer ese índice primero**, no repetir la investigación.
-- Hallazgo adicional no pedido: bug de correctness real en
-  `Gemma4ChunkedPrefillTests`, confirmado preexistente en el baseline de
-  `origin/main` (no introducido en esta rama), causa raíz investigada con
-  alta confianza en `DOCS/gemma4-chunked-prefill-investigation.md`, no
-  arreglado.
-- Motivo del cierre: instrucción explícita del usuario de no seguir
-  lanzando subagentes en paralelo por presupuesto de tokens agotado. No es
-  un bloqueo técnico ni una falta de camino a seguir — los cuatro items
-  restantes (#3, #6, #7 resto, bug Gemma4) tienen cada uno una nota con
-  recomendación concreta de próximo paso, no son un vacío.
+La rama `docs/improvement-backlog-review` ya integra el `main` del fork que
+contiene:
 
-## Entorno de build/test — ya resuelto, no re-investigar
+- el `main` oficial hasta `10e0cb7`;
+- la compatibilidad Bonsai affine 1-bit;
+- el runtime M5-safe fijado en
+  `JuanColilla/mlx-swift@5e27a4cb2604599c72615cf058e09801c123b831`;
+- los cambios de implementación y documentación del backlog.
 
-Verificado funcional en esta máquina durante esta sesión:
+De los 15 ítems originales, cinco tienen una entrega de código verificable y
+los diez restantes tienen una guía o nota de alcance. Esto no significa que
+los quince estén implementados: el índice exacto está en `DOCS/README.md`,
+sección "Implementación del backlog (2026-07-15)".
+
+La política de release es integrar sólo la parte madura y conservar como
+trabajo futuro los cambios que requieren decisiones públicas de arquitectura,
+datos de modelos reales o validación física adicional.
+
+## Correcciones de la pasada de release
+
+- Las APIs históricas `KVCacheSimple.toQuantized(...)` y
+  `RotatingKVCache.toQuantized(...)` conservan su firma no throwing para no
+  romper consumidores 3.x. La nueva API `quantized(...) throws` permite manejar
+  el error de forma recuperable y `KVCacheError` es público.
+- `BenchmarkReport` tiene cobertura de serialización, carga y comparación entre
+  runs.
+- El hallazgo Gemma4 se considera cerrado para este árbol: las cuatro variantes
+  de `chunkSizeInvariance` pasan con el runtime M5-safe. Ver
+  `DOCS/gemma4-chunked-prefill-investigation.md`.
+- El índice conserva tanto Bonsai como los documentos del backlog.
+
+## Build y tests
+
+Requisito de esta máquina:
 
 ```bash
-# Requisito: xcode-select debe apuntar a Xcode.app completo, no Command Line
-# Tools (Metal compiler no está en CLT). Verificar con:
-xcrun -f metal   # si falla, pedir al usuario: sudo xcode-select -s /Applications/Xcode.app
+xcrun -f metal
+```
 
-# swift build/test directos rompen si el repo está bajo iCloud Drive
-# (codesign falla por "resource fork... not allowed"). Usar scratch-path
-# fuera del árbol sincronizado:
-swift build --scratch-path /tmp/mlx-swift-lm-build
+Build CLI con artefactos fuera del árbol:
 
-# `swift test` (CLI) falla en runtime cargando el metallib por diferencias
-# de resolución de resource bundles. Usar xcodebuild en su lugar:
-set -o pipefail && xcodebuild test \
+```bash
+swift build --scratch-path /private/tmp/mlx-swift-lm-release-build
+```
+
+Suite completa recomendada:
+
+```bash
+xcodebuild test \
   -scheme mlx-swift-lm-Package \
   -destination 'platform=macOS' \
   -skipPackagePluginValidation \
-  2>&1 | tee /tmp/verify.log | tail -60
-
-# Para un test/suite concreto (nótese la sintaxis Swift Testing, no XCTest):
-xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS' \
-  -skipPackagePluginValidation \
-  -only-testing:MLXLMTests/KVCacheTests/testName\(\) \
-  2>&1 | tee /tmp/verify.log | tail -60
-
-# Integration tests con modelos reales (descarga de HF) están en un
-# .xcodeproj separado:
-xcodebuild test -project IntegrationTesting/IntegrationTesting.xcodeproj \
-  -scheme IntegrationTesting -destination 'platform=macOS' \
-  2>&1 | tee /tmp/integration.log | tail -60
+  -derivedDataPath /private/tmp/mlx-swift-lm-release-derived
 ```
 
-**Trampa de verificación**: nunca confiar en el exit code de un pipe con
-`tail`/`tee` sin `set -o pipefail` (y ojo: un `echo "EXIT=$?"` posterior
-también lo pisa). Siempre `grep -n "error:\|TEST FAILED\|Build failed\|Failing tests:"`
-sobre el log crudo antes de reportar éxito.
-
-**Fallo conocido y ya diagnosticado** (no es una regresión nueva si
-reaparece): `Gemma4ChunkedPrefillTests.chunkSizeInvariance` (3 variantes
-de parámetro). Confirmado presente en el baseline `origin/main` limpio
-(aislado con `git stash push -u` + rebuild + `git stash pop`). Si una
-verificación futura muestra solo estos 3 fallos, la rama está limpia. Si
-aparece cualquier otro fallo, eso sí es nuevo y hay que investigarlo.
-
-## Próximos pasos concretos, en orden recomendado
-
-Cada uno de estos ya tiene una nota de alcance con el análisis completo —
-leerla antes de tocar código, no repetir la investigación:
-
-1. **`estimateKVCacheBytes(...)` — bajo riesgo, buen primer paso.**
-   Ver `DOCS/unified-memory-policy-scoping.md`, sección "Recomendación",
-   punto 2. Función pura y sin estado, testeable con valores conocidos, no
-   toca `ChatSession` ni políticas existentes. Cierra parte del gap de
-   item #3 sin comprometerse a la unificación completa.
-2. **Componer `WiredBudgetPolicy` con la estimación de KV** (mismo doc,
-   mismo punto). Solo después de (1).
-3. **Diseñar el ticket de memoria por turno de `ChatSession`** — el paso
-   más delicado, requiere decisiones de producto (¿ticket por turno o por
-   sesión? ¿cómo compone con MTP?). Ver el mismo doc, sección "Por qué
-   `ChatSession` es la parte más delicada". No intentar sin casos de uso
-   reales.
-4. **Item #6 (speculative decoding adaptativo)**: ver
-   `DOCS/adaptive-speculative-decoding-scoping.md` para el análisis y la
-   recomendación de próximo paso.
-5. **Item #7 resto (MTP en `ChatSession`)**: ver
-   `DOCS/mtp-production-scoping.md`. Depende de que (1)-(3) estén
-   resueltos primero (el ticket de memoria por turno necesita saber sumar
-   el coste del drafter).
-6. **Bug de Gemma4**: ver `DOCS/gemma4-chunked-prefill-investigation.md`
-   para la causa raíz ya identificada. Antes de tocar `RotatingKVCache`,
-   invocar `superpowers:systematic-debugging` desde Phase 3 (ya se
-   completó Phase 1-2 en la nota) y verificar el fix con un modelo real
-   sliding-window, no solo con el test sintético — `RotatingKVCache` es
-   compartida por todos los modelos de esa familia en el repo.
-
-## Cómo verificar que un futuro cambio no rompe nada ya entregado
+Suites con nombre estable para una comprobación corta:
 
 ```bash
-xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS' \
+xcodebuild test \
+  -scheme mlx-swift-lm-Package \
+  -destination 'platform=macOS' \
   -skipPackagePluginValidation \
-  -only-testing:MLXLMTests/KVCacheTests \
+  -derivedDataPath /private/tmp/mlx-swift-lm-release-derived \
+  -only-testing:MLXLMTests/BenchmarkReportTests \
   -only-testing:MLXLMTests/CompatibilityMatrixGeneratorTests \
-  2>&1 | tee /tmp/verify.log | tail -60
+  -only-testing:MLXLMTests/BonsaiOneBitCompatibilityTests
 ```
 
-Estos dos suites cubren el código realmente verificado de esta rama
-(#1/#2/#5/#8). `BenchmarkReport`/`SamplingBenchmarks` no tienen suite de
-tests dedicada propia — se verificaron por compilación + ejecución manual
-del reporte JSON durante esta sesión, no hay regresión automática que
-correr salvo el build general.
+Los tests de `KVCacheTests.swift` son funciones Swift Testing de nivel de
+archivo. El selector histórico `MLXLMTests/KVCacheTests` no garantiza que se
+ejecuten; para el gate de release se usa la suite completa y se comprueba el
+`.xcresult` estructurado.
+
+## Gate de compatibilidad pública
+
+Antes de publicar una variante 3.x:
+
+```bash
+swift package \
+  --scratch-path /private/tmp/mlx-swift-lm-release-api-diff \
+  diagnose-api-breaking-changes main \
+  --targets MLXLMCommon
+```
+
+El comando debe terminar sin `API breakage`. No mantener un cambio breaking en
+una variante patch sólo porque compila o porque los tests internos pasan.
+
+## Trabajo futuro — no bloquea este release
+
+1. Añadir `estimateKVCacheBytes(...)` como función pura y cubierta por tests.
+2. Evaluar su composición con `WiredBudgetPolicy` usando casos de uso reales.
+3. Diseñar el ticket de memoria de `ChatSession` por turno o por sesión.
+4. Recoger acceptance rate real antes de fijar speculative decoding adaptativo.
+5. Integrar MTP en `ChatSession` después de resolver la política de memoria.
+6. Ejecutar la validación física de Bonsai descrita en
+   `DOCS/bonsai-1bit-compatibility.md` antes de distribuir el modelo a usuarios.
+
+Los puntos 2–5 afectan superficies públicas o hot paths de generación y no se
+deben introducir como remate de una versión sin casos de producto y pruebas
+end-to-end con modelos reales.
+
+## Gate final de publicación
+
+- `git diff --check` limpio;
+- formato limpio en todos los ficheros modificados;
+- build completo aprobado;
+- suite completa aprobada y revisada mediante `.xcresult`;
+- cero breaking changes frente a `main` anterior;
+- documentación sin afirmaciones obsoletas;
+- tag anotado con sufijo `v`, después de comprobar el último tag oficial.

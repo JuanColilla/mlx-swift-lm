@@ -458,7 +458,21 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return trimmed
     }
 
-    /// Convert to quantized cache for maximum efficiency
+    /// Convert to quantized cache for maximum efficiency.
+    ///
+    /// This compatibility entry point preserves the original nonthrowing API.
+    /// New code should use ``quantized(groupSize:bits:)`` so unsupported
+    /// configurations can be handled without terminating the process.
+    @available(*, deprecated, message: "Use quantized(groupSize:bits:) to handle errors.")
+    public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
+        do {
+            return try quantized(groupSize: groupSize, bits: bits)
+        } catch {
+            preconditionFailure(error.localizedDescription)
+        }
+    }
+
+    /// Convert to quantized cache for maximum efficiency.
     ///
     /// Use `updateQuantized()` and `quantizedScaledDotProductAttention()` for zero-overhead operation.
     ///
@@ -466,7 +480,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     ///   dimensions of the model that produced this cache (no supported group size among
     ///   32/64/128 evenly divides both). Callers should treat this as a recoverable
     ///   configuration error (e.g. fall back to an unquantized cache) rather than a crash.
-    public func toQuantized(groupSize: Int = 64, bits: Int = 4) throws -> QuantizedKVCache {
+    public func quantized(groupSize: Int = 64, bits: Int = 4) throws -> QuantizedKVCache {
         if let keys = self.keys, let values = self.values {
             // Quantize the current keys and values
             let currentKeys = keys[.ellipsis, ..<offset, 0...]
@@ -486,9 +500,9 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             let quantizedCache = QuantizedKVCache(groupSize: effectiveGroupSize, bits: bits)
             quantizedCache.offset = self.offset
 
-            let quantizedKeys = quantized(
+            let quantizedKeys = MLX.quantized(
                 currentKeys, groupSize: effectiveGroupSize, bits: bits)
-            let quantizedValues = quantized(
+            let quantizedValues = MLX.quantized(
                 currentValues, groupSize: effectiveGroupSize, bits: bits)
 
             // Set the quantized state
@@ -786,7 +800,21 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return new
     }
 
-    /// Convert to quantized cache
+    /// Convert to quantized cache.
+    ///
+    /// This compatibility entry point preserves the original nonthrowing API.
+    /// New code should use ``quantized(groupSize:bits:)`` so the unsupported
+    /// rotating-cache conversion can be handled without terminating the process.
+    @available(*, deprecated, message: "Use quantized(groupSize:bits:) to handle errors.")
+    public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
+        do {
+            return try quantized(groupSize: groupSize, bits: bits)
+        } catch {
+            preconditionFailure(error.localizedDescription)
+        }
+    }
+
+    /// Convert to quantized cache.
     ///
     /// Not yet implemented: the rotating nature and temporal ordering of this cache
     /// require dedicated handling that the current implementation does not provide.
@@ -795,7 +823,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     ///   ``maybeQuantizeKVCache(cache:kvBits:kvGroupSize:quantizedKVStart:kvScheme:)``)
     ///   should catch this and fall back to leaving the cache unquantized instead of
     ///   crashing the process.
-    public func toQuantized(groupSize: Int = 64, bits: Int = 4) throws -> QuantizedKVCache {
+    public func quantized(groupSize: Int = 64, bits: Int = 4) throws -> QuantizedKVCache {
         // Future implementation would need to:
         // 1. Put keys/values in temporal order using temporalOrder()
         // 2. Quantize the temporally ordered arrays
@@ -1574,8 +1602,14 @@ public class CacheList: BaseKVCache {
 
 // MARK: - Error Types
 
-struct KVCacheError: Error {
-    let message: String
+public struct KVCacheError: Error, LocalizedError, Sendable, Equatable {
+    public let message: String
+
+    public init(message: String) {
+        self.message = message
+    }
+
+    public var errorDescription: String? { message }
 }
 
 // MARK: - Utility Functions
@@ -2077,7 +2111,7 @@ public func maybeQuantizeKVCache(
 
     /// Attempt to convert a single cache to its quantized form. Returns the
     /// original cache unchanged if conversion is not possible or not (yet)
-    /// supported for this entry -- see ``KVCacheSimple/toQuantized(groupSize:bits:)``.
+    /// supported for this entry -- see ``KVCacheSimple/quantized(groupSize:bits:)``.
     func quantize(_ cache: KVCacheSimple) -> KVCache {
         let state = cache.state
         if state.count == 2 {
@@ -2093,7 +2127,7 @@ public func maybeQuantizeKVCache(
                 return cache
             }
         }
-        return (try? cache.toQuantized(groupSize: effectiveGroupSize, bits: effectiveBits))
+        return (try? cache.quantized(groupSize: effectiveGroupSize, bits: effectiveBits))
             ?? cache
     }
 

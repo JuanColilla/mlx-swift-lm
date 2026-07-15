@@ -48,7 +48,9 @@ struct CompatibilityMatrixGeneratorTests {
         print("\n### LLM recommended models (\(llmModels.count) registered)")
         for model in llmModels {
             let toolFormat = model.toolCallFormat?.rawValue ?? "-"
-            let eos = model.extraEOSTokens.isEmpty ? "-" : model.extraEOSTokens.sorted().joined(separator: ",")
+            let eos =
+                model.extraEOSTokens.isEmpty
+                ? "-" : model.extraEOSTokens.sorted().joined(separator: ",")
             print("- \(model.name) | toolCallFormat=\(toolFormat) | extraEOS=\(eos)")
         }
 

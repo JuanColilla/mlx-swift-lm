@@ -157,7 +157,7 @@ public func benchmarkPenaltyProcessors(
         frequencyPenalty: 0.5, frequencyContextSize: contextSize)
     frequency.prompt(context)
 
-    var combined = PenaltyProcessor(
+    let combined = PenaltyProcessor(
         repetitionContext: repetition, presenceContext: presence, frequencyContext: frequency)
 
     return [

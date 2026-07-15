@@ -129,17 +129,17 @@ maybeQuantizeKVCache(
 
 ### `RotatingKVCache` + cuantización: gap real confirmado en esta rama
 
-`RotatingKVCache.toQuantized(groupSize:bits:)` (`KVCache.swift:798-808`) **lanza** incondicionalmente:
+`RotatingKVCache.quantized(groupSize:bits:)` **lanza** incondicionalmente:
 
 ```swift
-public func toQuantized(groupSize: Int = 64, bits: Int = 4) throws -> QuantizedKVCache {
+public func quantized(groupSize: Int = 64, bits: Int = 4) throws -> QuantizedKVCache {
     // Future implementation would need to: ...
     throw KVCacheError(
         message: "RotatingKVCache quantization not yet implemented - temporal ordering makes this complex")
 }
 ```
 
-Esto ya **no es un `fatalError`** — es un `throw` recuperable, confirmado también por el test `testRotatingKVCacheToQuantizedThrowsInsteadOfCrashing` en `Tests/MLXLMTests/KVCacheTests.swift:747-753`. Pero eso no es lo que pasa en la práctica al combinar `maxKVSize` + `kvBits`: `maybeQuantizeKVCache.isQuantizable` chequea `cache is KVCacheSimple` (`KVCache.swift:2069`), y cuando `maxKVSize` está seteado, `newCache` construye `RotatingKVCache`, no `KVCacheSimple` (`LanguageModel.swift:294-297`). Como `RotatingKVCache` no es `KVCacheSimple`, `isQuantizable` devuelve `false` para esas cachés y `maybeQuantizeKVCache` las ignora por completo — **nunca intenta llamar `toQuantized` y por tanto nunca lanza el error**. El resultado observable es: `GenerateParameters(maxKVSize: N, kvBits: 4)` no falla, no lanza, simplemente no cuantiza nada. Este es el gap que hay que documentar de cara a producto: es un silencio, no un error.
+Esta es la ruta recuperable para código nuevo, confirmada por el test `testRotatingKVCacheQuantizedThrowsInsteadOfCrashing`. La firma histórica `toQuantized(...)` sigue disponible y deprecada para conservar compatibilidad fuente con consumidores 3.x; no debe usarse cuando la configuración pueda ser incompatible. Pero eso no es lo que pasa en la práctica al combinar `maxKVSize` + `kvBits`: `maybeQuantizeKVCache.isQuantizable` sólo acepta `KVCacheSimple`, y cuando `maxKVSize` está seteado, `newCache` construye `RotatingKVCache`. Esas cachés se ignoran por completo — **nunca se intenta llamar `quantized` y por tanto nunca se lanza el error**. El resultado observable es: `GenerateParameters(maxKVSize: N, kvBits: 4)` no falla, no lanza, simplemente no cuantiza nada. Este es el gap que hay que documentar de cara a producto: es un silencio, no un error.
 
 ```swift
 // Esto NO produce una caché rotatoria cuantizada. Genera sin error,
@@ -267,7 +267,7 @@ Estado real de la cobertura de tests en `Tests/MLXLMTests/` (verificado por grep
 
 **Lo que sí está cubierto hoy:**
 - Serialización/round-trip de todos los tipos de caché (`testCacheSerialization`, parametrizado sobre `KVCacheSimple`, `RotatingKVCache`, `QuantizedKVCache`, `ChunkedKVCache`, `ArraysCache`, `MambaCache` — `KVCacheTests.swift:56-86`).
-- Que `RotatingKVCache.toQuantized` lanza en vez de crashear (`testRotatingKVCacheToQuantizedThrowsInsteadOfCrashing`, `KVCacheTests.swift:747-753`).
+- Que `RotatingKVCache.quantized` lanza en vez de crashear (`testRotatingKVCacheQuantizedThrowsInsteadOfCrashing`).
 - Que `loadPromptCache` lanza `KVCacheError` (no crashea) ante estado/metaState corrupto para `KVCacheSimple`, `QuantizedKVCache`, `ChunkedKVCache` (`KVCacheTests.swift:717-745`).
 - Máscara basada en `leftPadding`/`lengths` para `ArraysCache.makeMask` (`testArraysCacheMaskUsesLeftPaddingAfterStateUpdate`, `testArraysCacheMaskUsesLengthsWhenLeftPaddingIsAbsent`, `KVCacheTests.swift:191-226`).
 - Máscara causal compartida (`testAttentionMaskUsesSharedCausalCachePath`, `KVCacheTests.swift:329`) y máscara SSM (`testSSMMaskUsesSharedMambaMetadataPath`, `KVCacheTests.swift:363`).

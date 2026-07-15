@@ -5,8 +5,8 @@ Backlog: `DOCS/tech-debt-and-research-backlog.md` #3 — "Unificar
 Producir recomendaciones explicables, no solo errores OOM. Incluir
 `ChatSession`, que hoy no expone wired-memory ticket por turno."
 
-Nota de alcance, no implementación. De los cuatro backlog items generation-path
-de esta rama (#3, #6, #7, y el bug de Gemma4), este es el que tiene la
+Nota de alcance, no implementación. De los tres backlog items generation-path
+que quedan tras la pasada de release (#3, #6 y #7), este es el que tiene la
 superficie de diseño más amplia — no es una decisión técnica puntual sino una
 decisión de arquitectura pública que otros dos items (#6 y #7, ver sus propios
 scoping notes) ya dependen de que se resuelva primero. Se documenta el estado
