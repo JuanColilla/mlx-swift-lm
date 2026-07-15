@@ -1,15 +1,19 @@
 # Detokenizer y media materialization: investigación
 
-Investigación del backlog item #15 (`DOCS/tech-debt-and-research-backlog.md`, prioridad
-baja-pero-estrategica): "Medir coste O(n^2) de streaming detokenization y picos CPU de
-imagen/audio". Este documento es solo investigación/análisis de código; no implementa
-ningún benchmark ni cambia código de producción.
+Investigación e implementación del backlog item #15
+(`DOCS/tech-debt-and-research-backlog.md`, prioridad baja-pero-estrategica):
+"Medir coste O(n^2) de streaming detokenization y picos CPU de imagen/audio".
+
+La primera versión de este documento aisló los hotspots. La implementación posterior añade un
+microbenchmark reproducible, acota el buffer para los tokenizers de swift-transformers y reduce
+las materializaciones CPU transitorias de vídeo/audio sin romper las APIs públicas 3.x.
 
 Ground truth previo: `DOCS/memory-kv-cache.md`, sección "Riesgos principales", items 7 y 8.
 
 ## Detokenizer complexity: what the code actually does
 
-Implementación: `Libraries/MLXLMCommon/Tokenizer.swift:71-114` (`NaiveStreamingDetokenizer`).
+Implementación histórica: `Libraries/MLXLMCommon/Tokenizer.swift`
+(`NaiveStreamingDetokenizer`).
 
 ```swift
 public mutating func append(token: Int) {
@@ -194,12 +198,13 @@ lugar de materializar todo el vídeo de una vez.
 | `UserInput.swift:136` (`array.max().item()`) | tamaño de una imagen | No, pero es un doble-recorrido sobre el array (uno para el max, otro implícito en `asData()` después) que podría fusionarse |
 | `UserInput.swift:162` (`array.asData()`) | tamaño de una imagen | No — requerido para construir el `CIImage` |
 
-## Proposed microbenchmark (not implemented)
+## Microbenchmark implementado
 
-Estilo de referencia: `Libraries/BenchmarkHelpers/BenchmarkHelpers.swift` (`BenchmarkStats`,
-warm-up + N runs cronometrados, `CFAbsoluteTimeGetCurrent()`) y, más cercano en intención,
-`Libraries/BenchmarkHelpers/SamplingBenchmarks.swift` (inputs sintéticos, sin cargar modelo,
-`measureSampling`-style helper con warm-up separado de runs cronometrados).
+`Libraries/BenchmarkHelpers/DetokenizerBenchmarks.swift` expone
+`benchmarkStreamingDetokenization(...)`. Usa `BenchmarkStats`, warm-up separado y entradas
+sintéticas sin red ni modelo. A diferencia de un benchmark basado en `NoOpTokenizer`, el
+tokenizer sintético hace trabajo lineal real por cada ID y cuenta `decodedTokenVisits`. Esta
+métrica determinista permite distinguir complejidad algorítmica del ruido del reloj.
 
 **Variable crítica que el benchmark tiene que barrer explícitamente: la cadencia de saltos de
 línea.** Es precisamente lo que decide si el resultado medido es O(n) o O(n²) — un benchmark que
@@ -213,85 +218,96 @@ nada real. El stub sintético necesita un `decode` con coste genuinamente `O(k)`
 cada id a un string corto fijo y hacer `joined`), para que la medición refleje el mecanismo real
 descrito arriba.
 
-Sketch (prosa + pseudo-Swift, no código de producción):
+Ejemplo:
 
 ```swift
-// Synthetic tokenizer: decode(tokenIds:) cuesta O(k) real (map + join),
-// a diferencia de NoOpTokenizer (O(1), no sirve para este benchmark).
-private struct SyntheticLinearTokenizer: Tokenizer {
-    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
-        tokenIds.map { "tok\($0 % 1000) " }.joined()
-    }
-    // resto de la conformance con stubs triviales, como NoOpTokenizer
-}
-
-public struct DetokenizerBenchmarkResult: Sendable {
-    let bufferLength: Int
-    let newlineEvery: Int?   // nil = sin saltos de línea (peor caso)
-    let stats: BenchmarkStats
-}
-
-// Genera una secuencia sintética de `count` "tokens" donde, cada
-// `newlineEvery` tokens, el decode producido termina en "\n" (para
-// disparar startNewSegment()). `newlineEvery == nil` nunca inserta "\n".
-private func syntheticTokenStream(count: Int, newlineEvery: Int?) -> [Int] { ... }
-
-public func benchmarkStreamingDetokenizer(
-    bufferLengths: [Int] = [100, 1_000, 10_000],
-    newlineCadences: [Int?] = [10, 100, nil],   // nil = peor caso, sin resets
-    runs: Int = BenchmarkDefaults.decodingRuns
-) -> [DetokenizerBenchmarkResult] {
-    var results: [DetokenizerBenchmarkResult] = []
-    for cadence in newlineCadences {
-        for length in bufferLengths {
-            let tokens = syntheticTokenStream(count: length, newlineEvery: cadence)
-            var times: [Double] = []
-            for _ in 0..<runs {
-                var detok = NaiveStreamingDetokenizer(tokenizer: SyntheticLinearTokenizer())
-                let start = CFAbsoluteTimeGetCurrent()
-                for token in tokens {
-                    detok.append(token: token)
-                    _ = detok.next()
-                }
-                times.append((CFAbsoluteTimeGetCurrent() - start) * 1000)
-            }
-            results.append(.init(bufferLength: length, newlineEvery: cadence,
-                                  stats: BenchmarkStats(times: times)))
-        }
-    }
-    return results
-}
+let results = benchmarkStreamingDetokenization(
+    tokenCounts: [512],
+    newlineCadences: [nil],
+    strategies: [.unbounded, .bounded(contextTokens: 16)],
+    runs: 7
+)
 ```
 
-Lectura esperada del resultado: para `newlineEvery: nil` (peor caso), tiempo vs `bufferLength`
-debería trazar una curva cuadrática (tiempo/length creciendo con length, no constante); para
-`newlineEvery: 10` o `100` (cadencias acotadas), el tiempo por token debería mantenerse
-aproximadamente constante según crece `bufferLength`, confirmando el comportamiento amortizado
-lineal. Si ambas curvas resultan planas, la hipótesis de O(n²) estaría refutada empíricamente —
-pero dado el análisis estático de arriba, no se espera ese resultado para `newlineEvery: nil`.
+En el test Debug del 15 de julio de 2026 sobre este Mac, 512 tokens sin saltos de línea dieron:
 
-Esto es solo una propuesta; implementarlo y validarlo como API pública nueva del paquete necesita
-su propia sesión revisada (no se añade ningún archivo Swift nuevo en esta investigación).
+| Estrategia | Mediana | IDs visitados por `decode` | Visitas/token |
+|---|---:|---:|---:|
+| Buffer histórico sin límite | 4.963 ms | 131328 | 256.50 |
+| Contexto acotado a 16 | 1.204 ms | 16504 | 32.23 |
+
+Los tiempos son una observación local, no un compromiso de rendimiento. Las visitas son
+deterministas: el caso histórico sigue la suma triangular `N×(N+1)/2`; el acotado visita como
+máximo una constante por token y por tanto es O(N).
+
+Comando reproducible:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild test \
+  -scheme mlx-swift-lm-Package -destination platform=macOS \
+  -only-testing:MLXLMTests/DetokenizerBenchmarkTests
+```
+
+### Corrección del path de producción
+
+`BoundedStreamingDecodeTokenizer` es un protocolo de capacidad aditivo y opcional, así que no
+añade requisitos a `Tokenizer` ni cambia su witness table. Los tokenizers custom conservan
+exactamente el buffer 3.x sin límite salvo que adopten esta capacidad. El adaptador
+`#adaptHuggingFaceTokenizer` la adopta con un solapamiento conservador de 16 tokens para los
+decoders soportados por swift-transformers. `NaiveStreamingDetokenizer` compacta solo después de
+emitir un fragmento Unicode completo y conserva ese solapamiento como contexto para el siguiente
+decode. No se comparte ni se retiene ningún `MLXArray`.
+
+El contrato es deliberadamente opt-in: un tokenizer con un decoder custom de contexto no acotado
+debe devolver `nil`. Anunciar un límite incorrecto puede cambiar el sufijo decodificado.
+
+## Mitigaciones de materialización
+
+- Vídeo: `MediaProcessing` materializa cada frame procesado como `MLXArray` dentro del bucle de
+  muestreo. La API sigue devolviendo todos los arrays, pero ya no mantiene simultáneamente la
+  colección completa de `CGImage`/`CIImage` y la colección creciente de arrays MLX.
+- Audio: `UserInput.Audio.url` acumula PCM en `Data` y copia cada `CMBlockBuffer` directamente en
+  su región final. Se elimina el `[Float]` temporal por chunk y el posterior
+  `append(contentsOf:)`. La reserva anticipada se limita a 64 MiB para no hacer una asignación
+  eager descontrolada ante audios muy largos.
+- Imagen única: no cambia; el buffer RGBAf de `asMLXArray` sigue siendo una materialización
+  necesaria y acotada por la resolución de esa imagen.
+
+Los tests de vídeo conservan número de frames, timestamps y shapes; los nuevos tests de audio
+validan dtype/shape y el passthrough de `.array`. El pico RSS/CPU exacto depende de CoreImage,
+AVFoundation, resolución y hardware, por lo que debe medirse con Instruments Allocations/Time
+Profiler en el dispositivo objetivo. No se deriva un porcentaje de ahorro de los tests unitarios.
+
+## Validación
+
+La validación se ejecutó en un clon temporal limpio creado desde `e4296d2`, para excluir los
+archivos locales duplicados con sufijo ` 2` del worktree compartido:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild test \
+  -scheme mlx-swift-lm-Package -destination platform=macOS \
+  -skipPackagePluginValidation \
+  -only-testing:MLXLMTests/DetokenizerBenchmarkTests \
+  -only-testing:MLXLMTests/UserInputAudioTests \
+  -only-testing:MLXLMTests/MediaProcesingTests
+```
+
+Resultado: 15 tests, 0 fallos. Incluye un tokenizer 3.x que no adopta la capacidad nueva, el
+camino acotado, Unicode incompleto, vídeo desde fichero/frames y audio desde fichero/array.
+`swift-api-digester -diagnose-sdk -abi` entre los módulos anterior y nuevo no reportó requisitos
+de protocolo, declaraciones eliminadas ni otros breakages; el protocolo de capacidad aparece
+solo como API aditiva. Un paquete consumidor temporal que importa `Tokenizers` y
+`MLXHuggingFace` también compiló la expansión real de `#adaptHuggingFaceTokenizer`.
 
 ## Verdict
 
-**El detokenizer no es un caso cerrado ni una falsa alarma.** El análisis estático confirma que
-`NaiveStreamingDetokenizer` es `O(m²)` por segmento entre saltos de línea, con `m` pudiendo
-llegar a `N` (la generación completa) si el modelo produce una sola línea larga sin `\n` — un
-escenario nada exótico para JSON, tool calls, código o listas. La premisa del backlog item
-(potencial O(n²)) es correcta; lo que faltaba era la caracterización condicional, que ahora está
-documentada arriba con cita de línea exacta.
+**El problema O(n²) estaba confirmado y queda corregido para el adaptador oficial de
+swift-transformers.** Los tokenizers custom mantienen el comportamiento histórico salvo que
+declaren explícitamente un contexto acotado. El benchmark conserva ambos modos para detectar
+regresiones futuras.
 
-**Prioridad:** sigue siendo razonable mantenerlo como "baja-pero-estratégica". No es un blocker
-de producción hoy (la mayoría de generación de texto natural tiene saltos de línea razonablemente
-frecuentes), pero es barato de confirmar empíricamente (el microbenchmark propuesto no necesita
-modelo ni datos reales) y, si se confirma el peor caso, barato de arreglar: la solución obvia es
-mantener un puntero de "posición ya emitida" en el tokenizer o decodificar solo el delta de
-tokens nuevos en vez de todo `segmentTokens`, cambio acotado a `Tokenizer.swift`.
-
-**En media, el hotspot más accionable es la acumulación de todos los frames de vídeo antes de
-convertirlos (`MediaProcessing.swift:442-458` / `494-524`)**, seguido de la acumulación completa
-de samples de audio antes de construir el `MLXArray` (`UserInput+Audio.swift:48-64`). Ambos
-escalan con la duración del input y no tienen equivalente en el path de imagen única, que ya está
-acotado por definición (una imagen, una resolución). Ninguno de los dos requiere romper la API
-pública para mitigarse — son cambios internos de estrategia de acumulación/streaming.
+**En media**, se han eliminado las retenciones transitorias más claras sin alterar el resultado
+público. Aun así, `ProcessedFrames.frames` y el audio final continúan siendo colecciones completas:
+el cambio reduce el pico intermedio, no convierte la API en streaming end-to-end. Una API que
+consuma frames/audio incrementalmente requeriría un diseño nuevo y queda fuera de este bloque
+compatible con 3.x.

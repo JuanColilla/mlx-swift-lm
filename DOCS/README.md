@@ -45,7 +45,7 @@ resultado, marcado explícitamente como **código verificado** o **investigació
 - Prioridad baja-estratégica #12: [kvscheme-research-note.md](kvscheme-research-note.md).
 - Prioridad baja-estratégica #13: [cache-persistence-api.md](cache-persistence-api.md).
 - Prioridad baja-estratégica #14: [conformance-dashboard.md](conformance-dashboard.md) (+ `scripts/conformance-dashboard/generate-report.sh`).
-- Prioridad baja-estratégica #15: [detokenizer-media-investigation.md](detokenizer-media-investigation.md).
+- Prioridad baja-estratégica #15: [detokenizer-media-investigation.md](detokenizer-media-investigation.md) (microbenchmark determinista, contexto acotado para swift-transformers y menor materialización transitoria de vídeo/audio).
 
 **Hallazgo no listado originalmente en el backlog, cerrado en la pasada de release:**
 
