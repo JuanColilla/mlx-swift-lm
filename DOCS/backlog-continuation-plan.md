@@ -4,23 +4,22 @@ Fecha de actualización: 2026-07-15.
 
 ## Estado de release
 
-La rama `docs/improvement-backlog-review` ya integra el `main` del fork que
-contiene:
+La rama `feature/complete-improvement-backlog` parte de `main` en `ac178f6` y
+cierra los 11 bloques operativos definidos para esta continuación. El estado,
+los commits y los límites están en
+[`backlog-completion-status.md`](backlog-completion-status.md).
 
-- el `main` oficial hasta `10e0cb7`;
-- la compatibilidad Bonsai affine 1-bit;
+La composición final conserva:
+
+- la compatibilidad Bonsai affine 1-bit y su validación física confirmada;
 - el runtime M5-safe fijado en
   `JuanColilla/mlx-swift@5e27a4cb2604599c72615cf058e09801c123b831`;
-- los cambios de implementación y documentación del backlog.
+- compatibilidad de API 3.x, comprobada contra `main`;
+- documentación separada entre comportamiento implementado, prototipos
+  experimentales y mediciones físicas todavía necesarias.
 
-De los 15 ítems originales, cinco tienen una entrega de código verificable y
-los diez restantes tienen una guía o nota de alcance. Esto no significa que
-los quince estén implementados: el índice exacto está en `DOCS/README.md`,
-sección "Implementación del backlog (2026-07-15)".
-
-La política de release es integrar sólo la parte madura y conservar como
-trabajo futuro los cambios que requieren decisiones públicas de arquitectura,
-datos de modelos reales o validación física adicional.
+No se ha creado tag ni se ha publicado esta rama: esos pasos pertenecen al
+flujo de release posterior al merge.
 
 ## Correcciones de la pasada de release
 
@@ -93,17 +92,19 @@ una variante patch sólo porque compila o porque los tests internos pasan.
 
 ## Trabajo futuro — no bloquea este release
 
-1. Añadir `estimateKVCacheBytes(...)` como función pura y cubierta por tests.
-2. Evaluar su composición con `WiredBudgetPolicy` usando casos de uso reales.
-3. Diseñar el ticket de memoria de `ChatSession` por turno o por sesión.
-4. Recoger acceptance rate real antes de fijar speculative decoding adaptativo.
-5. Integrar MTP en `ChatSession` después de resolver la política de memoria.
-6. Ejecutar la validación física de Bonsai descrita en
-   `DOCS/bonsai-1bit-compatibility.md` antes de distribuir el modelo a usuarios.
+1. Recoger benchmarks físicos reproducibles por dispositivo/modelo para
+   long-context, speculative adaptativo, MTP y materialización de media.
+2. Ejecutar los checkpoints de red del dashboard y conservar sus result
+   bundles; hasta entonces deben seguir como `not_run`.
+3. Evaluar si WHT KV merece optimización fused antes de promoverlo fuera de su
+   estado experimental.
+4. Diseñar una representación persistible de `LMOutput.State` solo si aparece
+   un requisito real de rehidratación cross-process.
+5. Medir RSS con Instruments para cuantificar los ahorros de vídeo/audio y
+   decidir si el resultado multimedia final también debe ser incremental.
 
-Los puntos 2–5 afectan superficies públicas o hot paths de generación y no se
-deben introducir como remate de una versión sin casos de producto y pruebas
-end-to-end con modelos reales.
+Ninguno de estos puntos invalida la corrección o compatibilidad de la API
+entregada; sí limita las afirmaciones de rendimiento que pueden publicarse.
 
 ## Gate final de publicación
 
@@ -114,3 +115,8 @@ end-to-end con modelos reales.
 - cero breaking changes frente a `main` anterior;
 - documentación sin afirmaciones obsoletas;
 - tag anotado con sufijo `v`, después de comprobar el último tag oficial.
+
+La validación local del 2026-07-15 aprobó los primeros seis puntos: build
+macOS, 454 tests lógicos/489 ejecuciones sin fallos ni skips, formato, diff,
+dashboard offline, compilación de integración macOS/iphoneos y cero breaking
+changes en `MLXLMCommon`. El tag continúa pendiente por diseño.

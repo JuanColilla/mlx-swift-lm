@@ -288,7 +288,7 @@ La generación del resumen en sí (`summarize` closure arriba) es una llamada de
 - Al reemplazar `instructions` con el resumen, el caché de la sesión anterior queda inválido para esos turnos (el resumen es texto nuevo, hay que re-prefillearlo) — esto es un trade-off inherente entre "ahorrar contexto" y "ahorrar prefill", no algo que MLXLMCommon resuelva por vos.
 - Nada en este repo verifica que el resumen preserve hechos citables exactos (nombres, números, cotas). Si la app depende de precisión factual sobre turnos antiguos, el resumen por LLM es lossy y hay que decidir explícitamente qué se puede permitir perder.
 
-## Tests que deberían existir y hoy mayormente no existen
+## Cobertura entregada y gaps que requieren medición real
 
 Estado real de la cobertura de tests en `Tests/MLXLMTests/` (verificado por grep):
 

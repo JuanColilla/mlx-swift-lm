@@ -37,10 +37,10 @@ El repo contiene `WiredMemoryPolicies.swift` y `WiredMemoryUtils.swift`, ademas 
 
 7. Media input materialization.
    - `UserInput.Image.array.asCIImage()` puede materializar datos CPU.
-   - Audio por URL acumula floats antes de construir `MLXArray`; para entradas largas puede ser un pico evitable.
+   - Audio y video ya evitan las colecciones transitorias mas claras, pero el resultado final sigue materializado completo; para entradas largas requiere presupuesto y medicion fisica.
 
 8. Streaming detokenizer.
-   - El detokenizer ingenuo decodifica segmentos acumulados por token para manejar Unicode parcial. Correcto, pero potencialmente O(n^2) en segmentos largos.
+   - El adaptador oficial declara contexto acotado y evita crecimiento cuadratico en segmentos largos. Los tokenizers custom conservan el camino 3.x sin limite salvo que adopten `BoundedStreamingDecodeTokenizer`.
 
 ## Mejoras propuestas
 
@@ -60,9 +60,9 @@ El repo contiene `WiredMemoryPolicies.swift` y `WiredMemoryUtils.swift`, ademas 
    - Si la calidad lo permite, activar `kvBits: 4` desde cierto token.
    - Si hay VLM/media, reservar presupuesto antes de generar.
 
-5. `ChatSession` con politica de memoria.
-   - Exponer `wiredMemoryTicket` o una policy closure por turno.
-   - Documentar/implementar fallback cuando se pide `maxKVSize` + `kvBits` en una ruta que no soporta cache rotatoria cuantizada.
+5. `ChatSession` con politica de memoria — entregado.
+   - `wiredMemoryTicket` es reemplazable entre turnos y se captura al iniciar cada stream.
+   - `maxKVSize + kvBits` conserva la cache rotatoria sin cuantizar; MTP pasa a target-only si aparece shared K/V cuantizado y expone el motivo.
 
 6. APIs throwing para cache.
    - Sustituir `fatalError` por errores lanzables en restauracion de prompt cache, conversion de cache y combinaciones no soportadas.
@@ -72,10 +72,10 @@ El repo contiene `WiredMemoryPolicies.swift` y `WiredMemoryUtils.swift`, ademas 
 
 - Comparar `KVCacheSimple`, `RotatingKVCache`, `QuantizedKVCache`, caches hibridas y Mamba/SSM en memoria y calidad.
 - Medir degradacion de calidad por `kvBits` y `quantizedKVStart` en tareas de long-context.
-- Estudiar si `kvScheme` puede soportar esquemas WHT/low-rank/product quantization sin romper APIs.
+- Medir y optimizar el prototipo `wht4`/`wht8`; low-rank y product quantization siguen en investigacion.
 - Crear stress tests de trim/copy/serialize en 8k/32k/128k tokens.
 - Unificar wired memory, GPU working set y speculative memory policy bajo una sola capa de decision.
 - Medir RSS/`Memory.activeMemory` para `KVCacheSimple.trim` y confirmar si bajar `offset` retiene buffers grandes.
 - Probar `GenerateParameters(maxKVSize: ..., kvBits: 4)` en modelos reales para validar fallo/fallback esperado.
-- Benchmark del `NaiveStreamingDetokenizer` con respuestas largas sin saltos de linea.
+- Ejecutar el benchmark del detokenizer acotado/no acotado sobre tokenizers y hardware de producto.
 - Validar `GPU.maxRecommendedWorkingSetBytes()` vs `os_proc_available_memory()` vs jetsam observado en dispositivos iOS/iPadOS reales.

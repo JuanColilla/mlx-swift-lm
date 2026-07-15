@@ -35,10 +35,10 @@ Uso real en este repo:
   `:978-979`).
 - El scoring/salida cuantizados usan `quantizedMM(...)` en el camino de atención
   cuantizada (`Libraries/MLXLMCommon/KVCache.swift:1961`, `:2001`).
-- `resolveAffineScheme(_:)` (`KVCache.swift:2021-2027`) solo resuelve `"affine4"` →
-  `(4, 64)` y `"affine8"` → `(8, 64)`; cualquier otro string cae a `nil` y
-  `maybeQuantizeKVCache` no hace nada con él (`KVCache.swift:2052-2060`), dejando la
-  puerta abierta a que un cache custom interprete el string por su cuenta.
+- `resolveAffineScheme(_:)` solo resuelve `"affine4"` → `(4, 64)` y
+  `"affine8"` → `(8, 64)`. La ruta dinámica consulta antes
+  `resolveWalshHadamardScheme(_:)` para `"wht4"`/`"wht8"`; los demás strings
+  continúan sin efecto para que un cache custom pueda interpretarlos.
 
 ### 1.2 Transformada de Hadamard: SÍ existe, y está expuesta a nivel Swift
 
@@ -63,10 +63,11 @@ Cadena de implementación: `Ops.swift:1583` → `mlx_hadamard_transform` (C API,
 `Source/Cmlx/mlx-generated/metal/hadamard.h` (funciones `hadamard_n`/`hadamard_m`,
 soporta tamaños compuestos `N = m·2^k`).
 
-`hadamardTransform` **no se usa hoy en ningún fichero Swift de este repo**
-(`grep -rn "hadamardTransform" --include="*.swift" .` fuera de `.build` no devuelve
-resultados). Es un op disponible y sin usar, no algo que haya que construir desde
-cero.
+En la investigacion inicial, `hadamardTransform` no tenia consumidores Swift en
+este repo. Esa observacion ya no describe la rama actual:
+`WalshHadamardKVCache.swift` lo aplica a keys/values antes de cuantizar y de
+nuevo tras dequantizar. El prototipo confirma que el op puede componerse sin un
+kernel nuevo; no confirma todavia una mejora de latencia o RSS.
 
 ### 1.3 Precedente de "rotar antes de cuantizar" ya en este repo
 
@@ -110,14 +111,15 @@ familia de tamaños — 64 y 128 son `2^k` puros y caen dentro del rango soporta
 de la lista salvo 12·8=96, que sí encaja). Este cálculo debe rehacerse por arquitectura
 antes de comprometerse, no asumirse.
 
-**Veredicto: feasible-with-moderate-work.** El kernel fusionado ya existe y está
+**Veredicto inicial: feasible-with-moderate-work.** El kernel fusionado ya existe y está
 expuesto en Swift — no hace falta escribir Metal a mano, a diferencia de lo que
 sugiere el fraseo del ticket original ("si MLX Swift lo permite eficientemente"). El
 trabajo real está en (a) verificar compatibilidad de tamaño por head_dim/arquitectura,
 (b) decidir si la rotación se aplica por cabeza o sobre el head_dim completo, (c)
 medir si el error de cuantización realmente baja para las distribuciones de KV reales
 de los modelos soportados, y (d) diseñar el nuevo caso de `QuantizedKVCacheProtocol`
-(ver sección 3). Es un experimento de una–dos semanas, no una investigación abierta.
+(ver sección 3). La rama actual ya materializa la variante conservadora
+descrita allí; la medición empírica sigue abierta.
 
 ### 2.2 Product Quantization (PQ)
 
