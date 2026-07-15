@@ -4,11 +4,12 @@ Item de backlog #12 (`DOCS/tech-debt-and-research-backlog.md`): "Affine4/8 ya so
 Explorar WHT, product quantization o compresión híbrida si MLX Swift lo permite
 eficientemente."
 
-Esta nota es investigación, no implementación. No hay código de producción aquí,
-siguiendo el mismo estándar de honestidad que `RotatingKVCache.quantized(...)`
-(`Libraries/MLXLMCommon/KVCache.swift:798-808`), que lanza
-`KVCacheError("RotatingKVCache quantization not yet implemented ...")` en vez de
-fingir soporte.
+La investigación inicial dio lugar a un prototipo WHT experimental y opt-in,
+documentado en `DOCS/wht-kv-cache-prototype.md`. No es una recomendación de
+producción: usa una ruta correcta de dequantización + WHT inversa antes de la
+atención estándar, con un coste de ejecución que todavía debe medirse en hardware
+físico. Product quantization y compresión híbrida avanzada siguen siendo sólo
+investigación.
 
 ## 1. Qué expone hoy mlx-swift
 
@@ -159,7 +160,7 @@ superficie de diseño (política de selección por capa, testing de calidad por
 combinación). Es efectivamente un paso posterior a 2.1, no una tercera vía
 independiente.
 
-## 3. Recomendación: menor siguiente paso viable
+## 3. Menor siguiente paso viable — implementado como prototipo
 
 `GenerateParameters.kvScheme: String?` (`Evaluate.swift:79`) y
 `resolveAffineScheme(_:)` (`KVCache.swift:2021`) ya están diseñados para exactamente
@@ -168,26 +169,23 @@ este caso — el propio doc comment de `kvScheme` dice "Extensible for custom sc
 pasar sin efecto cualquier string que `resolveAffineScheme` no reconozca
 (`KVCache.swift:2052-2060`), precisamente para que un cache custom lo intercepte.
 
-Forma más pequeña de prototipar WHT sin tocar la API pública:
+El prototipo adopta una variante conservadora de la forma propuesta:
 
-1. Un nuevo tipo que conforme `QuantizedKVCacheProtocol`
-   (`KVCache.swift:145-160`) — análogo a `QuantizedKVCache` pero que aplique
-   `hadamardTransform` a keys/values antes de `quantized(...)` en
-   `updateQuantized(keys:values:)`, y la inversa tras `dequantized(...)` en el camino
-   de lectura.
-2. Un resolver de scheme análogo a `resolveAffineScheme`, p.ej.
-   `resolveWHTScheme(_ scheme: String?) -> (bits: Int, groupSize: Int)?` reconociendo
-   un string nuevo (p.ej. `"wht4"`/`"wht8"`), consultado desde `maybeQuantizeKVCache`
-   antes o después de `resolveAffineScheme` (mismo patrón de precedencia que ya existe
-   entre `kvScheme` y `kvBits`, `KVCache.swift:2049-2060`).
-3. Reutilizar `resolvedKVQuantizationGroupSize` (`KVCache.swift:811-829`) para
-   mantener la misma lógica de group size compatible por head_dim, más una
-   verificación adicional de que el head_dim cumple la restricción `m·2^k` de
-   `hadamardTransform` — si no la cumple, hacer fallback a affine puro (mismo patrón
-   defensivo que ya usa `maybeQuantizeKVCache` al descartar caches no cuantizables).
-4. No tocar `RotatingKVCache` en esta primera vuelta — su `quantized` ya declara
-   explícitamente que no está implementado; un esquema WHT debería nacer solo para
-   `KVCacheSimple → QuantizedKVCache`-equivalente, igual que affine4/8 hoy.
+1. `WalshHadamardQuantizedKVCache` no conforma `QuantizedKVCacheProtocol`. Almacena
+   keys/values transformados y cuantizados, pero dequantiza y aplica la inversa antes
+   de devolverlos a la atención estándar. Esta diferencia corrige un defecto del
+   boceto inicial: el camino `quantizedMM` habría consumido `H(K)`/`H(V)` sin
+   transformar `Q` ni invertir la salida.
+2. `resolveWalshHadamardScheme` reconoce `wht4`/`wht8` y
+   `maybeQuantizeKVCache` los trata como opt-in explícito con precedencia sobre
+   `kvBits`.
+3. La conversión usa sólo dimensiones `2^k`, además de validar dtype y group sizes
+   32/64/128. Aunque el kernel forward admite otros `m·2^k`, la API pública no expone
+   su inversa y repetir la transformación no reconstruye, por ejemplo, dimensión 80.
+   Si un caso no es compatible, conserva el `KVCacheSimple`; no cambia
+   silenciosamente a affine porque eso haría que el valor solicitado de `kvScheme`
+   no describiese el runtime.
+4. `RotatingKVCache` permanece fuera de alcance, igual que en el camino afín actual.
 
 No se necesita ningún cambio en mlx-swift/mlx-core para este primer prototipo — todo
 lo que hace falta (`hadamardTransform`, `quantized`, `dequantized`, `quantizedMM`) ya
