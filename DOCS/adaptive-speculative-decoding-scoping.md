@@ -1,100 +1,149 @@
-# Runtime adaptive speculative decoding — scoping note
+# Runtime adaptive speculative decoding
 
-Backlog: `DOCS/tech-debt-and-research-backlog.md` #6 — "Usar
-`SpeculativeDecodingTelemetry` para ajustar o abandonar speculative en
-caliente. Investigar pares target/draft mantenidos oficialmente."
+Backlog: `DOCS/tech-debt-and-research-backlog.md` #6 — usar
+`SpeculativeDecodingTelemetry` para abandonar speculative decoding en caliente
+cuando la aceptación medida del par target/draft no justifica seguir usando el
+modelo auxiliar.
 
-Esta es una nota de alcance/diseño, no una implementación. Toca el loop de
-generación de `SpeculativeTokenIterator` (`Libraries/MLXLMCommon/Evaluate.swift`),
-que es ruta caliente y correctness-crítica compartida por cualquier app que
-use speculative decoding clásico. Cambiarlo sin verificación end-to-end con
-un modelo real (no solo tests con pesos sintéticos) es exactamente el tipo de
-riesgo que este backlog advierte evitar — así que se deja como diseño para
-una sesión dedicada, no como código en esta rama.
+## Estado
 
-## Qué existe hoy (verificado leyendo el código actual)
+Implementado como API pública aditiva y **opt-in** para speculative decoding
+clásico. Si el caller no pasa una política, el iterador conserva exactamente el
+comportamiento fijo anterior durante toda la generación.
 
-`SpeculativeDecodingTelemetry` (`Libraries/MLXLMCommon/SpeculativeDecoding.swift:14-98`)
-ya acumula, en vivo, ronda a ronda: `roundCount`, `draftTokenCount`,
-`acceptedDraftTokenCount`, `targetModelCallCount`, `draftModelCallCount`,
-`targetVerifiedTokenCount`, `emittedTokenCount`, más las propiedades
-derivadas `acceptanceRate`, `meanAcceptedDraftTokensPerRound`,
-`meanEmittedTokensPerTargetCall`.
+La implementación no incluye un umbral global ni afirma resultados de ningún
+dispositivo. La tasa útil depende del par target/draft, la distribución de
+prompts, los parámetros de sampling y el hardware; el caller debe obtener los
+valores de su propio benchmark.
 
-`SpeculativeTokenIterator` (`Evaluate.swift:783-1035`) mantiene esta
-telemetría como `private var telemetry` (`Evaluate.swift:814`), expuesta
-públicamente vía `speculativeDecodingTelemetry` (`Evaluate.swift:815-817`,
-`nil` hasta la primera ronda). Cada llamada a `next()` que agota el buffer
-de tokens pendientes invoca `speculateRound()` (`Evaluate.swift:1024`), que
-al final llama `telemetry.recordRound(...)` (`Evaluate.swift:978-982`) — es
-decir, **la telemetría ya está actualizada y disponible en el momento exacto
-en que se decidiría si vale la pena la siguiente ronda especulativa**, antes
-de la llamada a `speculateRound()` del siguiente `next()`.
+## API
 
-Lo que **no existe**: ningún punto de `speculateRound()` o `next()` lee
-`telemetry.acceptanceRate` (o cualquier otra métrica) para decidir nada.
-`speculateRound()` se invoca incondicionalmente cada vez que el buffer de
-pendientes se vacía (`Evaluate.swift:1021-1024`); `numDraftTokens` es un
-`let` fijado una sola vez en `init` (`Evaluate.swift:806`, `840`, `857`) — no
-hay ningún mecanismo para reducirlo, ni para abandonar speculative y caer a
-generación normal a mitad de stream.
+`AdaptiveSpeculativeDecodingPolicy` exige cuatro valores explícitos:
 
-## Qué requeriría implementarlo
+- `warmUpRounds`: mínimo de rondas speculative totales antes de evaluar;
+- `observationWindowRounds`: tamaño de la ventana móvil de rondas recientes;
+- `minimumObservedDraftTokens`: mínimo de propuestas dentro de esa ventana;
+- `minimumAcceptanceRate`: tasa mínima medida, inclusiva. Solo una tasa
+  estrictamente inferior activa el fallback.
 
-1. **Decisión de abandono ("fall back a generación normal")**: `next()`
-   tendría que poder, en algún punto, dejar de llamar `speculateRound()` y
-   en su lugar hacer una llamada normal `mainModel(...)` de un solo token —
-   es decir, `SpeculativeTokenIterator` necesita un segundo modo de
-   operación, análogo al `passthrough` que ya existe en
-   `MTPSpeculativeTokenIterator` (`Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift`,
-   ver `switchToPassthrough`/`passthroughStep`) pero que hoy **no existe**
-   para el speculative decoding clásico. Este es el cambio estructural
-   principal, no un simple `if`.
-2. **Umbral de abandono**: el backlog no fija un número, y no debería
-   inventarse uno sin datos — `acceptanceRate` varía enormemente por
-   par target/draft y por tarea (código vs. prosa vs. instrucciones cortas).
-   Un umbral fijo (p.ej. "abandona si acceptanceRate < 0.3 tras N rondas")
-   sin medición real es exactamente el tipo de constante fabricada que este
-   documento evita proponer. El paso previo real es instrumentar
-   `IntegrationTesting` con pares target/draft reales y medir
-   acceptanceRate por tarea antes de fijar cualquier umbral — ver la
-   sección "Investigación propuesta" de `DOCS/performance-and-generation.md`,
-   que ya pide exactamente esto.
-3. **Ajuste de longitud de draft** (en vez de abandono binario): más
-   sofisticado — reducir `numDraftTokens` dinámicamente en vez de
-   abandonar del todo. Requiere que `numDraftTokens` deje de ser `let`
-   (`Evaluate.swift:806`) y que `speculateRound()` decida su propio
-   `numDraft` por ronda a partir de la telemetría reciente (no solo
-   acumulada desde el inicio — probablemente una ventana móvil de las
-   últimas K rondas, ya que `acceptanceRate` es acumulado histórico y una
-   mala racha reciente puede quedar diluida por buenas rondas tempranas).
-4. **Pares target/draft mantenidos oficialmente**: esto es trabajo de
-   catalogación/testing (qué draft models funcionan bien con qué targets),
-   no de código — encaja mejor como una tabla en
-   `DOCS/compatibility-matrix.md` o un nuevo doc, alimentada por
-   `IntegrationTesting`, una vez exista una forma repetible de medir
-   acceptance rate por par (ítem #1 del backlog, benchmark suite).
+El inicializador es `throws` y rechaza rondas/muestras no positivas y tasas no
+finitas o fuera de `0...1`. No existe `default`, `recommended` ni heurística
+dependiente del dispositivo.
 
-## Recomendación
+La política puede pasarse a:
 
-No implementar el abandono/ajuste adaptativo todavía. Orden correcto:
+- `SpeculativeTokenIterator(..., adaptivePolicy:)`;
+- `generate(..., draftModel:, adaptivePolicy:)`;
+- `generateTokens(..., draftModel:, adaptivePolicy:)`.
 
-1. Primero, extender el benchmark harness (`DOCS/tech-debt-and-research-backlog.md`
-   #1, ya con soporte JSON vía `BenchmarkReport` en esta rama) para medir
-   `acceptanceRate` real por par target/draft y por tipo de prompt.
-2. Con datos reales, decidir si un umbral fijo simple basta o si hace falta
-   una política más rica (ventana móvil, por tarea, etc.).
-3 Solo entonces diseñar el modo `passthrough`-equivalente para
-   `SpeculativeTokenIterator`, reutilizando el patrón ya probado en
-   `MTPSpeculativeTokenIterator` (que sí tiene un modo passthrough real y
-   testeado hoy — ver `Tests/MLXLMTests/MTPQuantizationOnsetTests.swift`),
-   con tests sintéticos de la transición **y** verificación con
-   `IntegrationTesting` sobre un modelo real, exactamente como se verificó
-   el fix de este documento hermano (`DOCS/gemma4-chunked-prefill-investigation.md`)
-   debía verificarse antes de tocar código compartido de generación.
+Ejemplo en el que los valores proceden de un perfil medido por la app:
 
-Implementar esto sin datos de aceptación reales tiene alto riesgo de fijar
-un umbral que ni ayuda (demasiado conservador, nunca abandona) ni protege
-(demasiado agresivo, abandona speculative decoding útil) — el propio ticket
-original ya apunta a esto al pedir "investigar pares target/draft" antes
-del umbral, no después.
+```swift
+let adaptivePolicy = try AdaptiveSpeculativeDecodingPolicy(
+    warmUpRounds: measuredProfile.warmUpRounds,
+    observationWindowRounds: measuredProfile.windowRounds,
+    minimumObservedDraftTokens: measuredProfile.minimumDraftSamples,
+    minimumAcceptanceRate: measuredProfile.acceptanceRateFloor
+)
+
+let stream = try generateTokens(
+    input: input,
+    parameters: parameters,
+    context: targetContext,
+    draftModel: draftModel,
+    numDraftTokens: measuredProfile.draftLength,
+    adaptivePolicy: adaptivePolicy
+)
+```
+
+## Semántica de decisión
+
+`AdaptiveSpeculativeDecodingController` registra únicamente rondas realmente
+completadas por `SpeculativeTokenIterator`. Para cada ronda conserva
+`drafted`/`accepted`, recorta el historial a las últimas
+`observationWindowRounds` y sigue este orden:
+
+1. espera a `warmUpRounds`;
+2. espera a que la ventana esté completa;
+3. espera a que la ventana contenga `minimumObservedDraftTokens` propuestas;
+4. calcula `accepted / drafted` sobre esa ventana reciente;
+5. continúa en speculative si la tasa es mayor o igual al umbral;
+6. cambia una sola vez a autoregresivo si es estrictamente inferior.
+
+El cambio es sticky: no se vuelve a cargar el draft en la misma generación y
+no hay oscilación entre modos. Esto mantiene explicable el coste y evita tomar
+decisiones repetidas sobre ventanas que ya no reciben nuevas rondas
+speculative.
+
+## Equivalencia en la transición
+
+La decisión se toma al terminar una ronda, después de verificar, aceptar y
+rebobinar los caches. El iterador primero entrega todos los tokens pendientes
+de esa ronda. Después procesa con el target el último token de
+corrección/bonus (`y`) contra el `mainCache` ya recortado y continúa a un token
+por forward.
+
+Se preservan durante el cambio:
+
+- el `LogitProcessor` canónico, actualizado solo con tokens aceptados/emitidos;
+- el `LogitSampler` del caller;
+- `mainState` y el KV cache del target;
+- cuantización dinámica del KV cache;
+- `maxTokens` y el contador de tokens emitidos.
+
+El cache del draft deja de usarse. No se descarga el modelo ni se modifica su
+ciclo de vida: esa decisión pertenece al caller que lo comparte o retiene.
+
+## Telemetría explicable
+
+`SpeculativeDecodingTelemetry.adaptive` es `nil` sin política. Cuando está
+activa contiene `AdaptiveSpeculativeDecodingTelemetry` con:
+
+- la política exacta usada;
+- estado: `warmingUp`, `collectingWindow`, `insufficientDraftTokens`,
+  `monitoring` o `autoregressive`;
+- número de ventanas realmente evaluadas;
+- llamadas al target realizadas después del cambio a autoregresivo;
+- rondas, propuestas y aceptaciones de la última ventana;
+- `observedAcceptanceRate` calculada sobre esa ventana;
+- ronda total del fallback y motivo estructurado
+  `acceptanceRateBelowMinimum`, si ocurrió.
+
+La telemetría acumulada previa (`roundCount`, `draftTokenCount`,
+`acceptedDraftTokenCount`, calls y tokens emitidos) se mantiene compatible.
+Al pasar a autoregresivo, rondas y contadores del draft dejan de crecer;
+`targetModelCallCount`/`targetVerifiedTokenCount` incluyen los forwards
+target-only y `emittedTokenCount` sigue reflejando el stream completo.
+
+## Cobertura sintética
+
+`Tests/MLXLMTests/AdaptiveSpeculativeDecodingTests.swift` cubre:
+
+- validación de cada entrada de la política, incluidos `NaN` e infinitos;
+- independencia entre warm-up y ventana;
+- mínimo de muestras dentro de la ventana;
+- igualdad exacta con el umbral (no abandona) y caída estricta (abandona);
+- ventana móvil reciente frente a la media acumulada histórica;
+- transición sticky y señal emitida una sola vez;
+- equivalencia token a token con generación target-only, con y sin penalty
+  processors, usando logits deterministas de alto margen;
+- ausencia de nuevas llamadas al draft después del fallback;
+- permanencia en speculative con aceptación alta;
+- compatibilidad del camino anterior cuando `adaptivePolicy == nil`;
+- propagación del estado final dentro de `GenerateCompletionInfo` mediante
+  `SpeculativeDecodingTelemetry`.
+
+Los tests sintéticos prueban el contrato y la transición sin atribuir
+rendimiento a hardware. Para adoptar la política en producto sigue siendo
+necesario medir target/draft/prompt reales en build Release y comparar tiempo,
+energía y memoria además de acceptance rate.
+
+## Fuera de alcance
+
+- Elegir o publicar pares target/draft recomendados.
+- Definir un umbral universal.
+- Ajustar dinámicamente `numDraftTokens`.
+- Volver de autoregresivo a speculative dentro de la misma generación.
+- Descargar o liberar automáticamente el draft model al cambiar de modo.
+- Activar esta política por defecto en `ChatSession`.
+- Inferir mejora de rendimiento únicamente a partir de acceptance rate.
