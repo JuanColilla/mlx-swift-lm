@@ -41,6 +41,40 @@ public class ChatSessionTests: XCTestCase {
         }
     }
 
+    private enum EventCollectionError: Error {
+        case timeout
+    }
+
+    private static func collectTicketEvents(
+        stream: AsyncStream<WiredMemoryEvent>,
+        ticketIDs: Set<UUID>
+    ) async throws -> [WiredMemoryEvent] {
+        try await withThrowingTaskGroup(of: [WiredMemoryEvent].self) { group in
+            group.addTask {
+                var events: [WiredMemoryEvent] = []
+                var ended = Set<UUID>()
+                for await event in stream {
+                    events.append(event)
+                    if event.kind == .ticketEnded, let ticketID = event.ticketID {
+                        ended.insert(ticketID)
+                    }
+                    if ended.isSuperset(of: ticketIDs) {
+                        return events
+                    }
+                }
+                return events
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(5))
+                throw EventCollectionError.timeout
+            }
+
+            let events = try await group.next() ?? []
+            group.cancelAll()
+            return events
+        }
+    }
+
     private static func makeModel(processor: TestInputProcessor = TestInputProcessor())
         -> ModelContext
     {
@@ -410,6 +444,83 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertEqual(loadCount, 1)
     }
 
+    func testWiredMemoryTicketCanChangeBetweenTurns() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let manager = WiredMemoryManager.makeForTesting(
+                configuration: .init(
+                    policyOnlyWhenUnsupported: true,
+                    baselineOverride: 0,
+                    useRecommendedWorkingSetWhenUnsupported: false
+                )
+            )
+            let policy = MLXLMCommon.WiredSumPolicy(cap: 1 << 20)
+            let firstTicket = policy.ticket(size: 1_024, manager: manager)
+            let secondTicket = policy.ticket(size: 2_048, manager: manager)
+            let eventStream = await manager.events()
+            let eventTask = Task {
+                try await Self.collectTicketEvents(
+                    stream: eventStream,
+                    ticketIDs: [firstTicket.id, secondTicket.id]
+                )
+            }
+
+            let session = ChatSession(
+                Self.makeModel(),
+                generateParameters: GenerateParameters(maxTokens: 1, temperature: 0)
+            )
+            session.wiredMemoryTicket = firstTicket
+            _ = try await session.respond(to: "first")
+            session.wiredMemoryTicket = secondTicket
+            _ = try await session.respond(to: "second")
+
+            let events = try await eventTask.value
+            let startedIDs = Set(
+                events.filter { $0.kind == .ticketStarted }.compactMap(\.ticketID)
+            )
+            let endedIDs = Set(
+                events.filter { $0.kind == .ticketEnded }.compactMap(\.ticketID)
+            )
+            XCTAssertTrue(startedIDs.isSuperset(of: [firstTicket.id, secondTicket.id]))
+            XCTAssertTrue(endedIDs.isSuperset(of: [firstTicket.id, secondTicket.id]))
+        }
+    }
+
+    func testWiredMemoryTicketPropagatesToSpeculativeGeneration() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let manager = WiredMemoryManager.makeForTesting(
+                configuration: .init(
+                    policyOnlyWhenUnsupported: true,
+                    baselineOverride: 0,
+                    useRecommendedWorkingSetWhenUnsupported: false
+                )
+            )
+            let ticket = MLXLMCommon.WiredSumPolicy(cap: 1 << 20).ticket(
+                size: 1_024,
+                manager: manager
+            )
+            let eventStream = await manager.events()
+            let eventTask = Task {
+                try await Self.collectTicketEvents(stream: eventStream, ticketIDs: [ticket.id])
+            }
+
+            let session = ChatSession(
+                Self.makeModel(),
+                speculativeDecoding: SpeculativeDecodingConfig(
+                    draftModel: ModelContainer(context: Self.makeModel()),
+                    numDraftTokens: 2
+                ),
+                generateParameters: GenerateParameters(maxTokens: 2, temperature: 0)
+            )
+            session.wiredMemoryTicket = ticket
+            _ = try await session.respond(to: "speculate")
+
+            let events = try await eventTask.value
+            XCTAssertTrue(
+                events.contains { $0.kind == .ticketStarted && $0.ticketID == ticket.id })
+            XCTAssertTrue(events.contains { $0.kind == .ticketEnded && $0.ticketID == ticket.id })
+        }
+    }
+
     // MARK: - KV Cache
 
     func testCurrentCacheNilBeforeGeneration() async throws {
@@ -425,6 +536,75 @@ public class ChatSessionTests: XCTestCase {
         await session.withCache { cache in
             XCTAssertNotNil(cache)
         }
+    }
+
+    func testPrefillPopulatesCacheWithoutGeneratingTokens() async throws {
+        let session = ChatSession(
+            model(),
+            generateParameters: GenerateParameters(maxTokens: 50, temperature: 0)
+        )
+
+        try await session.prefill("hello")
+
+        await session.withCache { cache in
+            XCTAssertEqual(cache?.map(\.offset), Array(repeating: 8, count: 8))
+        }
+    }
+
+    func testPrefillPreservesLMOutputStateForNextTurn() async throws {
+        let processor = TestInputProcessor()
+        let stateModel = PrefillStateTrackingModel(vocabularySize: 100)
+        let context = ModelContext(
+            configuration: processor.configuration,
+            model: stateModel,
+            processor: processor,
+            tokenizer: processor.tokenizer
+        )
+        let session = ChatSession(
+            context,
+            generateParameters: GenerateParameters(maxTokens: 1, temperature: 0)
+        )
+
+        try await session.prefill("prefill")
+        _ = try await session.respond(to: "continue")
+
+        XCTAssertGreaterThanOrEqual(stateModel.receivedStates.count, 2)
+        XCTAssertNil(stateModel.receivedStates[0])
+        XCTAssertEqual(stateModel.receivedStates[1], 1)
+    }
+
+    func testCancelledPrefillKeepsPreviouslyCommittedCache() async throws {
+        let processorCounter = PrefillProcessorCounter()
+        let processor = CancellablePrefillProcessor(counter: processorCounter)
+        let stateModel = PrefillStateTrackingModel(vocabularySize: 100)
+        let context = ModelContext(
+            configuration: ModelConfiguration(id: "prefill-cancellation-test"),
+            model: stateModel,
+            processor: processor,
+            tokenizer: processor.tokenizer
+        )
+        let session = ChatSession(
+            context,
+            generateParameters: GenerateParameters(maxTokens: 1, temperature: 0)
+        )
+        try await session.prefill("committed")
+        let sessionBox = UncheckedSendableBox(session)
+
+        let task = Task {
+            try await sessionBox.value.prefill("cancelled")
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        task.cancel()
+        do {
+            try await task.value
+            XCTFail("expected CancellationError")
+        } catch is CancellationError {
+            // expected
+        }
+
+        _ = try await sessionBox.value.respond(to: "continue")
+        XCTAssertGreaterThanOrEqual(stateModel.receivedStates.count, 2)
+        XCTAssertEqual(stateModel.receivedStates[1], 1)
     }
 
     func testInitWithKVCache() async throws {
@@ -476,6 +656,124 @@ public class ChatSessionTests: XCTestCase {
             ctx, cache: loadedCache, generateParameters: generationParameters)
         let result = try await restored.respond(to: "hello again")
         XCTAssertGreaterThan(result.count, targetLength, result)
+    }
+
+    func testPrefillSaveLoadValidatesMetadataAndRemainsLowLevelCompatible() async throws {
+        let context = model()
+        let initial = ChatSession(
+            context,
+            generateParameters: GenerateParameters(maxTokens: 1, temperature: 0)
+        )
+        try await initial.prefill("persistent context")
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let metadata = ["model": "test", "promptFingerprint": "abc123"]
+        try await initial.saveCache(to: url, metadata: metadata)
+
+        let (_, lowLevelMetadata) = try loadPromptCache(url: url)
+        XCTAssertEqual(lowLevelMetadata["model"], "test")
+        XCTAssertEqual(
+            lowLevelMetadata[ChatSession.cacheFormatVersionMetadataKey],
+            String(ChatSession.cacheFormatVersion)
+        )
+
+        let snapshot = try ChatSession.loadCache(from: url, validating: metadata)
+        XCTAssertEqual(snapshot.metadata, metadata)
+        XCTAssertEqual(snapshot.formatVersion, ChatSession.cacheFormatVersion)
+
+        let restored = ChatSession(
+            context,
+            cache: snapshot.cache,
+            generateParameters: GenerateParameters(maxTokens: 2, temperature: 0)
+        )
+        let result = try await restored.respond(to: "continue")
+        XCTAssertGreaterThan(result.count, targetLength, result)
+    }
+
+    func testCacheMetadataMismatchIsRejected() async throws {
+        let session = ChatSession(
+            model(),
+            generateParameters: GenerateParameters(maxTokens: 1, temperature: 0)
+        )
+        try await session.prefill("persistent context")
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try await session.saveCache(to: url, metadata: ["model": "test"])
+
+        XCTAssertThrowsError(
+            try ChatSession.loadCache(from: url, validating: ["model": "other"])
+        ) { error in
+            guard case ChatSessionCacheError.cacheMetadataMismatch(_, _, _) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testHighLevelCacheLoadRejectsMissingAndUnsupportedVersions() async throws {
+        let session = ChatSession(
+            model(),
+            generateParameters: GenerateParameters(maxTokens: 1, temperature: 0)
+        )
+        try await session.prefill("persistent context")
+
+        let missingVersionURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("safetensors")
+        let futureVersionURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("safetensors")
+        defer {
+            try? FileManager.default.removeItem(at: missingVersionURL)
+            try? FileManager.default.removeItem(at: futureVersionURL)
+        }
+
+        try await session.withCache { cache in
+            let cache = try XCTUnwrap(cache)
+            try savePromptCache(url: missingVersionURL, cache: cache)
+            try savePromptCache(
+                url: futureVersionURL,
+                cache: cache,
+                metadata: [ChatSession.cacheFormatVersionMetadataKey: "999"]
+            )
+        }
+        XCTAssertThrowsError(try ChatSession.loadCache(from: missingVersionURL)) { error in
+            guard case ChatSessionCacheError.missingCacheFormatVersion = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+
+        XCTAssertThrowsError(try ChatSession.loadCache(from: futureVersionURL)) { error in
+            guard case ChatSessionCacheError.unsupportedCacheFormatVersion(_, _) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testReservedCacheMetadataKeyIsRejected() async throws {
+        let session = ChatSession(
+            model(),
+            generateParameters: GenerateParameters(maxTokens: 1, temperature: 0)
+        )
+        try await session.prefill("persistent context")
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("safetensors")
+
+        do {
+            try await session.saveCache(
+                to: url,
+                metadata: [ChatSession.cacheFormatVersionMetadataKey: "2"]
+            )
+            XCTFail("expected reservedCacheMetadataKey")
+        } catch ChatSessionCacheError.reservedCacheMetadataKey(_) {
+            // expected
+        }
     }
 
     func testCurrentCacheNilForHistorySessionBeforeGeneration() async throws {
@@ -576,5 +874,77 @@ public class ChatSessionTests: XCTestCase {
         while model.isBusy {
             try await Task.sleep(for: .milliseconds(10))
         }
+    }
+}
+
+private let prefillStateSequenceKey = LMOutput.Key<Int>("chat-session-prefill-sequence")
+
+/// Test-only transfer wrapper. Tests await the child task before accessing the
+/// wrapped single-consumer session again, so no concurrent use is permitted.
+private struct UncheckedSendableBox<Value>: @unchecked Sendable {
+    let value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+}
+
+private actor PrefillProcessorCounter {
+    private var count = 0
+
+    func next() -> Int {
+        count += 1
+        return count
+    }
+}
+
+private struct CancellablePrefillProcessor: UserInputProcessor {
+    let counter: PrefillProcessorCounter
+    let tokenizer = TestTokenizer()
+
+    func prepare(input: UserInput) async throws -> LMInput {
+        if await counter.next() == 2 {
+            try await Task.sleep(for: .seconds(5))
+        }
+        return LMInput(tokens: MLXArray(Array(1 ... tokenizer.length)))
+    }
+}
+
+private final class PrefillStateTrackingModel: Module, LanguageModel, KVCacheDimensionProvider {
+    let vocabularySize: Int
+    var kvHeads: [Int] { [] }
+    private(set) var receivedStates: [Int?] = []
+
+    init(vocabularySize: Int) {
+        self.vocabularySize = vocabularySize
+        super.init()
+    }
+
+    func prepare(
+        _ input: LMInput,
+        cache: [KVCache],
+        state: LMOutput.State?,
+        windowSize: Int?
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(
+        _ input: LMInput.Text,
+        cache: [KVCache]?,
+        state: LMOutput.State?
+    ) -> LMOutput {
+        let previous = state?[prefillStateSequenceKey]
+        receivedStates.append(previous)
+
+        var nextState = state ?? LMOutput.State()
+        nextState[prefillStateSequenceKey] = (previous ?? 0) + 1
+
+        let tokenCount = input.tokens.size
+        let logits = MLXArray(
+            Array(repeating: Float(0), count: tokenCount * vocabularySize),
+            [1, tokenCount, vocabularySize]
+        )
+        return LMOutput(logits: logits, state: nextState)
     }
 }

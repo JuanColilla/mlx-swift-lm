@@ -1,14 +1,18 @@
-# API de persistencia de KV cache (prompt caching seguro)
+# API de persistencia de KV cache
 
-> Cubre el backlog item #13 ("Cache persistence API. Prompt caching seguro para
-> apps RAG y asistentes con system prompts largos"). La API descrita aquí ya
-> existe en el repo — este documento explica cómo usarla de forma segura, con
-> ejemplos verificados contra el código y los tests actuales, y señala los
-> huecos reales de la API pública en lugar de inventar soluciones.
+Backlog #13: prompt caching seguro para apps RAG, asistentes con system prompts
+largos y sesiones que necesitan preparar contexto sin emitir una respuesta.
 
-## 1. La API base
+La implementación mantiene dos niveles deliberadamente separados:
 
-Definida en `Libraries/MLXLMCommon/KVCache.swift`:
+- `savePromptCache` / `loadPromptCache`: formato de bajo nivel, sin opinión
+  sobre versión ni significado de la metadata;
+- `ChatSession`: prefill sin generación visible, metadata de usuario,
+  versionado reservado y validación antes de entregar el cache.
+
+## API de bajo nivel: sin cambios
+
+`Libraries/MLXLMCommon/KVCache.swift` conserva las firmas existentes:
 
 ```swift
 public func savePromptCache(
@@ -22,217 +26,206 @@ public func loadPromptCache(
 ) throws -> ([KVCache], [String: String])
 ```
 
-(`Libraries/MLXLMCommon/KVCache.swift:1603` y `:1648`.)
+El archivo safetensors contiene los arrays de cada cache, su `metaState`, el
+nombre de la clase concreta y la metadata del llamador. Esta capa sigue siendo
+la vía de interoperabilidad para archivos antiguos, herramientas externas y
+consumidores que administran directamente `[KVCache]`.
 
-### Qué serializan
+No se añadió una versión obligatoria a estas funciones. Un archivo creado con
+`savePromptCache` continúa pudiendo usar cualquier metadata —o ninguna— y
+`loadPromptCache` devuelve esa información sin interpretarla.
 
-- `url` debe tener extensión `.safetensors`. Cualquier otra extensión lanza
-  `LoadSaveError.unknownExtension` desde `save(arrays:metadata:url:)` /
-  `loadArraysAndMetadata(url:)` de MLX (`.build/checkouts/mlx-swift/Source/MLX/IO.swift:61-176`)
-  — estas dos funciones de MLX son el I/O real por debajo de `savePromptCache`/`loadPromptCache`.
-- Por cada `KVCache` en el array de entrada, `savePromptCache` toma:
-  - `cache.state`: los `[MLXArray]` (keys/values u otro estado según el tipo de caché),
-    aplanados en el safetensors con claves `"i.j"` (caché `i`, array `j` dentro de ese caché).
-  - `cache.metaState`: `[String]` con metadatos internos de reconstrucción (offset,
-    tamaño máximo, bits de cuantización, etc., variable según el tipo concreto de caché),
-    guardado bajo claves `"0.i.j"`.
-  - El nombre de clase Swift del caché (`KVCacheSimple`, `RotatingKVCache`,
-    `QuantizedKVCache`, `ChunkedKVCache`, `MambaCache`, `ArraysCache`, `CacheList`),
-    bajo `"2.i"`, usado para reconstruir el tipo correcto al cargar.
-  - El `metadata: [String: String]` que pases tú, bajo `"1.key"`.
-- El escritor de MLX materializa los `MLXArray` para poder serializarlos, así que no
-  hace falta llamar `.eval()` manualmente antes de `savePromptCache` — ningún test de
-  este repo lo hace (`Tests/MLXLMTests/KVCacheTests.swift`).
+## Prefill público sin tokens visibles
 
-### El parámetro `metadata`
-
-Es un diccionario `[String: String]` de uso libre para el llamador. La API no le da
-ningún significado especial — es el sitio correcto para guardar tu propia información
-de versionado: qué texto de system prompt/contexto RAG generó este caché, qué modelo
-y cuantización se usó, un timestamp, etc. Ver sección 3 (checklist de seguridad):
-esto es crítico porque cargar un caché "stale" contra un prompt *distinto* del que lo
-generó produce atención silenciosamente incorrecta — no hay ningún chequeo automático
-de esto en la API (verificado: no hay ninguna ocurrencia de `hash`, `fingerprint`,
-`checksum`, `modelId` ni `modelType` en `KVCache.swift` ni `ChatSession.swift`).
-
-## 2. Ejemplo real: caché de un system prompt largo / contexto RAG
-
-`ChatSession` (`Libraries/MLXLMCommon/ChatSession.swift`) es el único punto de entrada
-público que produce un `[KVCache]` ya "prefillado" y lo puede volcar a disco. El flujo
-real, verificado contra `Tests/MLXLMTests/ChatSessionTests.swift:464-479`
-(`testSaveAndRestoreCache`), es:
+`ChatSession` expone dos formas aditivas:
 
 ```swift
-// --- Paso 1: construir el caché una vez, con el system prompt / contexto RAG largo ---
-
-let longSystemPrompt = "... documento RAG largo o instrucciones extensas ..."
-
-let container = ModelContainer(context: modelContext)
-let session = ChatSession(
-    container,
-    instructions: longSystemPrompt,
-    generateParameters: GenerateParameters(maxTokens: 1)  // ver nota más abajo
+try await session.prefill(
+    "Contexto RAG largo",
+    role: .system
 )
 
-// Fuerza el prefill del system prompt. saveCache(to:) exige que haya habido
-// al menos una generación (ver ChatSessionError.noCacheAvailable más abajo),
-// así que no hay forma de "solo prefillar sin generar" con la API pública actual.
-_ = try await session.respond(to: "ok")
+try await session.prefill(messages: [
+    .system("Eres un asistente especializado."),
+    .user(documento),
+])
+```
 
-let cacheURL = URL(fileURLWithPath: "/path/to/system-prompt.safetensors")
+`prefill` usa el mismo processor, media processing, tools y
+`additionalContext` que una generación normal. Ejecuta `LanguageModel.prepare`,
+evalúa únicamente los tokens restantes que el modelo no haya consumido y
+materializa el KV cache. No crea un `TokenIterator`, no muestrea una respuesta y
+no abre un stream, por lo que no hay tokens de salida que descartar.
+
+El `LMOutput.State` devuelto por el modelo se guarda junto al cache en la sesión
+y se entrega al siguiente turno. Esto es necesario para modelos que mantienen
+estado posicional por llamada, como los que usan deltas M-RoPE.
+
+La operación es transaccional respecto a la sesión. Cuando ya existe un cache,
+`prefill` trabaja sobre copias; solo sustituye el estado comprometido después de
+completar processor, modelo y evaluación. Si hay error o cancelación, el cache
+anterior sigue disponible. En sesiones con speculative decoding, el prefill se
+replica en el draft model cuando su política de memoria lo admite, para mantener
+ambos caches alineados.
+
+## Guardado con metadata y versión
+
+La firma histórica permanece:
+
+```swift
 try await session.saveCache(to: cacheURL)
+```
 
-// --- Paso 2 (sesiones futuras): cargar el caché y arrancar sin re-prefillar ---
+La sobrecarga nueva añade metadata de usuario:
 
-let (loadedCache, savedMetadata) = try loadPromptCache(url: cacheURL)
+```swift
+try await session.saveCache(
+    to: cacheURL,
+    metadata: [
+        "model": "org/model@revision",
+        "quantization": "4-bit",
+        "promptFingerprint": sha256,
+    ]
+)
+```
 
-// ver sección 3: valida savedMetadata contra tu fingerprint esperado ANTES
-// de construir la sesión con este caché.
+Ambas firmas escriben automáticamente:
+
+```swift
+ChatSession.cacheFormatVersion == 1
+ChatSession.cacheFormatVersionMetadataKey
+    == "mlx-swift-lm.chat-session-cache.format-version"
+```
+
+La clave es reservada. Pasarla dentro de la metadata del llamador produce
+`ChatSessionCacheError.reservedCacheMetadataKey` en lugar de permitir que una app
+sobrescriba la versión declarada.
+
+El versionado pertenece al contrato de alto nivel de `ChatSession`; no cambia la
+estructura interna de `savePromptCache`. Por eso el mismo archivo continúa
+siendo legible con `loadPromptCache`, que devolverá tanto las claves de usuario
+como la clave reservada.
+
+## Carga y validación
+
+Para caches creados mediante `ChatSession`, la ruta recomendada es:
+
+```swift
+let snapshot = try ChatSession.loadCache(
+    from: cacheURL,
+    validating: [
+        "model": "org/model@revision",
+        "promptFingerprint": expectedSHA256,
+    ]
+)
 
 let restored = ChatSession(
-    container,                 // debe ser el MISMO modelo/cuantización que generó el caché
-    instructions: nil,         // nil: el system prompt ya está codificado en el caché
-    cache: loadedCache,
-    generateParameters: GenerateParameters()
+    modelContainer,
+    instructions: nil,
+    cache: snapshot.cache
 )
-
-let answer = try await restored.respond(to: "pregunta real del usuario")
 ```
 
-### Gap real #1: no hay "prefill-only" público
+`ChatSessionCacheSnapshot` expone:
 
-`ChatSession.saveCache(to:)` (`ChatSession.swift:899`) solo puede leer el caché desde
-el estado interno `.kvcache`, que únicamente existe tras `respond()`/`streamResponse()`.
-Si se llama antes, lanza `ChatSessionError.noCacheAvailable`
-(`"No KV cache is available. Call respond() or streamResponse() before saveCache(to:)."`,
-`ChatSession.swift:911-919`, cubierto por `testSaveCacheThrowsBeforeGeneration`).
+- `cache`: los `[KVCache]` restaurados;
+- `metadata`: solo la metadata del usuario, sin la clave reservada;
+- `formatVersion`: la versión ya parseada y validada.
 
-Bajando un nivel, `TokenIterator` (`Evaluate.swift:556`) tampoco ayuda: su inicializador
-llama `prepare(input:)` internamente, y `prepare` ya "ceba la bomba" generando un primer
-token como parte del prefill (`Evaluate.swift:690-710`, comentario "evaluate the
-remainder of the prompt -- this primes the pump"). Además, la propiedad `cache` de
-`TokenIterator` **no es `public`** (`Evaluate.swift:567`), así que ni siquiera se puede
-extraer el `[KVCache]` de un `TokenIterator` manualmente desde fuera del módulo.
+La carga de alto nivel falla con `ChatSessionCacheError` en estos casos:
 
-**Conclusión honesta**: hoy no existe una API pública para "prefillar sin generar
-ningún token". El patrón práctico es forzar `GenerateParameters(maxTokens: 1)` para
-minimizar el coste del token de descarte y luego llamar `saveCache(to:)`. Esto es un
-gap real de la API, no una limitación inventada — si se necesita evitar por completo
-la generación de tokens, haría falta una API nueva (p.ej. un `prefill(input:)` público
-en `ChatSession` o exponer `TokenIterator.cache`).
+- falta la clave de versión: `missingCacheFormatVersion`;
+- la versión no es un entero: `invalidCacheFormatVersion`;
+- la versión no coincide con la soportada: `unsupportedCacheFormatVersion`;
+- una clave esperada falta o tiene otro valor: `cacheMetadataMismatch`;
+- el llamador intenta validar la propia clave reservada:
+  `reservedCacheMetadataKey`.
 
-### Gap real #2: `saveCache(to:)` no acepta `metadata`
+Los caches anteriores a esta API no tienen la clave reservada. No se interpretan
+de forma ambigua: `ChatSession.loadCache` los rechaza como no versionados, pero
+`loadPromptCache` sigue cargándolos exactamente como antes. La app puede entonces
+aplicar su política de migración o descartarlos y repetir el prefill.
 
-`ChatSession.saveCache(to:)` llama a `savePromptCache(url:cache:)` **sin** pasar
-`metadata`, es decir, siempre con `[:]` (`ChatSession.swift:899-908`):
+## Flujo recomendado para RAG o system prompts largos
 
 ```swift
-public func saveCache(to url: URL) async throws {
-    try await cache.read { cache in
-        switch cache {
-        case .kvcache(let cache, _, _):
-            try savePromptCache(url: url, cache: cache)   // sin metadata
-        default:
-            throw ChatSessionError.noCacheAvailable
-        }
-    }
-}
+let session = ChatSession(modelContainer, instructions: longSystemPrompt)
+session.wiredMemoryTicket = turnTicket
+
+try await session.prefill("Contexto compartido", role: .system)
+try await session.saveCache(
+    to: cacheURL,
+    metadata: [
+        "model": modelRevision,
+        "promptFingerprint": fingerprint,
+    ]
+)
+
+let snapshot = try ChatSession.loadCache(
+    from: cacheURL,
+    validating: [
+        "model": modelRevision,
+        "promptFingerprint": fingerprint,
+    ]
+)
+
+let restored = ChatSession(
+    modelContainer,
+    instructions: nil,
+    cache: snapshot.cache
+)
+restored.wiredMemoryTicket = nextTurnTicket
 ```
 
-Y el método interno que expondría el `[KVCache]` crudo, `withCache(_:)`, no es `public`
-(`ChatSession.swift:878`, comentado explícitamente como "meant for test support").
+No se deben repetir en `instructions` los tokens ya incluidos en el cache
+restaurado. Hacerlo duplica el contexto lógico y puede producir resultados
+incoherentes.
 
-**Consecuencia práctica**: usando solo la API pública de `ChatSession`, no hay forma de
-adjuntar tu propio fingerprint (hash del system prompt, id de modelo, versión del
-formato de caché) al mismo archivo `.safetensors`. La solución honesta es un **archivo
-sidecar**: guarda un JSON/plist junto al `.safetensors` con esa información, y valida
-ese sidecar antes de cargar el caché real. Ver sección 3.
+El `wiredMemoryTicket` es mutable porque `ChatSession` ya es single-consumer y no
+thread-safe. Se captura al comenzar cada turno y se propaga a `generateTask` tanto
+en generación normal como speculative. `prefill` también usa la instantánea del
+ticket alrededor de su trabajo y la libera de forma segura ante cancelación.
 
-Si tu app puede permitirse ir por debajo de `ChatSession` (construyendo el `[KVCache]`
-tú mismo con `makePromptCache(model:parameters:)` y llamando `savePromptCache` a mano),
-sí tienes acceso directo al parámetro `metadata` — pero entonces pierdes el prefill
-automático que da `ChatSession`/`TokenIterator` y tendrías que reimplementar el
-prefill llamando a APIs de más bajo nivel del modelo, que quedan fuera del alcance
-de este documento porque no hay un patrón público y probado para ello en este repo.
+## Checklist de seguridad
 
-## 3. Checklist de seguridad
+Antes de reutilizar un cache persistido:
 
-Antes de confiar en un caché cargado con `loadPromptCache(url:)`, verifica:
+1. Guardar y validar un fingerprint del contenido exacto que originó el cache.
+2. Guardar y validar id, revisión y cuantización del modelo.
+3. Tratar cualquier error de I/O, safetensors, `KVCacheError` o validación como
+   cache no utilizable y repetir el prefill.
+4. Serializar los guardados: el escritor de safetensors de MLX no debe usarse
+   concurrentemente sobre el mismo estado.
+5. No guardar mientras otra operación utiliza el mismo `ChatSession`; `saveCache`
+   espera acceso exclusivo al contenedor de cache.
 
-1. **Fingerprint del contenido** (no hay nada automático — hazlo tú):
-   - Al guardar: calcula un hash (p.ej. SHA-256) del texto exacto del system
-     prompt / contexto RAG y guárdalo en tu sidecar (o en `metadata` si vas por
-     la ruta de bajo nivel de la sección 2).
-   - Al cargar: recalcula el hash del prompt que la sesión actual va a usar y
-     compara contra el guardado **antes** de construir el `ChatSession` con
-     `cache:`. Si no coincide, descarta el caché y re-prefillar desde cero.
-   - Esto es crítico: no hacerlo produce salidas incoherentes de forma
-     silenciosa, no un error — el modelo simplemente atiende sobre un contexto
-     que no es el que el resto de la conversación asume.
+## Límites deliberados
 
-2. **Archivo corrupto o truncado**: `loadPromptCache` ya no usa `fatalError`
-   (cambio reciente en esta rama) — lanza `KVCacheError` con mensajes específicos,
-   verificados en `Tests/MLXLMTests/KVCacheTests.swift:695-745`:
-   - `KVCacheSimple`/`KVCache` con un número de arrays distinto de 2:
-     `"Corrupt prompt cache: KVCacheSimple state must have exactly 2 arrays (keys, values), found \(n)"`.
-   - `QuantizedKVCache` con `metaState` distinto de 4 valores:
-     `"Corrupt prompt cache: QuantizedKVCache metaState must have exactly 4 values, found \(n)"`,
-     o con un número de arrays que no es 4 ni 6.
-   - `ChunkedKVCache` con `metaState` distinto de 2 valores:
-     `"Corrupt prompt cache: ChunkedKVCache metaState must have exactly 2 values, found \(n)"`.
-   - `RotatingKVCache` con `metaState` inválido, `maxSize == "None"`, o un
-     `maxSize` no parseable como `Int`.
-   - Estructura de metadata del propio archivo inválida (menos de 3 entradas
-     top-level): `"Invalid cache metadata format"`.
-   - Mismatch entre el número de cachés, de `cacheInfo` y de `cacheClasses`:
-     `"Mismatch in cache counts"`.
-   - Nombre de clase desconocido: `"Unknown cache class: \(className)"`.
+- Para preservar el cache comprometido ante error o cancelación, un `prefill`
+  incremental copia temporalmente los caches principal y draft. En contextos
+  muy largos esto puede aproximarse a duplicar su memoria hasta el commit.
+- `LMOutput.State` se conserva entre `prefill` y los turnos posteriores de la
+  misma sesión, pero no se serializa. Es un diccionario tipado que puede contener
+  valores arbitrarios y no tiene hoy un contrato de persistencia estable. Una
+  sesión creada únicamente con `[KVCache]` arranca con state `nil`.
+- La metadata permite a la app detectar modelo, revisión, prompt o cuantización
+  incompatibles; el framework no puede inferir de forma fiable esos valores a
+  partir de los tensores del cache.
+- `RotatingKVCache` sin `maxSize` no es restaurable. Los errores estructurales de
+  cache siguen correspondiendo a `KVCacheError` en la capa de bajo nivel.
+- El número de versión `1` reserva el contrato actual. Cualquier evolución
+  incompatible debe incrementar `cacheFormatVersion` y añadir una migración o un
+  rechazo explícito; nunca reinterpretar silenciosamente un archivo anterior.
 
-   Todos estos son `throw`, capturables con un simple `do/catch` alrededor de
-   `loadPromptCache(url:)`. Un fichero que no exista o no sea un safetensors
-   válido no llega siquiera a producir un `KVCacheError` — falla antes, dentro
-   de `loadArraysAndMetadata(url:)` de MLX, con un error genérico de I/O de MLX
-   (o `LoadSaveError.unknownExtension` si la extensión no es `.safetensors`).
-   Trata cualquier error de esta llamada como "caché no utilizable, re-prefillar".
+## Cobertura
 
-3. **Caché de un modelo/cuantización distinto al que está cargado ahora**: no
-   hay ninguna validación en el código actual. Ni `loadPromptCache` ni los
-   inicializadores de `ChatSession(_:cache:...)` comprueban que el caché
-   corresponda al modelo dado — el doc comment de esos inicializadores dice
-   explícitamente que el llamador es responsable ("a non-empty `[KVCache]`
-   previously loaded with `loadPromptCache(url:)`, **matching the given
-   model**", `ChatSession.swift:328-329` y `:374-375`). Cargar un caché de un
-   modelo A en una sesión de un modelo B probablemente no falle limpio: puede
-   producir un crash por mismatch de shapes dentro de la atención, o (peor)
-   salida con apariencia válida pero semánticamente basura, dependiendo de si
-   las dimensiones (número de capas, KV heads, head dim) coinciden por
-   casualidad. **Guarda el id/revisión del modelo y el esquema de
-   cuantización en tu metadata/sidecar y verifícalo explícitamente antes de
-   pasar el caché a `ChatSession`.**
+`Tests/MLXLMTests/ChatSessionTests.swift` cubre:
 
-## 4. Limitaciones conocidas
-
-- `KVCacheSimple.trim` baja el offset lógico pero no garantiza liberar
-  inmediatamente el backing storage (`DOCS/memory-kv-cache.md`, riesgo 6) — si
-  tu app trimea un caché cargado antes de reutilizarlo, no asumas que la
-  memoria se libera de inmediato.
-- `RotatingKVCache` puede crecer temporalmente por encima de `maxCacheSize`
-  durante un prefill multi-token (`DOCS/memory-kv-cache.md`) — ten esto en
-  cuenta al dimensionar el presupuesto de memoria para el prefill inicial de
-  un system prompt largo, no solo para el estado ya persistido.
-  Además, `RotatingKVCache` con `maxSize == nil` (metaState `"None"`) no se
-  puede restaurar en absoluto: `restoreCacheFromMetaState` lanza `KVCacheError`
-  para ese caso explícitamente (`KVCache.swift:1714-1718`) — no uses
-  `RotatingKVCache` sin `maxSize` si planeas persistir el caché.
-- No existe ningún mecanismo de versionado del propio formato de serialización
-  (la estructura `"i.j"` / `"0.i.j"` / `"1.key"` / `"2.i"`). Si el formato
-  cambia en una versión futura del paquete, un caché guardado con una versión
-  antigua podría cargar con datos corridos/mal interpretados en lugar de un
-  error claro. Recomendación: incluye la versión del paquete o un número de
-  versión de formato propio en tu metadata/sidecar también.
-- `ArraysCache` y `MambaCache` se reconstruyen vía `restoreFromMetaState`
-  (no `throws`) — a diferencia de los demás tipos, no se verificó en el código
-  actual que rechacen entradas corruptas de la misma forma explícita que
-  `KVCacheSimple`/`RotatingKVCache`/`QuantizedKVCache`/`ChunkedKVCache`; no
-  asumas la misma cobertura de errores para esos dos tipos sin revisar
-  `KVCache.swift` directamente si tu app los usa.
+- prefill sin tokens generados y offset exacto del cache;
+- continuidad de `LMOutput.State` al siguiente turno;
+- cancelación sin corromper el cache comprometido;
+- guardado, carga y restauración tras prefill;
+- metadata, clave reservada, versión ausente y versión futura;
+- interoperabilidad mediante `loadPromptCache`;
+- propagación y reemplazo por turno de wired-memory tickets, incluida la ruta
+  speculative.
