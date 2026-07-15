@@ -2,7 +2,7 @@
 
 ## Estado actual
 
-El paquete publica `MLXLLM`, `MLXVLM`, `MLXLMCommon`, `MLXEmbedders`, `MLXHuggingFace`, `BenchmarkHelpers` e `IntegrationTestHelpers` (`Package.swift`). La version de Swift requerida es 6.1 y el core depende de la revision exacta `15e907bf` de `JuanColilla/mlx-swift`, que anade cuantizacion affine de 1 bit sobre la base oficial actualizada.
+El paquete publica `MLXLLM`, `MLXVLM`, `MLXLMCommon`, `MLXEmbedders`, `MLXHuggingFace`, `BenchmarkHelpers` e `IntegrationTestHelpers` (`Package.swift`). La version de Swift requerida es 6.1 y el core depende de la revision exacta `5e27a4cb` de `JuanColilla/mlx-swift`, que anade cuantizacion affine de 1 bit sobre la base oficial actualizada y desactiva NAX en GPU gen-17 por correccion.
 
 La compatibilidad LLM es amplia: `LLMTypeRegistry.shared` registra 58 `model_type`, con familias como Mistral, Mixtral, Llama, Phi/Phi3/PhiMoE, Gemma 1/2/3/3n/4, Qwen2/Qwen3/Qwen3.5/MoE/Next, MiniCPM, Starcoder2, Cohere, OpenELM, InternLM2, DeepSeek V3, Granite, GLM4, Falcon H1, Bitnet, SmolLM3, Ernie, LFM2, Baichuan, Exaone, GPT-OSS, Olmo, Nemotron, Jamba, Mamba2, Mistral3, Apertus y otros (`Libraries/MLXLLM/LLMModelFactory.swift:23`). Hay 54 ficheros Swift bajo `Libraries/MLXLLM/Models`.
 
