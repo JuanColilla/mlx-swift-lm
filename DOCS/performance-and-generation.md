@@ -6,9 +6,15 @@
 
 El repo tambien contiene una implementacion de speculative decoding con telemetria (`SpeculativeDecodingTelemetry`) y politica de memoria (`SpeculativeDecodingMemoryPolicy`) basada en `GPU.maxRecommendedWorkingSetBytes()` (`Libraries/MLXLMCommon/SpeculativeDecoding.swift`). Hay tests especificos de speculative decoding y MTP en `Tests/MLXLMTests/SpeculativeDecodingTests.swift`, `MTP*Tests.swift` e integracion en `IntegrationTesting/IntegrationTestingTests/MTP*`.
 
-El `TokenIterator` separa prefill y decode, y la informacion final de generacion expone campos para speculative/MTP como `proposedDraftTokens`, `acceptedDraftTokens`, `passthroughReason` y `speculativeDecodingTelemetry`. `BenchmarkHelpers` ya ofrece benchmark base con warm-up, mediana y `temperature: 0`, pero no hay equivalente oficial para speculative clasico ni MTP.
+El `TokenIterator` separa prefill y decode, y la informacion final de generacion expone campos para speculative/MTP como `proposedDraftTokens`, `acceptedDraftTokens`, `passthroughReason` y `speculativeDecodingTelemetry`. `BenchmarkHelpers` ofrece benchmark base con warm-up, mediana y `temperature: 0`, microbenchmarks de sampling, un schema JSON generico y un adaptador MTP. Los resultados de speculative clasico, checkpoint y dispositivo siguen perteneciendo a los tests de integracion que los ejecuten.
 
-MTP merece seguimiento propio. `MTPSpeculativeTokenIterator` propone bloques de tokens mediante un drafter asociado al target; los tests de integracion muestran mejoras reales con `blockSize` 4 frente a 6 en escenarios medidos. La brecha principal: MTP con KV cuantizado no esta implementado y entra en passthrough sticky, por lo que `GenerateParameters(maxKVSize: ..., kvBits: 4)` puede anular una de las optimizaciones mas interesantes para dispositivos limitados.
+MTP merece seguimiento propio. `MTPSpeculativeTokenIterator` propone bloques
+de tokens mediante un drafter asociado al target y `ChatSession` lo expone con
+`MTPSpeculativeDecodingConfig`, incluida admisión de memoria, carga eager o
+deferred y telemetría. La verificación MTP con shared K/V cuantizado no está
+implementada: cuando la cuantización entra en vigor, el iterador pasa de forma
+sticky a target-only. Los tests prueban el contrato, no una mejora universal de
+rendimiento; hace falta medir cada target/drafter/dispositivo.
 
 El cambio 3.x documentado en `README.md` es importante para rendimiento real: el core queda desacoplado de tokenizer/downloader, y la ruta comoda se mueve a `MLXHuggingFace` macros. Eso permite comparar implementaciones de tokenizacion/descarga sin contaminar la generacion.
 
@@ -23,16 +29,15 @@ El cambio 3.x documentado en `README.md` es importante para rendimiento real: el
    - El default actual es 512. Conviene investigar perfiles por arquitectura: modelos con estado recurrente, MoE, VLM con muchas imagenes y modelos de contexto largo pueden necesitar otros pasos.
    - Proponer una API de recomendacion, por ejemplo `GenerationProfile.recommendedPrefillStepSize(model:device:promptTokens:)`, dejando el valor manual como escape hatch.
 
-3. Speculative decoding gobernado por datos.
-   - Ya existe telemetria de rondas, draft tokens, aceptados, llamadas al target y ratio de aceptacion.
-   - Falta convertir esa telemetria en decision adaptativa: parar speculative si `acceptanceRate` cae por debajo de un umbral durante N rondas, ajustar longitud de draft, o volver al modo normal si el draft no amortiza memoria/latencia.
-   - Investigar pares target/draft por familia: Gemma4/Gemma4 draft, Qwen3/Qwen pequeno, Llama/Llama pequeno, y no solo tamanos genericos.
+3. Calibrar speculative decoding adaptativo con datos reales.
+   - `AdaptiveSpeculativeDecodingPolicy` ya permite abandonar speculative de forma opt-in y sticky cuando una ventana medida cae por debajo del umbral configurado.
+   - Falta publicar perfiles medidos por par target/draft y dispositivo; la API no inventa un umbral universal.
+   - Investigar pares por familia y, como trabajo posterior, si compensa ajustar también la longitud de draft en runtime.
 
-4. MTP como producto de rendimiento, no solo test de integracion.
-   - Integrar MTP en `ChatSession`, o documentar claramente que solo vive en APIs lower-level.
-   - Exponer `MTPSpeculativeDecodingConfig` con `blockSize`, politica de memoria, fallback y telemetria.
-   - Eliminar `print` directo en passthrough y reemplazarlo por logging configurable o eventos.
-   - Convertir `fatalError` de compatibilidad target/drafter en preflight throwing.
+4. Validar MTP de alto nivel en modelos y dispositivos reales.
+   - `ChatSession` y `MTPSpeculativeDecodingConfig` ya cubren `blockSize`, política de memoria, fallback target-only y telemetría.
+   - Los fallos de configuración y compatibilidad recuperables usan errores; los fallbacks no dependen de `print` directo.
+   - Falta ejecutar la matriz de benchmark con pesos reales para elegir target/drafter, bloque y presupuesto por producto.
 
 5. Separar coste de sampling del coste del modelo.
    - `topP`, `topK` y `minP` aplican filtros sobre vocabulario completo. En vocabularios grandes, el coste no es gratis.
@@ -45,10 +50,10 @@ El cambio 3.x documentado en `README.md` es importante para rendimiento real: el
 ## Tech debt
 
 - La medicion de rendimiento esta dispersa entre tests, `BenchmarkHelpers` e integracion. Hay primitives, pero falta una historia de "run this and compare".
-- Las politicas de speculative decoding tienen gating de memoria, pero no parecen cerrar el loop con calidad/acceptance en runtime.
-- `GenerateCompletionInfo.summary()` todavia se centra en prompt/generation TPS; deberia resumir acceptance rate, emitted/target call y passthrough.
-- MTP no cubre KV quantization y no esta en `ChatSession`.
-- La documentacion de uso dice como cargar y chatear, pero no da una receta oficial para elegir `prefillStepSize`, `maxKVSize`, `kvBits` o draft model.
+- El fallback adaptativo ya cierra el loop con acceptance rate en runtime, pero su calibración sigue perteneciendo al producto y requiere benchmarks reales.
+- `GenerateCompletionInfo.summary()` expone datos speculative/MTP y MTP tiene adaptador JSON; falta decidir qué subconjunto conviene mostrar en cada UI o informe de producto y estandarizar el adaptador de speculative clasico.
+- MTP está integrado en `ChatSession`, pero no verifica con shared K/V cuantizado y pasa a target-only cuando aparece esa condición.
+- El playbook y las recetas documentan los controles, pero no publican valores universales para `prefillStepSize`, `maxKVSize`, `kvBits` o draft model porque dependen del modelo y dispositivo.
 - Conviene evitar que futuras optimizaciones dependan solo de tests unitarios con pesos sinteticos; esos tests son buenos para contratos, pero no capturan TTFT ni memoria real.
 
 ## Investigacion propuesta

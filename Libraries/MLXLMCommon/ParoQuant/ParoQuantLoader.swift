@@ -349,6 +349,31 @@ public func loadParoQuantModel<T: LanguageModel>(
     tokenizerLoader: any TokenizerLoader,
     toolCallFormat: ToolCallFormat? = nil
 ) async throws -> ModelContainer {
+    try await loadParoQuantModel(
+        from: directory,
+        typeRegistry: typeRegistry,
+        tokenizerLoader: tokenizerLoader,
+        toolCallFormat: toolCallFormat,
+        thinkingSupport: nil)
+}
+
+/// Load a ParoQuant model with explicit thinking-mode metadata.
+///
+/// - Parameters:
+///   - directory: Local path to the model checkpoint directory.
+///   - typeRegistry: Registry used to create the underlying model architecture.
+///   - tokenizerLoader: Loader for tokenizer.
+///   - toolCallFormat: Optional tool-call format for the model configuration.
+///   - thinkingSupport: Optional explicit thinking-mode metadata. Downloaded template
+///     inference is used when this is `nil`.
+/// - Returns: A ``ModelContainer`` ready for inference.
+public func loadParoQuantModel<T: LanguageModel>(
+    from directory: URL,
+    typeRegistry: ModelTypeRegistry<T>,
+    tokenizerLoader: any TokenizerLoader,
+    toolCallFormat: ToolCallFormat? = nil,
+    thinkingSupport: ThinkingSupport?
+) async throws -> ModelContainer {
     // 1. Parse config.json (flatten VLM text_config if present)
     let configURL = directory.appendingPathComponent("config.json")
     var configData = try Data(contentsOf: configURL)
@@ -396,7 +421,9 @@ public func loadParoQuantModel<T: LanguageModel>(
 
     var config = ModelConfiguration(
         directory: directory, stopStrings: genConfig?.stopStrings,
-        toolCallFormat: toolCallFormat)
+        toolCallFormat: toolCallFormat,
+        thinkingSupport: thinkingSupport
+            ?? ThinkingSupport.infer(fromTokenizerDirectory: directory))
     config.eosTokenIds = eosTokenIds
 
     // 5. Load raw safetensors (top-level only; do not recurse into

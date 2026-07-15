@@ -453,6 +453,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        guard n > 0 else { return 0 }
         let trimmed = min(offset, n)
         offset -= trimmed
         return trimmed
@@ -740,7 +741,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(offset, n)
+        guard n > 0, isTrimmable else { return 0 }
+        let trimmed = min(offset, idx, n)
         offset -= trimmed
         idx -= trimmed
         return trimmed
@@ -1106,6 +1108,7 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        guard n > 0 else { return 0 }
         let trimmed = min(offset, n)
         offset -= trimmed
         return trimmed
@@ -1205,7 +1208,8 @@ public class ChunkedKVCache: KVCacheSimple {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(offset - startPosition, n)
+        guard n > 0 else { return 0 }
+        let trimmed = min(max(0, offset - startPosition), n)
         offset -= trimmed
         return trimmed
     }
@@ -1621,6 +1625,7 @@ private func cacheClassName(_ cache: KVCache) -> String {
     case is MambaCache: return "MambaCache"
     case is ArraysCache: return "ArraysCache"
     case is RotatingKVCache: return "RotatingKVCache"
+    case is WalshHadamardQuantizedKVCache: return "WalshHadamardQuantizedKVCache"
     case is QuantizedKVCache: return "QuantizedKVCache"
     case is KVCacheSimple: return "KVCache"
     case is CacheList: return "CacheList"
@@ -1779,6 +1784,27 @@ private func restoreCacheFromMetaState(
             )
         }
         let cache = QuantizedKVCache()
+        cache.state = state
+        cache.metaState = metaState
+        return cache
+
+    case "WalshHadamardQuantizedKVCache":
+        guard
+            metaState.count == 5,
+            metaState.first == WalshHadamardQuantizedKVCache.formatVersion
+        else {
+            throw KVCacheError(
+                message:
+                    "Corrupt prompt cache: WalshHadamardQuantizedKVCache metaState must contain the supported format and four quantization values"
+            )
+        }
+        guard state.count == 4 || state.count == 6 else {
+            throw KVCacheError(
+                message:
+                    "Corrupt prompt cache: WalshHadamardQuantizedKVCache state must have exactly 4 or 6 arrays, found \(state.count)"
+            )
+        }
+        let cache = WalshHadamardQuantizedKVCache()
         cache.state = state
         cache.metaState = metaState
         return cache
@@ -2061,7 +2087,7 @@ public func resolveAffineScheme(_ scheme: String?) -> (bits: Int, groupSize: Int
 }
 
 /// Converts regular caches to quantized caches when:
-/// - kvBits is specified (or kvScheme resolves to a built-in affine scheme)
+/// - kvBits is specified (or kvScheme resolves to a built-in scheme)
 /// - The cache is not already quantized
 /// - The cache offset is greater than quantizedKVStart
 ///
@@ -2071,8 +2097,9 @@ public func resolveAffineScheme(_ scheme: String?) -> (bits: Int, groupSize: Int
 ///   - kvGroupSize: Group size for quantization
 ///   - quantizedKVStart: Token count threshold to begin quantizing
 ///   - kvScheme: Scheme selector; overrides kvBits when it names a built-in
-///     affine scheme ("affine4", "affine8"). Unrecognized schemes are left to
-///     custom cache implementations and do not quantize here.
+///     affine scheme ("affine4", "affine8") or experimental Walsh-Hadamard
+///     scheme ("wht4", "wht8"). Unrecognized schemes are left to custom cache
+///     implementations and do not quantize here.
 public func maybeQuantizeKVCache(
     cache: inout [KVCache],
     kvBits: Int?,
@@ -2083,12 +2110,19 @@ public func maybeQuantizeKVCache(
     // Resolve effective bits: kvScheme overrides kvBits.
     let effectiveBits: Int
     let effectiveGroupSize: Int
-    if let scheme = kvScheme, let resolved = resolveAffineScheme(scheme) {
+    let useWalshHadamard: Bool
+    if let scheme = kvScheme, let resolved = resolveWalshHadamardScheme(scheme) {
         effectiveBits = resolved.bits
         effectiveGroupSize = resolved.groupSize
+        useWalshHadamard = true
+    } else if let scheme = kvScheme, let resolved = resolveAffineScheme(scheme) {
+        effectiveBits = resolved.bits
+        effectiveGroupSize = resolved.groupSize
+        useWalshHadamard = false
     } else if let kvBits {
         effectiveBits = kvBits
         effectiveGroupSize = kvGroupSize
+        useWalshHadamard = false
     } else {
         return
     }
@@ -2113,6 +2147,14 @@ public func maybeQuantizeKVCache(
     /// original cache unchanged if conversion is not possible or not (yet)
     /// supported for this entry -- see ``KVCacheSimple/quantized(groupSize:bits:)``.
     func quantize(_ cache: KVCacheSimple) -> KVCache {
+        if useWalshHadamard {
+            return
+                (try? cache.walshHadamardQuantized(
+                    groupSize: effectiveGroupSize,
+                    bits: effectiveBits
+                )) ?? cache
+        }
+
         let state = cache.state
         if state.count == 2 {
             let keyHeadDim = state[0].dim(3)

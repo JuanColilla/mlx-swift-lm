@@ -48,10 +48,13 @@ struct CompatibilityMatrixGeneratorTests {
         print("\n### LLM recommended models (\(llmModels.count) registered)")
         for model in llmModels {
             let toolFormat = model.toolCallFormat?.rawValue ?? "-"
+            let thinking = model.thinkingSupport.map(describeThinkingSupport) ?? "-"
             let eos =
                 model.extraEOSTokens.isEmpty
                 ? "-" : model.extraEOSTokens.sorted().joined(separator: ",")
-            print("- \(model.name) | toolCallFormat=\(toolFormat) | extraEOS=\(eos)")
+            print(
+                "- \(model.name) | toolCallFormat=\(toolFormat) | thinking=\(thinking) | extraEOS=\(eos)"
+            )
         }
 
         let vlmModels = VLMRegistry.shared.models.sorted { $0.name < $1.name }
@@ -69,5 +72,16 @@ struct CompatibilityMatrixGeneratorTests {
         #expect(!llmTypes.isEmpty)
         #expect(!vlmTypes.isEmpty)
         #expect(!embedderTypes.isEmpty)
+    }
+
+    private func describeThinkingSupport(_ support: ThinkingSupport) -> String {
+        switch support {
+        case .none:
+            "none"
+        case .toggleableViaTemplate(let contextKey):
+            "template-toggle(\(contextKey))"
+        case .alwaysOn(let startTag, let endTag):
+            "always-on(\(startTag)…\(endTag))"
+        }
     }
 }

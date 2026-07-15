@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "checks": [
+    {
+      "id": "smolvlm2-loads",
+      "test_identifier": "VLMConformanceIntegrationTests/smolVLM2ImageGeneration",
+      "model_id": "mlx-community/SmolVLM2-500M-Video-Instruct-mlx",
+      "revision": "fa57db46815177fbdfd65cc85a2b3416a8332268",
+      "architecture": "smolvlm",
+      "capability": "loads",
+      "platforms": ["macOS", "iOS-device"],
+      "enabled": true
+    },
+    {
+      "id": "smolvlm2-vlm-image",
+      "test_identifier": "VLMConformanceIntegrationTests/smolVLM2ImageGeneration",
+      "model_id": "mlx-community/SmolVLM2-500M-Video-Instruct-mlx",
+      "revision": "fa57db46815177fbdfd65cc85a2b3416a8332268",
+      "architecture": "smolvlm",
+      "capability": "vlm",
+      "platforms": ["macOS", "iOS-device"],
+      "enabled": true
+    },
+    {
+      "id": "qwen35-loads",
+      "test_identifier": "LongContextConformanceIntegrationTests/qwen35LongContextSentinel",
+      "model_id": "mlx-community/Qwen3.5-0.8B-4bit",
+      "revision": "da28692b5f139cb0ec58a356b437486b7dac7462",
+      "architecture": "qwen3_5",
+      "capability": "loads",
+      "platforms": ["macOS", "iOS-device"],
+      "enabled": true
+    },
+    {
+      "id": "qwen35-long-context",
+      "test_identifier": "LongContextConformanceIntegrationTests/qwen35LongContextSentinel",
+      "model_id": "mlx-community/Qwen3.5-0.8B-4bit",
+      "revision": "da28692b5f139cb0ec58a356b437486b7dac7462",
+      "architecture": "qwen3_5",
+      "capability": "long_context",
+      "platforms": ["macOS", "iOS-device"],
+      "enabled": true
+    },
+    {
+      "id": "fastvlm-device-checkpoint",
+      "test_identifier": "VLMConformanceIntegrationTests/fastVLMImageGenerationCheckpointGate",
+      "model_id": "mlx-community/FastVLM-0.5B-bf16",
+      "revision": null,
+      "architecture": "fastvlm",
+      "capability": "vlm",
+      "platforms": ["macOS", "iOS-device"],
+      "enabled": false,
+      "disabled_reason": "Requires a pinned checkpoint plus physical-device memory and output validation."
+    },
+    {
+      "id": "idefics3-multi-image-device-checkpoint",
+      "test_identifier": "VLMConformanceIntegrationTests/idefics3MultiImageCheckpointGate",
+      "model_id": "HuggingFaceTB/SmolVLM-Instruct",
+      "revision": null,
+      "architecture": "idefics3",
+      "capability": "vlm",
+      "platforms": ["macOS", "iOS-device"],
+      "enabled": false,
+      "disabled_reason": "Requires a compatible pinned MLX checkpoint and physical multi-image validation."
+    },
+    {
+      "id": "gemma4-video-device-checkpoint",
+      "test_identifier": "VLMConformanceIntegrationTests/gemma4VideoInputCheckpointGate",
+      "model_id": "mlx-community/gemma-4-e2b-it-4bit",
+      "revision": null,
+      "architecture": "gemma4",
+      "capability": "vlm_video",
+      "platforms": ["macOS", "iOS-device"],
+      "enabled": false,
+      "disabled_reason": "The processor video path and its physical-device memory ceiling still require checkpoint validation."
+    }
+  ]
+}

@@ -98,9 +98,14 @@ xcodebuild -quiet test \
 La compilacion completa del esquema `mlx-swift-lm-Package` tambien finalizo
 correctamente con la revision fijada del fork.
 
-## Validacion pendiente antes de distribuir
+## Validacion fisica confirmada y mediciones pendientes
 
-- cargar y generar con Bonsai 27B en el iPhone del incidente;
+El usuario confirmo el 2026-07-15 la validacion fisica de Bonsai en el iPhone
+objetivo. Esta confirmacion prueba el camino de carga/generacion que motivaba el
+port, pero no se usan cifras no registradas para inferir memoria o rendimiento.
+
+Queda como trabajo de caracterizacion, no como bloqueo de compatibilidad:
+
 - cubrir hardware fisico gen-18 con NAX y hardware no NAX; el M5 Max gen-17
   queda correctamente en la ruta no NAX;
 - registrar pico de memoria, tiempo de carga y tokens por segundo;

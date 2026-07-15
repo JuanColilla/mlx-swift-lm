@@ -18,9 +18,8 @@ xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS' \
   -only-testing:MLXLMTests/CompatibilityMatrixGeneratorTests
 ```
 
-y sustituir las listas de abajo por el `stdout` del test. Generado en esta
-rama el 2026-07-15 contra el commit tras el merge de `origin/main`
-(`f97da4e` + los commits de esta rama).
+y sustituir las listas de abajo por el `stdout` del test. Recuento y metadata
+actualizados en esta rama el 2026-07-15.
 
 ## Cobertura actual
 
@@ -46,16 +45,15 @@ modelo). Ver `DOCS/vlm-media-budgets.md` para el desglose real por familia
 - Para LLM: `toolCallFormat` explícito (cuando el registro lo fija a mano —
   ver `ToolCallFormat.infer(from:configData:)` en
   `Libraries/MLXLMCommon/Tool/ToolCallFormat.swift` para los casos donde se
-  infiere en tiempo de carga en vez de declararse) y `extraEOSTokens`
-  explícitos.
+  infiere en tiempo de carga en vez de declararse), `thinkingSupport` explícito
+  y `extraEOSTokens` explícitos.
 
 ## Qué NO cubre (gaps conocidos, ver `DOCS/compatibility-and-models.md`)
 
-- **Thinking mode**: no existe ningún campo estructurado equivalente a
-  `toolCallFormat` para "este modelo soporta thinking toggle" — se maneja
-  puramente vía chat template / `additionalContext`, sin metadata tipada.
-  Confirmado por `grep -rln "thinking\|enableThinking" Libraries/` sin
-  resultados relevantes.
+- **Thinking inferido en runtime**: la tabla solo muestra metadata explícita del
+  registro. `ThinkingSupport.infer(...)` también puede reconocer
+  `enable_thinking` en la plantilla descargada, pero esta matriz no descarga
+  tokenizers ni asigna esa capacidad por `model_type`.
 - **Cuantización, tokenizer, template, VLM/video budgets**: no están en esta
   tabla porque no hay un campo por-modelo que los capture de forma
   homogénea hoy; añadir esas columnas requeriría antes añadir los campos a
@@ -87,35 +85,38 @@ qwen3_5, qwen3_5_moe, qwen3_vl, smolvlm
 bert, distilbert, gemma3, gemma3_text, gemma3n, lfm2, nomic_bert, qwen3,
 roberta, xlm-roberta
 
-## LLM — modelos recomendados con `toolCallFormat`/`extraEOSTokens` declarados
+## LLM — modelos con metadata de comportamiento declarada
 
-Solo se listan las entradas con al menos uno de los dos campos fijado
+Solo se listan las entradas con al menos uno de los tres campos fijado
 explícitamente en el registro (el resto usa inferencia en tiempo de carga
-vía `ToolCallFormat.infer` o no declara EOS extra):
+vía `ToolCallFormat.infer`/`ThinkingSupport.infer`, o no declara EOS extra):
 
-| Modelo | toolCallFormat | extraEOSTokens |
-|---|---|---|
-| mlx-community/GLM-4-9B-0414-4bit | glm4 | - |
-| mlx-community/LFM2-1.2B-4bit | lfm2 | - |
-| mlx-community/LFM2-8B-A1B-3bit-MLX | lfm2 | - |
-| mlx-community/Llama-3.2-1B-Instruct-4bit | - | `<\|eot_id\|>` |
-| mlx-community/Llama-3.2-3B-Instruct-4bit | - | `<\|eot_id\|>` |
-| mlx-community/Meta-Llama-3-8B-Instruct-4bit | - | `<\|eot_id\|>` |
-| mlx-community/Meta-Llama-3.1-8B-Instruct-4bit | - | `<\|eot_id\|>` |
-| mlx-community/Phi-3.5-MoE-instruct-4bit | - | `<\|end\|>` |
-| mlx-community/Phi-3.5-mini-instruct-4bit | - | `<\|end\|>` |
-| mlx-community/Qwen1.5-0.5B-Chat-4bit | - | `<\|im_end\|>` |
-| mlx-community/Qwen2.5-1.5B/7B-Instruct-4bit | - | `<\|im_end\|>` |
-| mlx-community/Qwen3-*-4bit (0.6B/1.7B/4B/8B/30B-A3B) | - | `<\|im_end\|>` |
-| mlx-community/Qwen3.5-2B-4bit / Qwen3.6-27B-4bit | - | `<\|im_end\|>` |
-| mlx-community/gemma-3-1b-it-qat-4bit | - | `<end_of_turn>` |
-| mlx-community/gemma-3n-E2B/E4B-it-lm-* | - | `<end_of_turn>` |
-| mlx-community/gemma-4-e2b/e4b-it-4bit | - | `<turn\|>` |
+| Modelo | toolCallFormat | thinkingSupport | extraEOSTokens |
+|---|---|---|---|
+| mlx-community/DeepSeek-R1-4bit | - | always-on (`<think>`…`</think>`) | - |
+| mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit | - | always-on (`<think>`…`</think>`) | - |
+| mlx-community/GLM-4-9B-0414-4bit | glm4 | - | - |
+| mlx-community/LFM2-1.2B-4bit | lfm2 | - | - |
+| mlx-community/LFM2-8B-A1B-3bit-MLX | lfm2 | - | - |
+| mlx-community/Llama-3.2-1B-Instruct-4bit | - | - | `<\|eot_id\|>` |
+| mlx-community/Llama-3.2-3B-Instruct-4bit | - | - | `<\|eot_id\|>` |
+| mlx-community/Meta-Llama-3-8B-Instruct-4bit | - | - | `<\|eot_id\|>` |
+| mlx-community/Meta-Llama-3.1-8B-Instruct-4bit | - | - | `<\|eot_id\|>` |
+| mlx-community/Phi-3.5-MoE-instruct-4bit | - | - | `<\|end\|>` |
+| mlx-community/Phi-3.5-mini-instruct-4bit | - | - | `<\|end\|>` |
+| mlx-community/Qwen1.5-0.5B-Chat-4bit | - | - | `<\|im_end\|>` |
+| mlx-community/Qwen2.5-1.5B/7B-Instruct-4bit | - | - | `<\|im_end\|>` |
+| mlx-community/Qwen3-*-4bit (0.6B/1.7B/4B/8B/30B-A3B) | - | - | `<\|im_end\|>` |
+| mlx-community/Qwen3.5-2B-4bit | - | template toggle (`enable_thinking`) | `<\|im_end\|>` |
+| mlx-community/Qwen3.6-27B-4bit | - | - | `<\|im_end\|>` |
+| mlx-community/gemma-3-1b-it-qat-4bit | - | - | `<end_of_turn>` |
+| mlx-community/gemma-3n-E2B/E4B-it-lm-* | - | - | `<end_of_turn>` |
+| mlx-community/gemma-4-e2b/e4b-it-4bit | - | - | `<turn\|>` |
 
-El resto de las 55 entradas LLM recomendadas no fija ninguno de los dos
-campos explícitamente (dejando `toolCallFormat` a inferencia por
-`model_type` en tiempo de carga, y sin EOS extra más allá del `eos_token`
-del tokenizer).
+El resto de las 55 entradas LLM recomendadas no fija ninguno de los tres
+campos explícitamente. `toolCallFormat` puede inferirse por `model_type` y
+`thinkingSupport` por la plantilla concreta en tiempo de carga; los EOS restantes
+proceden del tokenizer/configuración del checkpoint.
 
 ## VLM — modelos recomendados (17)
 

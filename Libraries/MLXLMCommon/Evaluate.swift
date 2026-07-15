@@ -805,6 +805,11 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     public let maxTokens: Int?
     let numDraftTokens: Int
 
+    // Opt-in adaptive fallback. Once selected, autoregressive mode is sticky
+    // for the remainder of the iterator so model/cache state never oscillates.
+    private var adaptiveController: AdaptiveSpeculativeDecodingController?
+    private var autoregressive = false
+
     // Buffer of accepted tokens from the current speculation round
     private var pendingTokens = [Int]()
     private var pendingIndex = 0
@@ -839,10 +844,38 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         parameters: GenerateParameters,
         numDraftTokens: Int
     ) throws {
+        try self.init(
+            input: input,
+            mainModel: mainModel,
+            draftModel: draftModel,
+            mainCache: mainCache,
+            draftCache: draftCache,
+            mainState: nil,
+            parameters: parameters,
+            numDraftTokens: numDraftTokens
+        )
+    }
+
+    /// Package-level continuation initializer used by ``ChatSession``.
+    ///
+    /// The public initializer remains unchanged. This overload makes the
+    /// per-call target state explicit when speculative decoding resumes an
+    /// already warm session cache.
+    package init(
+        input: LMInput,
+        mainModel: any LanguageModel,
+        draftModel: any LanguageModel,
+        mainCache: [KVCache]? = nil,
+        draftCache: [KVCache]? = nil,
+        mainState: LMOutput.State?,
+        parameters: GenerateParameters,
+        numDraftTokens: Int
+    ) throws {
         self.y = input.text
         self.draftY = input.text
         self.mainModel = mainModel
         self.draftModel = draftModel
+        self.mainState = mainState
 
         self.mainCache = mainCache ?? mainModel.newCache(parameters: parameters)
         self.draftCache = draftCache ?? draftModel.newCache(parameters: parameters)
@@ -868,6 +901,35 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
         }
+    }
+
+    /// Initialize a speculative iterator with an explicit runtime fallback policy.
+    ///
+    /// The policy is opt-in and observes only completed speculative rounds.
+    /// Existing callers that use ``init(input:mainModel:draftModel:mainCache:draftCache:parameters:numDraftTokens:)``
+    /// retain fixed speculative decoding for the complete generation.
+    public init(
+        input: LMInput,
+        mainModel: any LanguageModel,
+        draftModel: any LanguageModel,
+        mainCache: [KVCache]? = nil,
+        draftCache: [KVCache]? = nil,
+        parameters: GenerateParameters,
+        numDraftTokens: Int,
+        adaptivePolicy: AdaptiveSpeculativeDecodingPolicy
+    ) throws {
+        try self.init(
+            input: input,
+            mainModel: mainModel,
+            draftModel: draftModel,
+            mainCache: mainCache,
+            draftCache: draftCache,
+            parameters: parameters,
+            numDraftTokens: numDraftTokens
+        )
+        let controller = AdaptiveSpeculativeDecodingController(policy: adaptivePolicy)
+        self.adaptiveController = controller
+        self.telemetry.updateAdaptive(controller.telemetry)
     }
 
     /// Prefill both main and draft models with the prompt, priming caches for generation
@@ -981,6 +1043,13 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             targetVerified: numDraft + 1
         )
 
+        if var controller = adaptiveController {
+            let shouldSwitch = controller.recordRound(drafted: numDraft, accepted: accepted)
+            telemetry.updateAdaptive(controller.telemetry)
+            adaptiveController = controller
+            autoregressive = autoregressive || shouldSwitch
+        }
+
         // Rewind caches for rejected tokens
         trimPromptCache(mainCache, numTokens: numDraft - accepted)
         trimPromptCache(draftCache, numTokens: Swift.max(numDraft - accepted - 1, 0))
@@ -1005,6 +1074,34 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         }
     }
 
+    /// Runs one target-only decode step after adaptive fallback. At the
+    /// transition point, `y` is the correction/bonus token emitted by the
+    /// final speculative round and `mainCache` has already been rewound to
+    /// the accepted prefix, so processing `y` continues the exact target
+    /// sequence without replay or omission.
+    private mutating func autoregressiveStep() -> Int? {
+        if let maxTokens, tokenCount >= maxTokens {
+            return nil
+        }
+
+        let result = mainModel(y[text: .newAxis], cache: mainCache, state: mainState)
+        mainState = result.state
+        telemetry.recordAutoregressiveTargetCall()
+        if var controller = adaptiveController {
+            controller.recordAutoregressiveTargetCall()
+            telemetry.updateAdaptive(controller.telemetry)
+            adaptiveController = controller
+        }
+        var logits = result.logits[0..., -1, 0...]
+        logits = processor?.process(logits: logits) ?? logits
+        let token = sampler.sample(logits: logits)
+        processor?.didSample(token: token)
+        eval(token)
+        y = .init(tokens: token)
+        quantizeKVCache(&mainCache)
+        return token.item(Int.self)
+    }
+
     mutating public func next() -> Int? {
         if let maxTokens, tokenCount >= maxTokens {
             return nil
@@ -1014,6 +1111,15 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         if pendingIndex < pendingTokens.count {
             let token = pendingTokens[pendingIndex]
             pendingIndex += 1
+            telemetry.recordGeneratedToken()
+            return token
+        }
+
+        // The fallback decision is made after a complete speculative round,
+        // but that round's accepted/correction tokens must be drained before
+        // target-only decoding resumes.
+        if autoregressive {
+            guard let token = autoregressiveStep() else { return nil }
             telemetry.recordGeneratedToken()
             return token
         }
@@ -1527,6 +1633,48 @@ public func generate(
     return stream
 }
 
+/// Generates text and tool calls using speculative decoding with an explicit,
+/// opt-in runtime fallback policy.
+///
+/// The iterator switches permanently to target-only autoregressive generation
+/// only after the caller-configured warm-up, rolling-window, sample-count, and
+/// acceptance-rate gates are satisfied.
+public func generate(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    draftModel: any LanguageModel,
+    draftCache: [KVCache]? = nil,
+    numDraftTokens: Int = 2,
+    adaptivePolicy: AdaptiveSpeculativeDecodingPolicy,
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) throws -> AsyncStream<Generation> {
+    let iterator = try SpeculativeTokenIterator(
+        input: input,
+        mainModel: context.model,
+        draftModel: draftModel,
+        mainCache: cache,
+        draftCache: draftCache,
+        parameters: parameters,
+        numDraftTokens: numDraftTokens,
+        adaptivePolicy: adaptivePolicy
+    )
+    let (stream, _) = generateLoopTask(
+        promptTokenCount: input.text.tokens.size,
+        modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        handler: TextToolTokenLoopHandler(
+            tokenizer: context.tokenizer,
+            stopStrings: context.configuration.effectiveStopStrings,
+            format: context.configuration.toolCallFormat ?? .json
+        )
+    )
+    return stream
+}
+
 @available(
     *, deprecated,
     message: "use a higher level generate() call or use generateTask() for fine grained control"
@@ -1657,6 +1805,40 @@ public func generateTokens(
         draftCache: draftCache,
         parameters: parameters,
         numDraftTokens: numDraftTokens
+    )
+    let (stream, _) = generateLoopTask(
+        promptTokenCount: input.text.tokens.size,
+        modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        handler: RawTokenLoopHandler()
+    )
+    return stream
+}
+
+/// Generates raw token IDs using speculative decoding with an explicit,
+/// opt-in runtime fallback policy.
+public func generateTokens(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    draftModel: any LanguageModel,
+    draftCache: [KVCache]? = nil,
+    numDraftTokens: Int = 2,
+    adaptivePolicy: AdaptiveSpeculativeDecodingPolicy,
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) throws -> AsyncStream<TokenGeneration> {
+    let iterator = try SpeculativeTokenIterator(
+        input: input,
+        mainModel: context.model,
+        draftModel: draftModel,
+        mainCache: cache,
+        draftCache: draftCache,
+        parameters: parameters,
+        numDraftTokens: numDraftTokens,
+        adaptivePolicy: adaptivePolicy
     )
     let (stream, _) = generateLoopTask(
         promptTokenCount: input.text.tokens.size,
@@ -2017,10 +2199,10 @@ public struct GenerateCompletionInfo: Sendable {
     /// are non-nil and proposed > 0.
     public let acceptedDraftTokens: Int?
 
-    /// Non-nil when the MTP iterator transitioned into sticky-passthrough
-    /// mode for the remainder of the stream; carries the reason string
-    /// captured at the moment of engagement. Nil if the iterator stayed
-    /// speculative for the full stream or for non-MTP streams.
+    /// Non-nil when MTP transitioned into sticky-passthrough or a high-level
+    /// memory gate selected target-only generation before loading the drafter.
+    /// Carries the reason captured at the transition/decision. Nil if MTP
+    /// stayed speculative for the full stream or for non-MTP streams.
     public let passthroughReason: String?
 
     /// Speculative decoding telemetry, when generation used speculative decoding.

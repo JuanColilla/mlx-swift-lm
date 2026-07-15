@@ -21,7 +21,11 @@ let parameters = GenerateParameters(
 
 No tratar estos valores como universales. Son un punto de partida para medir. En apps reales, derivarlos de modelo, dispositivo, longitud de conversacion, media adjunta y objetivo de calidad.
 
-Para rutas que usen MTP, no asumir que el perfil anterior aplica sin cambios: hoy MTP y KV cache cuantizada no combinan bien en todos los caminos, y `ChatSession` no expone MTP como flujo conversacional de alto nivel.
+Para rutas que usen MTP, no asumir que el perfil anterior aplica sin cambios.
+`ChatSession` permite activarlo con `MTPSpeculativeDecodingConfig`, pero la
+verificación MTP no consume shared K/V cuantizado: si la cuantización entra en
+vigor, el iterador pasa de forma sticky a generación target-only y lo explica en
+la telemetría. Medir por separado MTP con KV normal y el perfil cuantizado.
 
 ## Seleccion de modelo
 

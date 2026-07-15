@@ -3,9 +3,10 @@
 > **Estado (2026-07-15)**: cada ítem de este backlog tiene ahora un documento
 > de resultado (código verificado o nota de alcance/investigación) enlazado
 > desde `DOCS/README.md`, sección "Implementación del backlog (2026-07-15)".
-> Este documento se deja tal cual (incluida su ortografía original) como
-> registro histórico del backlog priorizado; el estado actualizado vive en el
-> README, no aquí.
+> Las descripciones originales se conservan como registro del backlog
+> priorizado. Las frases dependientes del estado actual se anotan cuando el
+> trabajo ya fue entregado; el detalle verificable vive en
+> `DOCS/backlog-completion-status.md`.
 
 ## Prioridad alta
 
@@ -21,7 +22,7 @@
 3. Politica publica de memoria.
    - Unificar `GenerateParameters`, wired memory, KV estimate y speculative memory policy.
    - Producir recomendaciones explicables, no solo errores OOM.
-   - Incluir `ChatSession`, que hoy no expone wired-memory ticket por turno.
+   - Incluir `ChatSession`; completado con un `wiredMemoryTicket` reemplazable y capturado al inicio de cada turno.
 
 4. Recetas oficiales de long-context.
    - Cubrir trim, cache rotatoria, cache cuantizada, prompt cache y resumen de conversacion.

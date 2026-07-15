@@ -2,7 +2,9 @@
 
 Recetas concretas y copiables para gestionar contexto largo con `Libraries/MLXLMCommon`. Complementa `DOCS/memory-kv-cache.md` (investigación/riesgos) y `DOCS/implementation-playbook.md` (guía breve de perfiles); aquí el foco es "cómo se escribe esto en Swift real, con qué API existente hoy".
 
-Todos los símbolos citados existen en `Libraries/MLXLMCommon/KVCache.swift`, `Libraries/MLXLMCommon/Evaluate.swift`, `Libraries/MLXLMCommon/ChatSession.swift` y `Libraries/MLXLMCommon/LanguageModel.swift` en esta rama; se verificaron con grep antes de escribir cada snippet.
+Todos los símbolos citados existen en `Libraries/MLXLMCommon/KVCache.swift`,
+`KVCacheMemory.swift`, `WiredMemoryPolicies.swift`, `Evaluate.swift`,
+`ChatSession.swift` y `LanguageModel.swift` en esta rama.
 
 ## 1. Trim: regenerar o editar sin re-hacer prefill completo
 
@@ -46,7 +48,9 @@ Para "editar un mensaje anterior", el número de tokens a recortar es la suma de
 - `trimPromptCache` hace `cache.dropFirst().forEach { $0.trim(numTokens) }` y luego `cache.first?.trim(numTokens)` (`KVCache.swift:1913-1915`): todas las cachés del array se recortan por el mismo `numTokens`, asumiendo que todas las capas tienen el mismo offset. No mezclar cachés heterogéneas con offsets distintos.
 - `RotatingKVCache.isTrimmable` es `offset < maxCacheSize` (`KVCache.swift:723-725`): una vez que la caché rotatoria alcanzó su tamaño máximo y empezó a rotar, deja de ser trimmable. `canTrimPromptCache` devolverá `false` para el array completo en ese punto — no hay trim parcial disponible, hay que recrear la caché.
 - `KVCacheSimple.trim` solo baja `offset` (`KVCache.swift:454-459`): **no libera el backing storage** (`self.keys`/`self.values` siguen teniendo su tamaño `step`-alineado). Esto ya está documentado como riesgo en `DOCS/memory-kv-cache.md` ("Retención de buffers tras trim"). Si el objetivo es liberar memoria (no solo reescribir posiciones), hay que reconstruir el caché desde cero, no solo llamar `trim`.
-- No existe ningún test de regresión para `trim()` en `Tests/MLXLMTests/` a fecha de este documento (verificado por grep de `.trim(` sobre todo `Tests/MLXLMTests/`) — ver sección final.
+- `trim(_:)` trata ahora valores no positivos como no-op. En caché rotatoria
+  devuelve `0` una vez alcanzado el window, evitando corromper `idx`; estos
+  contratos están cubiertos en `LongContextKVCacheTests.swift`.
 
 ## 2. Caché rotatoria: dimensionar `maxKVSize` para un presupuesto de dispositivo
 
@@ -59,6 +63,20 @@ Para "editar un mensaje anterior", el número de tokens a recortar es la suma de
 ```swift
 import MLXLMCommon
 
+let estimatedKVBytes = try estimateKVCacheBytes(
+    numLayers: 28,
+    kvHeads: 8,
+    headDim: 128,
+    maxTokens: 4096,
+    kvBits: nil
+)
+
+let memoryPolicy = WiredBudgetPolicy(
+    baseBytes: weightsBytes + workspaceBytes,
+    kvCacheBytes: estimatedKVBytes,
+    cap: deviceBudgetBytes
+)
+
 let parameters = GenerateParameters(
     maxTokens: 512,
     maxKVSize: 4096,   // techo duro de tokens en caché por capa
@@ -68,6 +86,12 @@ let parameters = GenerateParameters(
 let session = ChatSession(modelContainer, generateParameters: parameters)
 // A partir del turno en que offset > 4096, RotatingKVCache empieza a rotar.
 ```
+
+La estimación es lógica y pura: no incluye spare capacity de los buffers,
+alineación ni el pico temporal de prefill. La policy tampoco se conecta
+automáticamente a `ChatSession`; sirve para construir un ticket explícito en las
+rutas de generación que ya aceptan `WiredMemoryPolicy`. Para calibración real,
+comparar con `WiredMemoryUtils.tune(...)` en el modelo y hardware objetivo.
 
 ### Qué significa "la calidad de conversación se degrada al empezar a truncar"
 
@@ -140,6 +164,9 @@ public func quantized(groupSize: Int = 64, bits: Int = 4) throws -> QuantizedKVC
 ```
 
 Esta es la ruta recuperable para código nuevo, confirmada por el test `testRotatingKVCacheQuantizedThrowsInsteadOfCrashing`. La firma histórica `toQuantized(...)` sigue disponible y deprecada para conservar compatibilidad fuente con consumidores 3.x; no debe usarse cuando la configuración pueda ser incompatible. Pero eso no es lo que pasa en la práctica al combinar `maxKVSize` + `kvBits`: `maybeQuantizeKVCache.isQuantizable` sólo acepta `KVCacheSimple`, y cuando `maxKVSize` está seteado, `newCache` construye `RotatingKVCache`. Esas cachés se ignoran por completo — **nunca se intenta llamar `quantized` y por tanto nunca se lanza el error**. El resultado observable es: `GenerateParameters(maxKVSize: N, kvBits: 4)` no falla, no lanza, simplemente no cuantiza nada. Este es el gap que hay que documentar de cara a producto: es un silencio, no un error.
+
+`testMaxKVSizeAndKVBitsKeepRotatingCacheUnquantized` fija explícitamente este
+contrato para detectar cualquier cambio futuro de comportamiento.
 
 ```swift
 // Esto NO produce una caché rotatoria cuantizada. Genera sin error,
@@ -261,11 +288,21 @@ La generación del resumen en sí (`summarize` closure arriba) es una llamada de
 - Al reemplazar `instructions` con el resumen, el caché de la sesión anterior queda inválido para esos turnos (el resumen es texto nuevo, hay que re-prefillearlo) — esto es un trade-off inherente entre "ahorrar contexto" y "ahorrar prefill", no algo que MLXLMCommon resuelva por vos.
 - Nada en este repo verifica que el resumen preserve hechos citables exactos (nombres, números, cotas). Si la app depende de precisión factual sobre turnos antiguos, el resumen por LLM es lossy y hay que decidir explícitamente qué se puede permitir perder.
 
-## Tests que deberían existir y hoy mayormente no existen
+## Cobertura entregada y gaps que requieren medición real
 
 Estado real de la cobertura de tests en `Tests/MLXLMTests/` (verificado por grep):
 
 **Lo que sí está cubierto hoy:**
+- Estimación KV BF16 y affine, metadata de cuantización, group-size efectivo,
+  configuraciones inválidas y overflow (`KVCacheMemoryTests.swift`).
+- Trim y reescritura de `KVCacheSimple`, alineación de offsets entre capas y
+  rechazo de trim tras alcanzar el window rotatorio (`LongContextKVCacheTests.swift`).
+- Máscara de `RotatingKVCache` tras wraparound para decode de un token y window
+  menor que `maxSize` (`testRotatingKVCacheMaskTracksWrappedSingleTokenWindow`).
+- Round-trip persistido de una caché rotatoria ya envuelta, seguido de otra
+  actualización que verifica que `idx` se restauró correctamente.
+- Combinación `maxKVSize + kvBits`: no lanza y mantiene las cachés rotatorias sin
+  cuantizar.
 - Serialización/round-trip de todos los tipos de caché (`testCacheSerialization`, parametrizado sobre `KVCacheSimple`, `RotatingKVCache`, `QuantizedKVCache`, `ChunkedKVCache`, `ArraysCache`, `MambaCache` — `KVCacheTests.swift:56-86`).
 - Que `RotatingKVCache.quantized` lanza en vez de crashear (`testRotatingKVCacheQuantizedThrowsInsteadOfCrashing`).
 - Que `loadPromptCache` lanza `KVCacheError` (no crashea) ante estado/metaState corrupto para `KVCacheSimple`, `QuantizedKVCache`, `ChunkedKVCache` (`KVCacheTests.swift:717-745`).
@@ -274,10 +311,8 @@ Estado real de la cobertura de tests en `Tests/MLXLMTests/` (verificado por grep
 - `maybeQuantizeKVCache` end-to-end sobre un modelo real pequeño (Gemma4Text, `Gemma4TextTests.swift:18,38`) y sobre híbridos (`FalconH1Tests.swift:145`).
 - Guardar/restaurar un `ChatSession` completo vía `saveCache`/`init(cache:)` (`ChatSessionTests.swift:430-479`).
 
-**Gaps reales (nada de esto tiene test hoy, verificado por grep de `.trim(` y de nombres de archivo `*Mask*`/`*Rotating*` sobre `Tests/MLXLMTests/`):**
-- **Regresión de `trim()` en sí**: ningún test llama `.trim(` directamente ni `trimPromptCache`/`canTrimPromptCache` sobre ninguna caché. No hay verificación de que tras un trim el `offset` sea correcto, de que la máscara post-trim sea correcta, ni de que `isTrimmable` refleje bien el estado de rotación de `RotatingKVCache`.
-- **Regresión de máscara específica de `RotatingKVCache.makeMask`**: no existe un test dedicado (no hay `RotatingKVCacheTests.swift` ni equivalente) que cubra el camino de `roll` para el caso "un solo token, caché ya rotada, `windowSize < maxCacheSize`" (`KVCache.swift:756-770`) — es el camino de código más frágil del archivo y no tiene aserción propia. Nota: esta misma zona de código está bajo sospecha en la investigación de `DOCS/gemma4-chunked-prefill-investigation.md` — un test dedicado aquí probablemente sería el primer paso real para confirmar o descartar esa hipótesis.
+**Gaps que siguen requiriendo modelo o dispositivo real:**
 - **Calidad bajo `maxKVSize` (truncación real)**: no hay ningún test que mida degradación de calidad de generación (ni siquiera con heurística simple) cuando la conversación supera `maxKVSize` y la caché rotatoria empieza a descartar tokens.
 - **Calidad bajo `kvBits`/`quantizedKVStart`**: los tests de `maybeQuantizeKVCache` verifican que la conversión ocurre y que el modelo sigue generando sin crashear, pero no comparan salida cuantizada vs. no cuantizada para detectar regresión de calidad.
-- **El gap de `maxKVSize` + `kvBits` combinados** (sección 3 de este documento) no tiene ningún test que verifique explícitamente "esto no lanza y no cuantiza" — sería el test más barato de añadir para fijar el comportamiento actual y detectar si algún día cambia.
-- **Round-trip de prompt cache con `RotatingKVCache` ya rotada** (offset > maxSize, con wraparound de `idx`): `testCacheSerialization` cubre `RotatingKVCache` pero con una sola actualización pequeña (`keys/values` de tamaño 32, igual al `maxSize: 32` del creador en la línea 9) — no fuerza el camino de rotación real (múltiples updates que superen `maxCacheSize`) antes de guardar/cargar.
+- **Estimación vs. residencia real**: falta contrastar los bytes lógicos con
+  `WiredMemoryUtils.tune`, `Memory.activeMemory` y RSS en perfiles 8K/32K/128K.

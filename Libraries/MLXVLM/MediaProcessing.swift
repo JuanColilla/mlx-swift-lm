@@ -352,10 +352,29 @@ public enum MediaProcessing {
         samplesPerSecond: Int,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
+        try await asProcessedSequence(
+            video,
+            samplesPerSecond: samplesPerSecond,
+            maxFrames: Int.max,
+            frameProcessing: frameProcessing
+        )
+    }
+
+    /// Samples and processes a video while enforcing an upper bound on decoded frames.
+    ///
+    /// The historical ``asProcessedSequence(_:samplesPerSecond:frameProcessing:)`` overload
+    /// remains unbounded for source compatibility. Use this overload when the caller has a
+    /// concrete visual-token or memory budget. `maxFrames` must be at least one.
+    static public func asProcessedSequence(
+        _ video: UserInput.Video,
+        samplesPerSecond: Int,
+        maxFrames: Int,
+        frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
+    ) async throws -> ProcessedFrames {
         return try await asProcessedSequence(
             video,
             targetFPS: { _ in Double(samplesPerSecond) },
-            maxFrames: Int.max,
+            maxFrames: maxFrames,
             frameProcessing: frameProcessing
         )
     }
@@ -382,7 +401,8 @@ public enum MediaProcessing {
 
         case .frames(let videoFrames):
             return try await _asProcessedSequence(
-                videoFrames, targetFPS: targetFPS, frameProcessing: frameProcessing)
+                videoFrames, maxFrames: maxFrames, targetFPS: targetFPS,
+                frameProcessing: frameProcessing)
         }
     }
 
@@ -438,9 +458,13 @@ public enum MediaProcessing {
         let timescale = duration.timescale
         let sampledTimes = sampledTimeValues.map { CMTime(value: $0, timescale: timescale) }
 
-        // Collect the frames
-        var ciImages: [CIImage] = []
+        // Materialize each processed frame before requesting the next one. The
+        // result necessarily retains all MLX arrays for API compatibility, but
+        // it no longer retains every source CGImage/CIImage alongside them.
+        var frames: [MLXArray] = []
+        frames.reserveCapacity(finalFrameCount)
         var timestamps: [CMTime] = []
+        timestamps.reserveCapacity(finalFrameCount)
 
         for await result in generator.images(for: sampledTimes) {
             switch result {
@@ -448,23 +472,22 @@ public enum MediaProcessing {
                 let ciImage = CIImage(
                     cgImage: image, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
                 let frame = try frameProcessing(.init(image: .ciImage(ciImage), timeStamp: actual))
-                ciImages.append(try frame.image.asCIImage())
+                frames.append(try frame.image.asCIImage().asMLXArray())
                 timestamps.append(frame.timeStamp)
             case .failure(requestedTime: _, _):
                 break
             }
         }
 
-        let framesAsArrays = ciImages.map { $0.asMLXArray() }
         return ProcessedFrames(
-            frames: framesAsArrays,
+            frames: frames,
             timestamps: timestamps,
             totalDuration: duration
         )
     }
 
     static private func _asProcessedSequence(
-        _ videoFrames: [VideoFrame],
+        _ videoFrames: [VideoFrame], maxFrames: Int,
         targetFPS: (CMTime) -> Double,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
@@ -480,7 +503,7 @@ public enum MediaProcessing {
         let fps = targetFPS(duration)
         // Note: the round was not present in `asCIImageSequence`, so we may now be passing 1 more frame to Qwen depending on video duration.
         let estimatedFrames = Int(round(fps * duration.seconds))
-        let desiredFrames = min(estimatedFrames, videoFrames.count)
+        let desiredFrames = min(estimatedFrames, videoFrames.count, maxFrames)
         let finalFrameCount = max(desiredFrames, 1)
 
         let sampledTimeValues = MLXArray.linspace(
@@ -490,9 +513,12 @@ public enum MediaProcessing {
         // Construct a CMTime using the sampled CMTimeValue's and the asset's timescale
         let timescale = duration.timescale
 
-        // Collect the frames
-        var ciImages: [CIImage] = []
+        // Materialize one sampled frame at a time instead of retaining all
+        // intermediate CIImage graphs until a second conversion pass.
+        var frames: [MLXArray] = []
+        frames.reserveCapacity(finalFrameCount)
         var timestamps: [CMTime] = []
+        timestamps.reserveCapacity(finalFrameCount)
 
         // See https://github.com/ml-explore/mlx-swift-lm/pull/64#discussion_r2713532157
         // for rationalle for the follwing timing code
@@ -516,14 +542,13 @@ public enum MediaProcessing {
                 let videoFrame = videoFrames[targetIndex]
                 let frame = try frameProcessing(
                     .init(image: videoFrame.image, timeStamp: videoFrame.timeStamp))
-                ciImages.append(try frame.image.asCIImage())
+                frames.append(try frame.image.asCIImage().asMLXArray())
                 timestamps.append(frame.timeStamp)
             }
         }
 
-        let framesAsArrays = ciImages.map { $0.asMLXArray() }
         return ProcessedFrames(
-            frames: framesAsArrays,
+            frames: frames,
             timestamps: timestamps,
             totalDuration: duration
         )
