@@ -45,6 +45,36 @@ final class WiredMemoryPolicyTests: XCTestCase {
         XCTAssertFalse(first.canAdmit(baseline: 50, activeSizes: [75], newSize: 76))
     }
 
+    func testWiredBudgetPolicyKeepsEstimatedKVCacheDemandExplainable() throws {
+        let kvBytes = try estimateKVCacheBytes(
+            numLayers: 1,
+            kvHeads: 1,
+            headDim: 64,
+            maxTokens: 100
+        )
+        let policy = WiredBudgetPolicy(
+            baseBytes: 1_000,
+            kvCacheBytes: kvBytes,
+            cap: 27_000
+        )
+
+        XCTAssertEqual(kvBytes, 25_600)
+        XCTAssertEqual(policy.baseBytes, 1_000)
+        XCTAssertEqual(policy.kvCacheBytes, 25_600)
+        XCTAssertEqual(policy.totalBaseBytes, 26_600)
+        XCTAssertEqual(policy.limit(baseline: 100, activeSizes: [100]), 26_800)
+        XCTAssertTrue(policy.canAdmit(baseline: 100, activeSizes: [100], newSize: 200))
+        XCTAssertFalse(policy.canAdmit(baseline: 100, activeSizes: [100], newSize: 201))
+    }
+
+    func testWiredBudgetPolicyDoesNotTrapWhenDemandOverflows() {
+        let policy = WiredBudgetPolicy(baseBytes: Int.max, kvCacheBytes: 1)
+
+        XCTAssertEqual(policy.totalBaseBytes, Int.max)
+        XCTAssertGreaterThan(policy.limit(baseline: 1, activeSizes: []), 0)
+        XCTAssertFalse(policy.canAdmit(baseline: 1, activeSizes: [], newSize: 0))
+    }
+
     func testSpeculativeDecodingMemoryPolicyEvaluatesCombinedModelBudget() {
         let policy = SpeculativeDecodingMemoryPolicy(
             limitBytes: 1_000,

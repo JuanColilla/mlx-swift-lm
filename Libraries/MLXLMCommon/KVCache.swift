@@ -453,6 +453,7 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        guard n > 0 else { return 0 }
         let trimmed = min(offset, n)
         offset -= trimmed
         return trimmed
@@ -740,7 +741,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(offset, n)
+        guard n > 0, isTrimmable else { return 0 }
+        let trimmed = min(offset, idx, n)
         offset -= trimmed
         idx -= trimmed
         return trimmed
@@ -1106,6 +1108,7 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        guard n > 0 else { return 0 }
         let trimmed = min(offset, n)
         offset -= trimmed
         return trimmed
@@ -1205,7 +1208,8 @@ public class ChunkedKVCache: KVCacheSimple {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(offset - startPosition, n)
+        guard n > 0 else { return 0 }
+        let trimmed = min(max(0, offset - startPosition), n)
         offset -= trimmed
         return trimmed
     }
