@@ -105,6 +105,31 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         parameters: GenerateParameters,
         blockSize: Int
     ) throws {
+        try self.init(
+            input: input,
+            mainModel: mainModel,
+            drafter: drafter,
+            mainCache: mainCache,
+            mainState: nil,
+            parameters: parameters,
+            blockSize: blockSize
+        )
+    }
+
+    /// Package-level continuation initializer used by ``ChatSession``.
+    ///
+    /// MTP carries only the target cache between turns; the drafter owns no
+    /// cache. `mainState` accompanies that target cache so stateful prefill is
+    /// never silently downgraded to a cold-state call.
+    package init(
+        input: LMInput,
+        mainModel: any LanguageModel,
+        drafter: any MTPDrafterModel,
+        mainCache: [KVCache]? = nil,
+        mainState: LMOutput.State?,
+        parameters: GenerateParameters,
+        blockSize: Int
+    ) throws {
         precondition(
             blockSize >= 2,
             "MTPSpeculativeTokenIterator requires blockSize >= 2 (1 bonus + K-1 drafted)")
@@ -112,6 +137,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         self.y = input.text
         self.mainModel = mainModel
         self.drafter = drafter
+        self.mainState = mainState
 
         self.mainCache = mainCache ?? mainModel.newCache(parameters: parameters)
         guard canTrimPromptCache(self.mainCache) else {
@@ -144,20 +170,31 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         processor?.prompt(input.text.tokens)
 
-        var prefillState = LMOutput.State()
+        // MTP hidden/shared-KV snapshots describe a specific cache offset.
+        // Never feed a previous turn's snapshot into a new prefill: preserve
+        // model-specific continuation keys, but require the follow-up forward
+        // below to emit a fresh MTP snapshot aligned with the updated cache.
+        var carriedState = mainState
+        carriedState?[mtpLastHiddenStatesKey] = nil
+        carriedState?[mtpSharedKVStatesKey] = nil
+        carriedState?[mtpEmitFlagKey] = nil
+        var prefillState = carriedState ?? LMOutput.State()
         prefillState[mtpEmitFlagKey] = true
         // Note: the drafter is primed via an explicit follow-up forward call
         // after prefill (one position, the bonus token) rather than by
         // passing `prefillState` into `prepare` — the emit flag is meant for
         // exactly one position, not the whole prompt.
 
-        switch try mainModel.prepare(input, cache: mainCache, state: nil, windowSize: windowSize)
+        switch try mainModel.prepare(
+            input, cache: mainCache, state: carriedState, windowSize: windowSize)
         {
         case .tokens(let tokens):
             y = tokens
             // Final prompt position not yet evaluated -- run one forward to
             // produce the bonus token AND prime drafter state.
-            let result = mainModel(y[text: .newAxis], cache: mainCache, state: prefillState)
+            let result = withPreparedCache(mainCache, lengths: tokens.sequenceLengths) {
+                mainModel(y[text: .newAxis], cache: mainCache, state: prefillState)
+            }
             var logits = result.logits[0..., -1, 0...]
             logits = processor?.process(logits: logits) ?? logits
             let token = sampler.sample(logits: logits)
@@ -179,15 +216,18 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             let token = sampler.sample(logits: logits)
             processor?.didSample(token: token)
             y = .init(tokens: token)
-            mainState = prefillResult.state
+            let preparedState = prefillResult.state
+            mainState = preparedState
 
             // If prefill didn't emit drafter state, do one more forward call
             // with the just-sampled bonus token to prime the state. The cost
             // is one extra token's forward pass; acceptable.
-            if mainState?[mtpLastHiddenStatesKey] == nil
-                || mainState?[mtpSharedKVStatesKey] == nil
+            if preparedState?[mtpLastHiddenStatesKey] == nil
+                || preparedState?[mtpSharedKVStatesKey] == nil
             {
-                let primed = mainModel(y[text: .newAxis], cache: mainCache, state: prefillState)
+                var primingState = preparedState ?? carriedState ?? LMOutput.State()
+                primingState[mtpEmitFlagKey] = true
+                let primed = mainModel(y[text: .newAxis], cache: mainCache, state: primingState)
                 mainState = primed.state
                 // Resample bonus from this forward's logits so the chain stays
                 // coherent at this position (the cache offset moves by 1, so
@@ -242,7 +282,13 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             let lastHidden = state[mtpLastHiddenStatesKey],
             let sharedKV = state[mtpSharedKVStatesKey]
         else {
-            switchToPassthrough(reason: "main model did not emit drafter state")
+            let reason =
+                if mainCache.contains(where: { $0 is any QuantizedKVCacheProtocol }) {
+                    "main model did not emit drafter state after KV cache quantization"
+                } else {
+                    "main model did not emit drafter state"
+                }
+            switchToPassthrough(reason: reason)
             return
         }
 
@@ -286,7 +332,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         // Verify pass: main model evaluates [bonus, draft_1, ..., draft_numDraft]
         // in one forward call, emitting state for next round.
-        var verifyState = LMOutput.State()
+        var verifyState = mainState ?? LMOutput.State()
+        verifyState[mtpLastHiddenStatesKey] = nil
+        verifyState[mtpSharedKVStatesKey] = nil
         verifyState[mtpEmitFlagKey] = true
         let verifyTokens = concatenated([bonusToken, flatDraftTokens])
         let verifyInput = LMInput.Text(tokens: verifyTokens)
@@ -387,7 +435,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     private mutating func passthroughStep() -> Int? {
         if let maxTokens, tokenCount >= maxTokens { return nil }
 
-        let result = mainModel(y[text: .newAxis], cache: mainCache, state: nil)
+        let result = mainModel(y[text: .newAxis], cache: mainCache, state: mainState)
+        mainState = result.state
         var logits = result.logits[0..., -1, 0...]
         logits = processor?.process(logits: logits) ?? logits
         let token = sampler.sample(logits: logits)

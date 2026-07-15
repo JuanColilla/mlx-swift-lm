@@ -844,10 +844,38 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         parameters: GenerateParameters,
         numDraftTokens: Int
     ) throws {
+        try self.init(
+            input: input,
+            mainModel: mainModel,
+            draftModel: draftModel,
+            mainCache: mainCache,
+            draftCache: draftCache,
+            mainState: nil,
+            parameters: parameters,
+            numDraftTokens: numDraftTokens
+        )
+    }
+
+    /// Package-level continuation initializer used by ``ChatSession``.
+    ///
+    /// The public initializer remains unchanged. This overload makes the
+    /// per-call target state explicit when speculative decoding resumes an
+    /// already warm session cache.
+    package init(
+        input: LMInput,
+        mainModel: any LanguageModel,
+        draftModel: any LanguageModel,
+        mainCache: [KVCache]? = nil,
+        draftCache: [KVCache]? = nil,
+        mainState: LMOutput.State?,
+        parameters: GenerateParameters,
+        numDraftTokens: Int
+    ) throws {
         self.y = input.text
         self.draftY = input.text
         self.mainModel = mainModel
         self.draftModel = draftModel
+        self.mainState = mainState
 
         self.mainCache = mainCache ?? mainModel.newCache(parameters: parameters)
         self.draftCache = draftCache ?? draftModel.newCache(parameters: parameters)
@@ -2171,10 +2199,10 @@ public struct GenerateCompletionInfo: Sendable {
     /// are non-nil and proposed > 0.
     public let acceptedDraftTokens: Int?
 
-    /// Non-nil when the MTP iterator transitioned into sticky-passthrough
-    /// mode for the remainder of the stream; carries the reason string
-    /// captured at the moment of engagement. Nil if the iterator stayed
-    /// speculative for the full stream or for non-MTP streams.
+    /// Non-nil when MTP transitioned into sticky-passthrough or a high-level
+    /// memory gate selected target-only generation before loading the drafter.
+    /// Carries the reason captured at the transition/decision. Nil if MTP
+    /// stayed speculative for the full stream or for non-MTP streams.
     public let passthroughReason: String?
 
     /// Speculative decoding telemetry, when generation used speculative decoding.

@@ -1,99 +1,179 @@
-# MTP de producción — scoping note
+# MTP de producción en `ChatSession`
 
-Backlog: `DOCS/tech-debt-and-research-backlog.md` #7 — "Integrar MTP en
-`ChatSession`, añadir config pública, benchmark oficial y soporte/fallback
-claro para KV cuantizado. Sustituir prints directos por logging o eventos."
+Backlog: `DOCS/tech-debt-and-research-backlog.md` #7 — integrar MTP en la API
+de chat de alto nivel, con configuración pública, política de memoria,
+telemetría y benchmark JSON comparable.
 
-Nota de alcance, no implementación completa. Un ítem de los cuatro
-("sustituir prints directos") ya se resolvió en esta rama (ver
-`git log --oneline -- Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift`)
-porque era un cambio aislado, de una línea, fuera del hot path por-token. Los
-otros tres son cambios estructurales sobre generación real y quedan
-documentados aquí, no implementados.
+## Estado
 
-## Qué existe hoy (verificado)
+Implementado en la rama `feature/complete-improvement-backlog`.
 
-- `MTPSpeculativeTokenIterator` (`Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift`)
-  es una API completa y testeada a nivel de iterador de bajo nivel:
-  `TokenIteratorProtocol`, con `blockSize`, telemetría (`SpeculativeDecodingTelemetry`
-  reutilizada), y **ya tiene** un modo `passthrough` real (no un TODO):
-  `switchToPassthrough(reason:)` cambia a generación de un solo token cuando
-  el target deja de emitir `sharedKV`/hidden state (p.ej. al cruzar el
-  umbral de cuantización de KV, cubierto explícitamente por
-  `IntegrationTesting/IntegrationTestingTests/MTPQuantizationOnsetTests.swift`
-  — el "R13" mencionado
-  en el doc comment del fichero, `MTPSpeculativeTokenIterator.swift:26`).
-  Es decir: **el fallback a KV cuantizado ya existe y ya tiene test
-  dedicado** — el gap real no es "no hay fallback", es que ese fallback
-  vive únicamente en la API de bajo nivel, invisible para quien use
-  `ChatSession`.
-- Tests de integración reales ya cubren MTP con modelos descargados:
-  `IntegrationTesting/IntegrationTestingTests/MTPAcceptanceRateTests.swift`,
-  `MTPIteratorEndToEndDiagnosticTests.swift`, `MTPRung4TokenParityTests.swift`,
-  `MTPDrafterModelFactoryIntegrationTests.swift`, `Gemma4AssistantDraftModelIntegrationTests.swift`
-  — así que "benchmark oficial" tiene más sustrato del que el ticket sugiere;
-  el gap es que no está en el formato JSON comparable entre commits que
-  `BenchmarkReport` (añadido en esta rama, ítem #1) ya habilita para otros
-  benchmarks.
+La implementación reutiliza `MTPSpeculativeTokenIterator`; no duplica el
+algoritmo draft/verify/accept. El cambio de producción está en la composición:
+`ChatSession` puede resolver el drafter, decidir si cabe, conservar el estado
+del target entre turnos y exponer el resultado por su stream normal.
 
-## Qué falta de verdad
+## API pública
 
-1. **Integración en `ChatSession`**: `ChatSession` (`Libraries/MLXLMCommon/ChatSession.swift`)
-   no construye ni ofrece `MTPSpeculativeTokenIterator` en ningún punto —
-   confirmado por `grep -n "MTP" Libraries/MLXLMCommon/ChatSession.swift`
-   sin resultados. Un usuario de `ChatSession` (la API de alto nivel que la
-   mayoría de apps usa) no tiene forma de pedir MTP; solo quien construye
-   `TokenIteratorProtocol` a mano lo tiene disponible. Esto es el gap
-   estructural real del ticket.
-2. **Config pública**: no existe un `MTPSpeculativeDecodingConfig` (el
-   ticket lo menciona por nombre pero no existe en el código —
-   `grep -rn "MTPSpeculativeDecodingConfig" Libraries/` no devuelve nada).
-   `blockSize` y el drafter se pasan hoy directamente al inicializador de
-   `MTPSpeculativeTokenIterator`, sin un tipo de configuración reusable ni
-   almacenable en `GenerateParameters`.
-3. **Benchmark oficial en formato comparable**: los tests de integración
-   miden acceptance rate (`MTPAcceptanceRateTests.swift`) pero no emiten
-   `BenchmarkReport` JSON — sería trabajo de conectar esos tests (o una
-   nueva función en `BenchmarkHelpers`, siguiendo el patrón de
-   `benchmarkLLMGeneration`) al tipo `BenchmarkReport` ya añadido en esta
-   rama.
+`MTPSpeculativeDecodingConfig` es deliberadamente independiente de
+`SpeculativeDecodingConfig`, porque un drafter MTP no es un `LanguageModel` y
+no tiene KV cache propio.
 
-## Por qué no se implementa aquí
+```swift
+let config = try MTPSpeculativeDecodingConfig(
+    drafter: loadedDrafter,
+    blockSize: 4,
+    memoryPolicy: .recommendedWorkingSet
+)
 
-Integrar MTP en `ChatSession` significa tocar el tipo más usado y con más
-estado mutable público del repo (`ChatSession` ya se documenta a sí mismo
-como no thread-safe con estado mutable — ver `DOCS/memory-kv-cache.md`
-sección "Estado actual"), decidiendo cómo convive con:
-- Reuso de KV cache entre turnos (`ChatSession` ya evita re-prefill de
-  historial — cualquier MTP config tiene que respetar esa invariante).
-- El modo `passthrough` de MTP, que hoy es *sticky* dentro de un solo
-  `MTPSpeculativeTokenIterator` — ¿debe reiniciarse en cada turno de
-  `ChatSession`, o permanecer sticky entre turnos si el KV cache sigue
-  cuantizado? Esto no tiene una respuesta obvia sin decidir primero el
-  diseño de la política de memoria unificada (backlog #3, tampoco
-  implementada en esta rama por la misma razón).
-- `additionalContext`/`wiredMemoryTicket` por turno (gap ya documentado en
-  `DOCS/memory-kv-cache.md` punto 5, "`ChatSession` con política de
-  memoria") — MTP añade un segundo modelo (drafter) cuyo presupuesto de
-  memoria también debería entrar en esa misma política, no en una paralela.
+let session = ChatSession(
+    targetContainer,
+    mtpSpeculativeDecoding: config,
+    generateParameters: GenerateParameters(maxTokens: 512)
+)
+```
 
-Diseñar esto bien requiere resolver primero el diseño de política de
-memoria de `ChatSession` (#3) — hacerlo al revés (MTP primero) arriesga
-tener que rehacer la integración cuando #3 se resuelva.
+`blockSize` debe ser al menos 2: un bonus/corrección del target y uno o más
+tokens propuestos. Los initializers históricos de `ChatSession` y las rutas
+sin config o con speculative clásico se conservan; MTP se selecciona mediante
+un overload aditivo cuyo label `mtpSpeculativeDecoding:` es obligatorio. Esto
+también impide configurar classic y MTP simultáneamente por accidente.
 
-## Recomendación de orden
+Los overloads MTP cubren `ModelContainer` y `ModelContext`, incluidos los
+initializers con historial rehidratado y KV cache preconstruida.
 
-1. Backlog #3 (política de memoria de `ChatSession`) primero — define cómo
-   `ChatSession` expone/gestiona presupuesto de memoria por turno para
-   *cualquier* modelo auxiliar (draft clásico o drafter MTP), no solo MTP.
-2. Con ese diseño fijado, añadir `MTPSpeculativeDecodingConfig` (struct
-   simple: drafter, `blockSize`, política de memoria) y un punto de entrada
-   en `ChatSession` que lo acepte, reutilizando `MTPSpeculativeTokenIterator`
-   tal cual (no reescribirlo — ya está testeado).
-3. Conectar `MTPAcceptanceRateTests`/`MTPIteratorEndToEndDiagnosticTests` a
-   `BenchmarkReport` para tener benchmark oficial en JSON comparable.
+## Carga eager y deferred
 
-Ningún paso de esta lista requiere tocar la lógica interna de
-`MTPSpeculativeTokenIterator` (draft/verify/accept, passthrough) — está
-verificada y estable; el trabajo real es de superficie pública y
-composición con `ChatSession`, no de algoritmo.
+Para evitar cargar un auxiliar que no cabe, se puede proporcionar una
+estimación y un loader:
+
+```swift
+let config = try MTPSpeculativeDecodingConfig(
+    drafterBytes: estimatedDrafterBytes,
+    blockSize: 4,
+    memoryPolicy: SpeculativeDecodingMemoryPolicy(
+        limitBytes: deviceBudgetBytes,
+        additionalBytes: kvAndWorkspaceBytes,
+        action: .fallbackToDefault
+    )
+) {
+    try await MTPDrafterModelFactory.shared.loadContainer(
+        configuration: drafterConfiguration
+    )
+}
+```
+
+`drafterBytes` negativo se normaliza a cero, igual que en
+`SpeculativeDecodingConfig`. La aplicación es responsable de proporcionar una
+estimación conservadora; el framework no inventa un umbral de hardware.
+
+La resolución usa dos gates:
+
+1. Antes del loader, evalúa pesos del target + estimación del drafter +
+   `additionalBytes`.
+2. Después de cargar, vuelve a evaluar con los bytes reales de parámetros del
+   drafter.
+
+Con `.fallbackToDefault`, una denegación ejecuta generación target-only y no
+invoca el loader cuando falla el primer gate. Con `.fail`, propaga
+`SpeculativeDecodingMemoryError`. Un drafter deferred admitido se cachea en la
+sesión y no se vuelve a cargar en cada turno.
+
+## Memoria wired y prefill
+
+`ChatSession.wiredMemoryTicket` se captura al comenzar cada turno. La ruta MTP
+lo pasa al mismo `generateTask` que la generación normal y classic speculative,
+por lo que start/end mantienen el emparejamiento cancellation-safe.
+
+`ChatSession.prefill(...)` solo prepara el target y su KV cache. No carga el
+drafter MTP: este no mantiene una caché propia y se resuelve cuando realmente
+empieza una generación MTP. Así se puede construir contexto reutilizable sin
+pagar memoria auxiliar ni emitir tokens visibles.
+
+## Coherencia de KV cache y `LMOutput.State`
+
+La sesión conserva una única KV cache del target para MTP; no existe
+`draftKVCache` en este modo. El input de cada turno se añade a esa cache y el
+iterador recibe también el `LMOutput.State` asociado.
+
+Hay dos salvaguardas adicionales:
+
+- Los iteradores classic y MTP tienen initializers package aditivos que aceptan
+  el state de continuación. Las firmas públicas históricas siguen inicializando
+  desde `nil`.
+- Un state sink de un solo consumidor recoge el state final del iterador tras
+  cada token. `ChatSession` espera a `genTask` antes de leerlo y guardarlo junto
+  a la KV cache, incluyendo reinicios por tool calls.
+
+En MTP, los snapshots `mtpLastHiddenStatesKey` y `mtpSharedKVStatesKey` de un
+turno anterior se eliminan antes de un nuevo prefill. El forward con
+`mtpEmitFlagKey = true` produce un snapshot nuevo alineado con el offset actual;
+esto evita reutilizar shared K/V stale y disparar la invariante de span.
+
+## Fallbacks observables
+
+MTP no soporta verificar con shared K/V cuantizado. El comportamiento es
+explícito y no crashea:
+
+- Si el target deja de emitir hidden/shared K/V —incluido el onset de KV
+  cuantizado— `MTPSpeculativeTokenIterator` pasa de forma sticky a target-only.
+- El fallback sigue encadenando `LMOutput.State` y la KV cache del target.
+- El motivo de cuantización contiene `after KV cache quantization`; un estado
+  faltante por otra causa conserva `main model did not emit drafter state`.
+- Si el gate de memoria evita entrar en MTP, un wrapper target-only publica
+  igualmente `proposedDraftTokens = 0`, `acceptedDraftTokens = 0` y un
+  `passthroughReason` que comienza por `MTP skipped by memory policy`.
+
+La app obtiene la telemetría desde el evento `.info` habitual:
+
+```swift
+for try await event in session.streamDetails(to: prompt) {
+    guard let info = event.info else { continue }
+    let proposed = info.proposedDraftTokens
+    let accepted = info.acceptedDraftTokens
+    let reason = info.passthroughReason
+    let detailed = info.speculativeDecodingTelemetry
+}
+```
+
+## Benchmark JSON reproducible
+
+`BenchmarkHelpers` expone el adaptador
+`GenerateCompletionInfo.mtpBenchmarkEntry(...)`. Los integration tests reales
+pueden conservar sus mediciones de modelo/dispositivo y producir el mismo
+schema JSON que el resto de benchmarks:
+
+```swift
+let entry = completionInfo.mtpBenchmarkEntry(
+    context: "target=<id>;drafter=<id>;blockSize=4;kv=fp16",
+    generationTimesMilliseconds: repeatedDecodeTimes
+)
+
+let report = BenchmarkReport(
+    label: commitSHA,
+    entries: [entry]
+)
+try report.write(to: outputURL)
+```
+
+El entry incluye `tokensPerSecond`, `generationTokenCount`,
+`proposedDraftTokens`, `acceptedDraftTokens`, `acceptanceRate` y
+`didPassthrough`. El `context` debe fijar target, drafter, block size,
+cuantización y preset para que dos commits sean comparables.
+
+Los tests unitarios validan el mapeo y el JSON. Las suites físicas existentes
+(`MTPAcceptanceRateTests`, `MTPIteratorEndToEndDiagnosticTests` y
+`MTPQuantizationOnsetTests`) siguen siendo la fuente para números reales: MLX
+en iOS debe medirse en dispositivo físico, no en Simulator.
+
+## Límites explícitos
+
+- MTP requiere un target que implemente las claves de emisión; actualmente la
+  ruta de producción relevante es Gemma 4.
+- KV cuantizado usa target-only sticky; no se promete MTP cuantizado.
+- La política de memoria es consultiva/explicativa. No cambia `kvBits`,
+  `maxKVSize` ni el block size automáticamente.
+- `ChatSession` sigue siendo single-consumer y no thread-safe.
+- Persistir KV cache con `saveCache` no serializa un `LMOutput.State` arbitrario;
+  tras restaurar, el siguiente prefill debe reconstruir el state que el modelo
+  necesite.

@@ -154,7 +154,8 @@ public protocol MTPStatsCollecting {
     var acceptedDraftTokens: Int { get }
 
     /// nil if the iterator stayed in speculative mode for the full stream;
-    /// non-nil if sticky-passthrough engaged, with the reason string captured
-    /// at the moment of engagement.
+    /// non-nil if sticky-passthrough engaged or high-level MTP admission
+    /// selected target-only generation, with the reason captured at the
+    /// moment of the transition/decision.
     var passthroughReason: String? { get }
 }

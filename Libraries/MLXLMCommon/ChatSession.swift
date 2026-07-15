@@ -7,6 +7,125 @@ import MLX
 import CoreGraphics
 #endif
 
+/// Target-only iterator used when high-level MTP admission falls back before
+/// the drafter is loaded. It preserves normal token semantics while exposing
+/// the reason through the existing MTP completion-info surface.
+private struct MTPFallbackTokenIterator: TokenIteratorProtocol, MTPStatsCollecting {
+    private var base: TokenIterator
+    private let sink: ChatSessionStateSink
+
+    let passthroughReason: String?
+    var proposedDraftTokens: Int { 0 }
+    var acceptedDraftTokens: Int { 0 }
+    var maxTokens: Int? { base.maxTokens }
+    var tokenCount: Int { base.tokenCount }
+    var promptPrefillTime: TimeInterval { base.promptPrefillTime }
+    var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? { nil }
+
+    init(base: TokenIterator, reason: String, sink: ChatSessionStateSink) {
+        self.base = base
+        self.sink = sink
+        self.passthroughReason = reason
+        sink.store(base.state)
+    }
+
+    mutating func next() -> Int? {
+        let token = base.next()
+        sink.store(base.state)
+        return token
+    }
+
+    mutating func discardGeneratedToken() {
+        base.discardGeneratedToken()
+        sink.store(base.state)
+    }
+}
+
+/// Single-consumer handoff for the final iterator state.
+///
+/// Generation runs in the unstructured task returned by `generateTask`; the
+/// session awaits that task before reading this box and before starting any
+/// later turn. The lock documents and enforces the handoff boundary while the
+/// unchecked conformance is required because `LMOutput.State` can contain
+/// non-Sendable MLX arrays.
+private final class ChatSessionStateSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var state: LMOutput.State?
+
+    func store(_ state: LMOutput.State?) {
+        lock.lock()
+        self.state = state
+        lock.unlock()
+    }
+
+    func load() -> LMOutput.State? {
+        lock.lock()
+        defer { lock.unlock() }
+        return state
+    }
+}
+
+private struct StateReportingSpeculativeTokenIterator: TokenIteratorProtocol {
+    private var base: SpeculativeTokenIterator
+    private let sink: ChatSessionStateSink
+
+    var maxTokens: Int? { base.maxTokens }
+    var tokenCount: Int { base.tokenCount }
+    var promptPrefillTime: TimeInterval { base.promptPrefillTime }
+    var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? {
+        base.speculativeDecodingTelemetry
+    }
+
+    init(base: SpeculativeTokenIterator, sink: ChatSessionStateSink) {
+        self.base = base
+        self.sink = sink
+        sink.store(base.mainState)
+    }
+
+    mutating func next() -> Int? {
+        let token = base.next()
+        sink.store(base.mainState)
+        return token
+    }
+
+    mutating func discardGeneratedToken() {
+        base.discardGeneratedToken()
+        sink.store(base.mainState)
+    }
+}
+
+private struct StateReportingMTPTokenIterator: TokenIteratorProtocol, MTPStatsCollecting {
+    private var base: MTPSpeculativeTokenIterator
+    private let sink: ChatSessionStateSink
+
+    var maxTokens: Int? { base.maxTokens }
+    var tokenCount: Int { base.tokenCount }
+    var promptPrefillTime: TimeInterval { base.promptPrefillTime }
+    var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? {
+        base.speculativeDecodingTelemetry
+    }
+    var proposedDraftTokens: Int { base.proposedDraftTokens }
+    var acceptedDraftTokens: Int { base.acceptedDraftTokens }
+    var passthroughReason: String? { base.passthroughReason }
+
+    init(base: MTPSpeculativeTokenIterator, sink: ChatSessionStateSink) {
+        self.base = base
+        self.sink = sink
+        sink.store(base.mainState)
+    }
+
+    mutating func next() -> Int? {
+        let token = base.next()
+        sink.store(base.mainState)
+        return token
+    }
+
+    mutating func discardGeneratedToken() {
+        base.discardGeneratedToken()
+        sink.store(base.mainState)
+    }
+}
+
 /// Configuration for speculative decoding in a `ChatSession`.
 ///
 /// Speculative decoding uses a small draft model to propose candidate tokens
@@ -188,6 +307,7 @@ public final class ChatSession {
     public var instructions: String?
     private let cache: SerialAccessContainer<Cache>
     private let loadedDraftModel: SerialAccessContainer<ModelContainer?>
+    private let loadedMTPDrafter: SerialAccessContainer<MTPDrafterContainer?>
     public var processing: UserInput.Processing
     public var generateParameters: GenerateParameters
     /// Optional wired-memory ticket applied to generation work for the next turn.
@@ -202,6 +322,12 @@ public final class ChatSession {
 
     /// Speculative decoding configuration, nil if disabled.
     public let speculativeDecoding: SpeculativeDecodingConfig?
+
+    /// MTP speculative-decoding configuration, nil if disabled.
+    ///
+    /// This is mutually exclusive with ``speculativeDecoding``. Use an
+    /// initializer whose required label is `mtpSpeculativeDecoding:` to opt in.
+    public private(set) var mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig?
 
     /// Initialize the `ChatSession`.
     ///
@@ -228,6 +354,7 @@ public final class ChatSession {
         self.instructions = instructions
         self.cache = .init(.empty)
         self.loadedDraftModel = .init(speculativeDecoding?.draftModel)
+        self.loadedMTPDrafter = .init(nil)
         self.processing = processing
         self.generateParameters = generateParameters
         self.wiredMemoryTicket = nil
@@ -235,6 +362,7 @@ public final class ChatSession {
         self.toolDispatch = toolDispatch
         self.additionalContext = additionalContext
         self.speculativeDecoding = speculativeDecoding
+        self.mtpSpeculativeDecoding = nil
     }
 
     /// Initialize the `ChatSession`.
@@ -262,6 +390,7 @@ public final class ChatSession {
         self.instructions = instructions
         self.cache = .init(.empty)
         self.loadedDraftModel = .init(speculativeDecoding?.draftModel)
+        self.loadedMTPDrafter = .init(nil)
         self.processing = processing
         self.generateParameters = generateParameters
         self.wiredMemoryTicket = nil
@@ -269,6 +398,7 @@ public final class ChatSession {
         self.toolDispatch = toolDispatch
         self.additionalContext = additionalContext
         self.speculativeDecoding = speculativeDecoding
+        self.mtpSpeculativeDecoding = nil
     }
 
     /// Initialize the `ChatSession` with an existing message history.
@@ -300,6 +430,7 @@ public final class ChatSession {
         self.instructions = instructions
         self.cache = .init(.history(history))
         self.loadedDraftModel = .init(speculativeDecoding?.draftModel)
+        self.loadedMTPDrafter = .init(nil)
         self.processing = processing
         self.generateParameters = generateParameters
         self.wiredMemoryTicket = nil
@@ -307,6 +438,7 @@ public final class ChatSession {
         self.toolDispatch = toolDispatch
         self.additionalContext = additionalContext
         self.speculativeDecoding = speculativeDecoding
+        self.mtpSpeculativeDecoding = nil
     }
 
     /// Initialize the `ChatSession` with an existing message history.
@@ -338,6 +470,7 @@ public final class ChatSession {
         self.instructions = instructions
         self.cache = .init(.history(history))
         self.loadedDraftModel = .init(speculativeDecoding?.draftModel)
+        self.loadedMTPDrafter = .init(nil)
         self.processing = processing
         self.generateParameters = generateParameters
         self.wiredMemoryTicket = nil
@@ -345,6 +478,7 @@ public final class ChatSession {
         self.toolDispatch = toolDispatch
         self.additionalContext = additionalContext
         self.speculativeDecoding = speculativeDecoding
+        self.mtpSpeculativeDecoding = nil
     }
 
     /// Initialize the `ChatSession` with a pre-built KV cache.
@@ -385,6 +519,7 @@ public final class ChatSession {
         self.instructions = instructions
         self.cache = .init(.kvcache(cache, draftKVCache: nil, state: nil))
         self.loadedDraftModel = .init(speculativeDecoding?.draftModel)
+        self.loadedMTPDrafter = .init(nil)
         self.processing = processing
         self.generateParameters = generateParameters
         self.wiredMemoryTicket = nil
@@ -392,6 +527,7 @@ public final class ChatSession {
         self.toolDispatch = toolDispatch
         self.additionalContext = additionalContext
         self.speculativeDecoding = speculativeDecoding
+        self.mtpSpeculativeDecoding = nil
     }
 
     /// Initialize the `ChatSession` with a pre-built KV cache.
@@ -432,6 +568,7 @@ public final class ChatSession {
         self.instructions = instructions
         self.cache = .init(.kvcache(cache, draftKVCache: nil, state: nil))
         self.loadedDraftModel = .init(speculativeDecoding?.draftModel)
+        self.loadedMTPDrafter = .init(nil)
         self.processing = processing
         self.generateParameters = generateParameters
         self.wiredMemoryTicket = nil
@@ -439,6 +576,158 @@ public final class ChatSession {
         self.toolDispatch = toolDispatch
         self.additionalContext = additionalContext
         self.speculativeDecoding = speculativeDecoding
+        self.mtpSpeculativeDecoding = nil
+    }
+
+    // MARK: MTP initializers
+
+    /// Initializes a session with high-level MTP speculative decoding.
+    ///
+    /// The required `mtpSpeculativeDecoding` label keeps this overload
+    /// separate from the historical no-config and classic-speculative APIs.
+    public convenience init(
+        _ model: ModelContainer,
+        instructions: String? = nil,
+        mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig,
+        generateParameters: GenerateParameters = .init(),
+        processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
+        additionalContext: [String: any Sendable]? = nil,
+        tools: [ToolSpec]? = nil,
+        toolDispatch: (@Sendable (ToolCall) async throws -> String)? = nil
+    ) {
+        self.init(
+            model,
+            instructions: instructions,
+            generateParameters: generateParameters,
+            processing: processing,
+            additionalContext: additionalContext,
+            tools: tools,
+            toolDispatch: toolDispatch
+        )
+        self.mtpSpeculativeDecoding = mtpSpeculativeDecoding
+    }
+
+    /// Initializes a context-backed session with high-level MTP speculative decoding.
+    public convenience init(
+        _ model: ModelContext,
+        instructions: String? = nil,
+        mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig,
+        generateParameters: GenerateParameters = .init(),
+        processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
+        additionalContext: [String: any Sendable]? = nil,
+        tools: [ToolSpec]? = nil,
+        toolDispatch: (@Sendable (ToolCall) async throws -> String)? = nil
+    ) {
+        self.init(
+            model,
+            instructions: instructions,
+            generateParameters: generateParameters,
+            processing: processing,
+            additionalContext: additionalContext,
+            tools: tools,
+            toolDispatch: toolDispatch
+        )
+        self.mtpSpeculativeDecoding = mtpSpeculativeDecoding
+    }
+
+    /// Initializes a rehydrated-history session with MTP speculative decoding.
+    public convenience init(
+        _ model: ModelContainer,
+        instructions: String? = nil,
+        history: consuming [Chat.Message],
+        mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig,
+        generateParameters: GenerateParameters = .init(),
+        processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
+        additionalContext: [String: any Sendable]? = nil,
+        tools: [ToolSpec]? = nil,
+        toolDispatch: (@Sendable (ToolCall) async throws -> String)? = nil
+    ) {
+        self.init(
+            model,
+            instructions: instructions,
+            history: history,
+            generateParameters: generateParameters,
+            processing: processing,
+            additionalContext: additionalContext,
+            tools: tools,
+            toolDispatch: toolDispatch
+        )
+        self.mtpSpeculativeDecoding = mtpSpeculativeDecoding
+    }
+
+    /// Initializes a context-backed rehydrated-history session with MTP.
+    public convenience init(
+        _ model: ModelContext,
+        instructions: String? = nil,
+        history: [Chat.Message],
+        mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig,
+        generateParameters: GenerateParameters = .init(),
+        processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
+        additionalContext: [String: any Sendable]? = nil,
+        tools: [ToolSpec]? = nil,
+        toolDispatch: (@Sendable (ToolCall) async throws -> String)? = nil
+    ) {
+        self.init(
+            model,
+            instructions: instructions,
+            history: history,
+            generateParameters: generateParameters,
+            processing: processing,
+            additionalContext: additionalContext,
+            tools: tools,
+            toolDispatch: toolDispatch
+        )
+        self.mtpSpeculativeDecoding = mtpSpeculativeDecoding
+    }
+
+    /// Initializes a prompt-cache-backed session with MTP speculative decoding.
+    public convenience init(
+        _ model: ModelContainer,
+        instructions: String? = nil,
+        cache: consuming [KVCache],
+        mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig,
+        generateParameters: GenerateParameters = .init(),
+        processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
+        additionalContext: [String: any Sendable]? = nil,
+        tools: [ToolSpec]? = nil,
+        toolDispatch: (@Sendable (ToolCall) async throws -> String)? = nil
+    ) {
+        self.init(
+            model,
+            instructions: instructions,
+            cache: cache,
+            generateParameters: generateParameters,
+            processing: processing,
+            additionalContext: additionalContext,
+            tools: tools,
+            toolDispatch: toolDispatch
+        )
+        self.mtpSpeculativeDecoding = mtpSpeculativeDecoding
+    }
+
+    /// Initializes a context-backed prompt-cache session with MTP.
+    public convenience init(
+        _ model: ModelContext,
+        instructions: String? = nil,
+        cache: consuming [KVCache],
+        mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig,
+        generateParameters: GenerateParameters = .init(),
+        processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
+        additionalContext: [String: any Sendable]? = nil,
+        tools: [ToolSpec]? = nil,
+        toolDispatch: (@Sendable (ToolCall) async throws -> String)? = nil
+    ) {
+        self.init(
+            model,
+            instructions: instructions,
+            cache: cache,
+            generateParameters: generateParameters,
+            processing: processing,
+            additionalContext: additionalContext,
+            tools: tools,
+            toolDispatch: toolDispatch
+        )
+        self.mtpSpeculativeDecoding = mtpSpeculativeDecoding
     }
 
     /// Produces a response to a prompt.
@@ -735,6 +1024,37 @@ public final class ChatSession {
         return draftContainer
     }
 
+    private static func modelWeightBytes(_ model: any BaseLanguageModel) -> Int {
+        model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
+    }
+
+    private static func mtpMemoryFallbackReason(
+        _ evaluation: SpeculativeDecodingMemoryEvaluation
+    ) -> String {
+        if let limit = evaluation.limitBytes {
+            return
+                "MTP skipped by memory policy: estimated \(evaluation.estimatedBytes) bytes exceeds \(limit) bytes"
+        }
+        return "MTP skipped by memory policy"
+    }
+
+    private static func mtpMemoryAdmissionFallbackReason(
+        policy: SpeculativeDecodingMemoryPolicy?,
+        mainModelBytes: Int,
+        drafterBytes: Int?
+    ) throws -> String? {
+        guard let policy, let drafterBytes else { return nil }
+        let evaluation = policy.evaluate(
+            mainModelBytes: mainModelBytes,
+            draftModelBytes: drafterBytes
+        )
+        guard !evaluation.shouldUseSpeculativeDecoding else { return nil }
+        if evaluation.action == .fail {
+            throw SpeculativeDecodingMemoryError(evaluation: evaluation)
+        }
+        return mtpMemoryFallbackReason(evaluation)
+    }
+
     /// Produces a streaming response to a prompt as Strings.
     ///
     /// - Parameters:
@@ -841,14 +1161,24 @@ public final class ChatSession {
         // images and videos are not Sendable (MLXArray) but they are consumed
         // and are only being sent to the inner async
         let inputMessages = SendableBox<[Chat.Message]>(messages)
+        let model = self.model
+        let instructions = self.instructions
+        let processing = self.processing
+        let tools = self.tools
+        let toolDispatch = self.toolDispatch
+        let additionalContext = self.additionalContext
+        let cache = self.cache
+        let loadedDraftModel = self.loadedDraftModel
+        let generateParameters = self.generateParameters
+        let speculativeDecoding = self.speculativeDecoding
+        let loadedMTPDrafter = self.loadedMTPDrafter
+        let mtpSpeculativeDecoding = self.mtpSpeculativeDecoding
+        let wiredMemoryTicket = self.wiredMemoryTicket
 
-        let task = Task {
-            [
-                model,
-                instructions, processing, tools, toolDispatch,
-                additionalContext, cache, loadedDraftModel, generateParameters, speculativeDecoding,
-                wiredMemoryTicket,
-            ] in
+        // Keep the generation body in an explicitly Sendable operation. Swift 6's
+        // region checker cannot analyze the two-stage MTP memory gate when that
+        // body is written directly as the Task closure.
+        let operation: @Sendable () async -> Void = {
             do {
                 try await cache.update { cache in
 
@@ -916,7 +1246,8 @@ public final class ChatSession {
 
                         // Select the token iterator based on speculative decoding configuration.
                         let (genStream, genTask): (AsyncStream<Generation>, Task<Void, Never>)
-                        func defaultGeneration() throws -> (
+                        var generationStateSink: ChatSessionStateSink?
+                        func defaultGeneration(mtpFallbackReason: String? = nil) throws -> (
                             AsyncStream<Generation>, Task<Void, Never>
                         ) {
                             // Seed the iterator with the carried state; read
@@ -930,17 +1261,104 @@ public final class ChatSession {
                                 parameters: generateParameters)
                             lmState = iterator.state
 
-                            return MLXLMCommon.generateTask(
-                                promptTokenCount: input.text.tokens.size,
-                                modelConfiguration: modelConfiguration,
-                                tokenizer: tokenizer,
-                                iterator: iterator,
-                                wiredMemoryTicket: wiredMemoryTicket,
-                                tools: tools
-                            )
+                            if let mtpFallbackReason {
+                                let stateSink = ChatSessionStateSink()
+                                generationStateSink = stateSink
+                                return MLXLMCommon.generateTask(
+                                    promptTokenCount: input.text.tokens.size,
+                                    modelConfiguration: modelConfiguration,
+                                    tokenizer: tokenizer,
+                                    iterator: MTPFallbackTokenIterator(
+                                        base: iterator,
+                                        reason: mtpFallbackReason,
+                                        sink: stateSink
+                                    ),
+                                    wiredMemoryTicket: wiredMemoryTicket,
+                                    tools: tools
+                                )
+                            } else {
+                                return MLXLMCommon.generateTask(
+                                    promptTokenCount: input.text.tokens.size,
+                                    modelConfiguration: modelConfiguration,
+                                    tokenizer: tokenizer,
+                                    iterator: iterator,
+                                    wiredMemoryTicket: wiredMemoryTicket,
+                                    tools: tools
+                                )
+                            }
                         }
 
-                        if let speculativeDecoding {
+                        if let mtpSpeculativeDecoding {
+                            let mainModelBytes =
+                                SpeculativeDecodingMemoryPolicy.modelWeightBytes(model)
+                            let preLoadFallbackReason =
+                                try Self.mtpMemoryAdmissionFallbackReason(
+                                    policy: mtpSpeculativeDecoding.memoryPolicy,
+                                    mainModelBytes: mainModelBytes,
+                                    drafterBytes: mtpSpeculativeDecoding.estimatedDrafterBytes
+                                ) ?? ""
+                            if !preLoadFallbackReason.isEmpty {
+                                (genStream, genTask) = try defaultGeneration(
+                                    mtpFallbackReason: preLoadFallbackReason
+                                )
+                            } else {
+                                let cachedDrafter = await loadedMTPDrafter.read { $0 }
+                                let drafterContainer =
+                                    if let cachedDrafter {
+                                        cachedDrafter
+                                    } else {
+                                        try await mtpSpeculativeDecoding.loadDrafter()
+                                    }
+                                let drafter = await drafterContainer.perform { context in
+                                    SendableBox(context.model)
+                                }.consume()
+
+                                let postLoadFallbackReason =
+                                    try Self.mtpMemoryAdmissionFallbackReason(
+                                        policy: mtpSpeculativeDecoding.memoryPolicy,
+                                        mainModelBytes: mainModelBytes,
+                                        drafterBytes: Self.modelWeightBytes(drafter)
+                                    ) ?? ""
+                                if !postLoadFallbackReason.isEmpty {
+                                    (genStream, genTask) = try defaultGeneration(
+                                        mtpFallbackReason: postLoadFallbackReason
+                                    )
+                                } else {
+                                    if cachedDrafter == nil {
+                                        await loadedMTPDrafter.update { storedDrafter in
+                                            if storedDrafter == nil {
+                                                storedDrafter = drafterContainer
+                                            }
+                                        }
+                                    }
+
+                                    let iterator = try MTPSpeculativeTokenIterator(
+                                        input: input,
+                                        mainModel: model,
+                                        drafter: drafter,
+                                        mainCache: kvCache,
+                                        mainState: lmState,
+                                        parameters: generateParameters,
+                                        blockSize: mtpSpeculativeDecoding.blockSize
+                                    )
+                                    lmState = iterator.mainState
+                                    let stateSink = ChatSessionStateSink()
+                                    generationStateSink = stateSink
+
+                                    (genStream, genTask) = MLXLMCommon.generateTask(
+                                        promptTokenCount: input.text.tokens.size,
+                                        modelConfiguration: modelConfiguration,
+                                        tokenizer: tokenizer,
+                                        iterator: StateReportingMTPTokenIterator(
+                                            base: iterator,
+                                            sink: stateSink
+                                        ),
+                                        wiredMemoryTicket: wiredMemoryTicket,
+                                        tools: tools
+                                    )
+                                }
+                            }
+                        } else if let speculativeDecoding {
                             var shouldFallBackBeforeLoadingDraft = false
                             if let memoryPolicy = speculativeDecoding.memoryPolicy,
                                 let draftModelBytes =
@@ -1016,15 +1434,22 @@ public final class ChatSession {
                                         draftModel: draftModel,
                                         mainCache: kvCache,
                                         draftCache: draftCache,
+                                        mainState: lmState,
                                         parameters: generateParameters,
                                         numDraftTokens: speculativeDecoding.numDraftTokens
                                     )
+                                    lmState = iterator.mainState
+                                    let stateSink = ChatSessionStateSink()
+                                    generationStateSink = stateSink
 
                                     (genStream, genTask) = MLXLMCommon.generateTask(
                                         promptTokenCount: input.text.tokens.size,
                                         modelConfiguration: modelConfiguration,
                                         tokenizer: tokenizer,
-                                        iterator: iterator,
+                                        iterator: StateReportingSpeculativeTokenIterator(
+                                            base: iterator,
+                                            sink: stateSink
+                                        ),
                                         wiredMemoryTicket: wiredMemoryTicket,
                                         tools: tools
                                     )
@@ -1067,6 +1492,9 @@ public final class ChatSession {
                         // the case where we broke the loop early as the generation
                         // work may continue (briefly) and use the KVCache
                         await genTask.value
+                        if let generationStateSink {
+                            lmState = generationStateSink.load()
+                        }
 
                         // dispatch all tool calls from this generation pass
                         if let toolDispatch, !pendingToolCalls.isEmpty,
@@ -1090,6 +1518,10 @@ public final class ChatSession {
             } catch {
                 continuation.finish(throwing: error)
             }
+        }
+
+        let task = Task {
+            await operation()
         }
 
         continuation.onTermination = { _ in
