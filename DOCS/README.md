@@ -15,6 +15,12 @@ Esta carpeta resume una investigación técnica del framework `mlx-swift-lm` en 
 
 ## Implementación del backlog (2026-07-15)
 
+> **Continuación**: si vas a retomar este trabajo, empieza por
+> [backlog-continuation-plan.md](backlog-continuation-plan.md) — tiene el
+> estado exacto, los comandos de build/test ya verificados en este
+> entorno y el orden recomendado de próximos pasos, para no tener que
+> re-investigar nada de lo ya resuelto en esta rama.
+
 Cada ítem de `tech-debt-and-research-backlog.md` tiene ahora un documento de
 resultado, marcado explícitamente como **código verificado** o **investigación
 / nota de alcance** (no implementado, por diseño — ver cada nota para el porqué).
