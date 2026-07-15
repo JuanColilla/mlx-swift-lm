@@ -3,7 +3,7 @@
 ## Fuentes locales
 
 - `README.md`: estado 3.x, instalacion, macros `MLXHuggingFace`, desacoplo tokenizer/downloader.
-- `Package.swift`: productos, plataformas, Swift 6.1 y dependencia `mlx-swift` 0.31.4.
+- `Package.swift`: productos, plataformas, Swift 6.1 y revision exacta del fork `JuanColilla/mlx-swift` con soporte affine de 1 bit.
 - `Libraries/MLXLMCommon/Evaluate.swift`: `GenerateParameters`, sampling, KV parameters.
 - `Libraries/MLXLMCommon/KVCache.swift`: protocolo KV cache, cache cuantizada, mascaras.
 - `Libraries/MLXLMCommon/SpeculativeDecoding.swift`: telemetria y politica de memoria para speculative decoding.
@@ -26,6 +26,9 @@
 
 - MLX Swift LM GitHub: https://github.com/ml-explore/mlx-swift-lm
 - MLX Swift GitHub: https://github.com/ml-explore/mlx-swift
+- Fork PrismML de MLX Swift: https://github.com/PrismML-Eng/mlx-swift
+- Variante PrismML sobre 0.31.6: https://github.com/PrismML-Eng/mlx-swift/tree/v0.31.6_prism
+- Core MLX de PrismML: https://github.com/PrismML-Eng/mlx
 - MLX Swift LM documentation en Swift Package Index: https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon
 - MLX documentation: https://ml-explore.github.io/mlx/build/html/index.html
 - MLX LM Python reference: https://github.com/ml-explore/mlx-lm
