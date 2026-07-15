@@ -352,10 +352,29 @@ public enum MediaProcessing {
         samplesPerSecond: Int,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
+        try await asProcessedSequence(
+            video,
+            samplesPerSecond: samplesPerSecond,
+            maxFrames: Int.max,
+            frameProcessing: frameProcessing
+        )
+    }
+
+    /// Samples and processes a video while enforcing an upper bound on decoded frames.
+    ///
+    /// The historical ``asProcessedSequence(_:samplesPerSecond:frameProcessing:)`` overload
+    /// remains unbounded for source compatibility. Use this overload when the caller has a
+    /// concrete visual-token or memory budget. `maxFrames` must be at least one.
+    static public func asProcessedSequence(
+        _ video: UserInput.Video,
+        samplesPerSecond: Int,
+        maxFrames: Int,
+        frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
+    ) async throws -> ProcessedFrames {
         return try await asProcessedSequence(
             video,
             targetFPS: { _ in Double(samplesPerSecond) },
-            maxFrames: Int.max,
+            maxFrames: maxFrames,
             frameProcessing: frameProcessing
         )
     }
@@ -382,7 +401,8 @@ public enum MediaProcessing {
 
         case .frames(let videoFrames):
             return try await _asProcessedSequence(
-                videoFrames, targetFPS: targetFPS, frameProcessing: frameProcessing)
+                videoFrames, maxFrames: maxFrames, targetFPS: targetFPS,
+                frameProcessing: frameProcessing)
         }
     }
 
@@ -464,7 +484,7 @@ public enum MediaProcessing {
     }
 
     static private func _asProcessedSequence(
-        _ videoFrames: [VideoFrame],
+        _ videoFrames: [VideoFrame], maxFrames: Int,
         targetFPS: (CMTime) -> Double,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
@@ -480,7 +500,7 @@ public enum MediaProcessing {
         let fps = targetFPS(duration)
         // Note: the round was not present in `asCIImageSequence`, so we may now be passing 1 more frame to Qwen depending on video duration.
         let estimatedFrames = Int(round(fps * duration.seconds))
-        let desiredFrames = min(estimatedFrames, videoFrames.count)
+        let desiredFrames = min(estimatedFrames, videoFrames.count, maxFrames)
         let finalFrameCount = max(desiredFrames, 1)
 
         let sampledTimeValues = MLXArray.linspace(

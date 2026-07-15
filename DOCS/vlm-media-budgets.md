@@ -43,7 +43,7 @@ sin guion: `lfm2_vl` / `lfm2-vl`) y GlmOcr.
 | **Qwen3VL** | Dinámica, rango por defecto mucho más amplio | No | Sí, 2 fps, sin cap de frames | 4 a 16384 tokens/imagen por defecto (`min=4×28²`, `max=16384×28²` px) | El caso peor por imagen es el mayor de toda la tabla |
 | **Qwen3.5 / Qwen3.5-MoE** | Reutiliza la vision tower de Qwen3VL (`Qwen3VLConfiguration.VisionConfiguration`) | No | No verificado en el processor (no hay registro de `Qwen35Processor`; usa el mismo `Qwen3VLProcessor`) | Igual que Qwen3VL | Igual que Qwen3VL; MoE solo afecta al FFN de texto |
 | **Idefics3** | Fija (384×384) | No — 1 imagen, sin tiling en `Idefics3Processor` | No | Modelo de 1 solo `imageTokenId` insertado en el prompt (ver "Gaps") | Bajo por imagen si el tiling realmente no aplica aquí |
-| **SmolVLM2** (clase = Idefics3, processor propio) | Fija por tile (384 modelos grandes / 512 modelos 200-500M) tras tiling dinámico | Sí — grid `nRows×nCols` + 1 tile global | Sí, ~1 fps con multiplicador para vídeos cortos; `maxVideoFrames` hardcodeado a 20 | `(nRows×nCols + 1) × imageSequenceLength(64)`. Ejemplos reales: 512×384→2 tiles→128 tok; 1024×768→5 tiles→320 tok; 4096×3072→13 tiles→832 tok | Escala con el tamaño real de la imagen; el fix de #208 evita upscaling espurio |
+| **SmolVLM2** (clase = Idefics3, processor propio) | Fija por tile (384 modelos grandes / 512 modelos 200-500M) tras tiling dinámico | Sí — grid `nRows×nCols` + 1 tile global | Sí, ~1 fps con multiplicador para vídeos cortos; cap efectivo de 20 frames | `(nRows×nCols + 1) × imageSequenceLength(64)`. Ejemplos reales: 512×384→2 tiles→128 tok; 1024×768→5 tiles→320 tok; 4096×3072→13 tiles→832 tok | Escala con el tamaño real de la imagen; el fix de #208 evita upscaling espurio |
 | **Gemma3** | Fija (`config.imageSize`, p.ej. 896) | No (config trae `do_pan_and_scan` pero el processor lo ignora — ver "Gaps") | No | 256 tokens fijos por imagen (`config.imageSeqLength`) | El más predecible de la tabla: siempre 256 tok/imagen |
 | **Gemma4** (no unificado) | Fija (800×800 por defecto) | No | No leído desde `UserInput.videos` (ver "Gaps") | 280 tokens por defecto (`imageSeqLength`) | Predecible, similar a Gemma3 |
 | **Gemma4Unified** | Dinámica, preserva aspect ratio, acotada por `maxSoftTokens` | No (patchify + padding a `maxSoftTokens`, no tiles) | Vía `videoPixelValues`/`videoPositionIds` en el modelo, pero el processor no lee `UserInput.videos` (ver "Gaps") | Hasta `maxSoftTokens` (del config.json, no hardcodeado); patches reales se rellenan/truncan a ese máximo | Presupuesto acotado de forma explícita — el más "seguro" de los dinámicos |
@@ -79,9 +79,10 @@ El patchify + reordenado a formato de merge está en `QwenVL.swift:212-256`.
 - Vídeo: Qwen2.5VL (`Qwen25VL.swift:864-865`) y Qwen3VL (`Qwen3VL.swift:123-124`)
   muestrean a **2 fps fijos**, vía `MediaProcessing.asProcessedSequence(video:
   targetFPS:)` sin pasar `maxFrames` — el default de esa función es `Int.max`
-  (`MediaProcessing.swift:355-361`). **No hay tope de frames en el código para
-  esta familia**: un vídeo largo puede generar un número de tokens visuales sin
-  límite superior explícito.
+  (`MediaProcessing.swift`). **No hay tope automático en estos processors**:
+  un vídeo largo puede generar un número de tokens visuales sin límite superior
+  explícito. El guard-rail público descrito abajo permite preacotar la secuencia,
+  pero Qwen todavía no deriva un presupuesto por request.
 - Qwen3.5/Qwen3.5-MoE reutilizan el mismo tipo `VisionConfiguration` que Qwen3VL
   vía `typealias` (`Qwen35.swift:179`) y la misma `Qwen3VLVision.VisionModel`
   (`Qwen35.swift:908`). No hay una entrada `Qwen35Processor` en
@@ -122,7 +123,31 @@ el processor:
   es decir, más denso para vídeos cortos y ~1 fps para vídeos ≥10s.
   `maxVideoFrames` está **hardcodeado a 20** en `SmolVLM2.swift:94`, con un
   comentario que indica que ignora deliberadamente `config.videoSampling.maxFrames`
-  del `preprocessor_config.json`.
+  del `preprocessor_config.json`. Ese valor ahora se pasa de forma efectiva a
+  `MediaProcessing.asProcessedSequence(..., maxFrames:)`; antes existía la
+  propiedad pero la llamada omitía el límite.
+
+## Guard-rail público para vídeo
+
+`MediaProcessing` ofrece una sobrecarga aditiva que combina FPS y máximo de
+frames sin cambiar el comportamiento histórico no acotado:
+
+```swift
+let frames = try await MediaProcessing.asProcessedSequence(
+    video,
+    samplesPerSecond: 2,
+    maxFrames: 24
+)
+```
+
+El límite se aplica tanto a `.url`/`.avAsset` como a `.frames`. La ruta
+`.frames` ignoraba anteriormente `maxFrames`; los tests deterministas
+`testVideoFramesRespectMaximumFrameBudget` y
+`testSamplesPerSecondOverloadRespectMaximumFrameBudget` cubren ambas rutas.
+Esto permite que una app pre-muestree vídeo con su propio presupuesto antes de
+entregarlo a un processor. Las sobrecargas antiguas siguen usando `Int.max`, por
+lo que no hay cambio de source/API ni un recorte silencioso para clientes
+existentes.
 
 ### Gemma3 — fijo, y `pan_and_scan` no implementado
 
@@ -239,12 +264,10 @@ Qwen-VL.
   `input.videos` en `prepare(input:)`. No está claro si el soporte de vídeo se
   activa por otra vía (construcción manual de `LMInput`) o si simplemente no
   está cableado todavía.
-- **Cap de frames de vídeo en la familia Qwen-VL / GlmOcr**: el código no
-  aplica ningún `maxFrames` al muestrear vídeo a 2 fps
-  (`MediaProcessing.asProcessedSequence` usa `Int.max` por defecto). Esto es
-  coherente con lo ya documentado en la skill `mlx-swift` (`references/vlm.md`),
-  pero no hay guard-rail en el código de este repo — un vídeo largo puede
-  generar un prompt de tamaño no acotado.
+- **Cap automático en Qwen-VL / GlmOcr**: el guard-rail genérico y configurable
+  ya existe, y SmolVLM2 lo consume. Qwen-VL y GlmOcr aún no calculan/pasan un
+  `maxFrames` por request; si el llamador no preacota `.frames`, un vídeo largo
+  sigue pudiendo generar un prompt no acotado.
 - **Memoria real en bytes**: ningún número de esta tabla está medido en
   hardware. La fórmula de KV cache citada (`Libraries/MLXLMCommon/KVCache.swift:401-404`)
   es correcta estructuralmente, pero traducirla a MB/GB reales requiere
