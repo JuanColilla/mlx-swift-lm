@@ -1,5 +1,12 @@
 # Tech debt e investigacion
 
+> **Estado (2026-07-15)**: cada ítem de este backlog tiene ahora un documento
+> de resultado (código verificado o nota de alcance/investigación) enlazado
+> desde `DOCS/README.md`, sección "Implementación del backlog (2026-07-15)".
+> Este documento se deja tal cual (incluida su ortografía original) como
+> registro histórico del backlog priorizado; el estado actualizado vive en el
+> README, no aquí.
+
 ## Prioridad alta
 
 1. Benchmark suite reproducible.
