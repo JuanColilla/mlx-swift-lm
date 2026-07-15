@@ -2,7 +2,7 @@
 
 ## Estado actual
 
-El paquete publica `MLXLLM`, `MLXVLM`, `MLXLMCommon`, `MLXEmbedders`, `MLXHuggingFace`, `BenchmarkHelpers` e `IntegrationTestHelpers` (`Package.swift`). La version de Swift requerida es 6.1 y el core depende de `mlx-swift` `0.31.4`.
+El paquete publica `MLXLLM`, `MLXVLM`, `MLXLMCommon`, `MLXEmbedders`, `MLXHuggingFace`, `BenchmarkHelpers` e `IntegrationTestHelpers` (`Package.swift`). La version de Swift requerida es 6.1 y el core depende de la revision exacta `15e907bf` de `JuanColilla/mlx-swift`, que anade cuantizacion affine de 1 bit sobre la base oficial actualizada.
 
 La compatibilidad LLM es amplia: `LLMTypeRegistry.shared` registra 58 `model_type`, con familias como Mistral, Mixtral, Llama, Phi/Phi3/PhiMoE, Gemma 1/2/3/3n/4, Qwen2/Qwen3/Qwen3.5/MoE/Next, MiniCPM, Starcoder2, Cohere, OpenELM, InternLM2, DeepSeek V3, Granite, GLM4, Falcon H1, Bitnet, SmolLM3, Ernie, LFM2, Baichuan, Exaone, GPT-OSS, Olmo, Nemotron, Jamba, Mamba2, Mistral3, Apertus y otros (`Libraries/MLXLLM/LLMModelFactory.swift:23`). Hay 54 ficheros Swift bajo `Libraries/MLXLLM/Models`.
 
@@ -18,6 +18,7 @@ El soporte de cuantizacion aparece en varios niveles:
 - `QuantizedKVCacheProtocol` con modo, bits y group size (`Libraries/MLXLMCommon/KVCache.swift:145`).
 - Conversion de safetensors con cuantizacion global y por capa: `skip`, `bits`, `groupSize`, `mode`.
 - Modos de conversion: `affine`, `mxfp4`, `mxfp8`, `nvfp4`; defaults observados: affine 4-bit group 64, MX/NV FP 4/8 group 32.
+- El modo `affine` admite pesos de 1 bit con `scale + bias`; el port, las revisiones y la validacion estan documentados en [Compatibilidad de Bonsai 1-bit](bonsai-1bit-compatibility.md).
 - ParoQuant como ruta especial para modelos/layouts concretos, con AutoAWQ, rotaciones y proyecciones Mamba fusionadas.
 - Tests de paridad y comportamiento, por ejemplo `ParoQuantTests`, `Gemma4TextTests`, `EvalTests`.
 
