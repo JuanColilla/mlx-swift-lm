@@ -120,7 +120,8 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 
     static public let deepSeekR1_7B_4bit = ModelConfiguration(
         id: "mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit",
-        defaultPrompt: "Is 9.9 greater or 9.11?"
+        defaultPrompt: "Is 9.9 greater or 9.11?",
+        thinkingSupport: .alwaysOn(startTag: "<think>", endTag: "</think>")
     )
 
     static public let falconH1R7B = ModelConfiguration(
@@ -261,7 +262,8 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
     static public let qwen3_5_2b_4bit = ModelConfiguration(
         id: "mlx-community/Qwen3.5-2B-4bit",
         defaultPrompt: "Why is the sky blue?",
-        extraEOSTokens: ["<|im_end|>"]
+        extraEOSTokens: ["<|im_end|>"],
+        thinkingSupport: .toggleableViaTemplate(contextKey: "enable_thinking")
     )
 
     static public let qwen3_6_27b_4bit = ModelConfiguration(
@@ -302,7 +304,8 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 
     static public let deepseek_r1_4bit = ModelConfiguration(
         id: "mlx-community/DeepSeek-R1-4bit",
-        defaultPrompt: "Tell me about the history of Spain."
+        defaultPrompt: "Tell me about the history of Spain.",
+        thinkingSupport: .alwaysOn(startTag: "<think>", endTag: "</think>")
     )
 
     static public let granite3_3_2b_4bit = ModelConfiguration(
@@ -585,7 +588,7 @@ public final class LLMModelFactory: GenericModelFactory {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
 
-        // Build a ModelConfiguration with loaded EOS token IDs and tool call format
+        // Build a ModelConfiguration with loaded EOS token IDs and behavioral metadata
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
         mutableConfiguration.stopStrings.formUnion(generationConfig?.stopStrings ?? [])
@@ -593,6 +596,7 @@ public final class LLMModelFactory: GenericModelFactory {
             mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
                 from: baseConfig.modelType, configData: configData)
         }
+        mutableConfiguration.inferThinkingSupportIfNeeded()
 
         // Load tokenizer and weights in parallel
         async let tokenizerTask = tokenizerLoader.load(
@@ -623,7 +627,8 @@ public final class LLMModelFactory: GenericModelFactory {
             extraEOSTokens: mutableConfiguration.extraEOSTokens,
             stopStrings: mutableConfiguration.stopStrings,
             eosTokenIds: mutableConfiguration.eosTokenIds,
-            toolCallFormat: mutableConfiguration.toolCallFormat)
+            toolCallFormat: mutableConfiguration.toolCallFormat,
+            thinkingSupport: mutableConfiguration.thinkingSupport)
 
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,

@@ -75,6 +75,7 @@ public struct ResolvedModelConfiguration: Sendable {
     public var stopStrings: Set<String>
     public var eosTokenIds: Set<Int>
     public var toolCallFormat: ToolCallFormat?
+    public var thinkingSupport: ThinkingSupport?
 
     public init(
         modelDirectory: URL,
@@ -84,7 +85,30 @@ public struct ResolvedModelConfiguration: Sendable {
         extraEOSTokens: Set<String>,
         stopStrings: Set<String>? = nil,
         eosTokenIds: Set<Int>,
-        toolCallFormat: ToolCallFormat?
+        toolCallFormat: ToolCallFormat?,
+    ) {
+        self.init(
+            modelDirectory: modelDirectory,
+            tokenizerDirectory: tokenizerDirectory,
+            name: name,
+            defaultPrompt: defaultPrompt,
+            extraEOSTokens: extraEOSTokens,
+            stopStrings: stopStrings,
+            eosTokenIds: eosTokenIds,
+            toolCallFormat: toolCallFormat,
+            thinkingSupport: nil)
+    }
+
+    public init(
+        modelDirectory: URL,
+        tokenizerDirectory: URL,
+        name: String,
+        defaultPrompt: String,
+        extraEOSTokens: Set<String>,
+        stopStrings: Set<String>? = nil,
+        eosTokenIds: Set<Int>,
+        toolCallFormat: ToolCallFormat?,
+        thinkingSupport: ThinkingSupport?
     ) {
         self.modelDirectory = modelDirectory
         self.tokenizerDirectory = tokenizerDirectory
@@ -94,6 +118,7 @@ public struct ResolvedModelConfiguration: Sendable {
         self.stopStrings = stopStrings ?? extraEOSTokens
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
+        self.thinkingSupport = thinkingSupport
     }
 }
 
@@ -109,6 +134,7 @@ extension ResolvedModelConfiguration {
             extraEOSTokens: [],
             stopStrings: [],
             eosTokenIds: [],
-            toolCallFormat: nil)
+            toolCallFormat: nil,
+            thinkingSupport: nil)
     }
 }

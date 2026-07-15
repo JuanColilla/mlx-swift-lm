@@ -385,6 +385,7 @@ public final class VLMModelFactory: GenericModelFactory {
         if mutableConfiguration.toolCallFormat == nil {
             mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
         }
+        mutableConfiguration.inferThinkingSupportIfNeeded()
 
         // Load tokenizer from model directory (or alternate tokenizer repo),
         // processor config, and weights in parallel using async let.
@@ -439,7 +440,8 @@ public final class VLMModelFactory: GenericModelFactory {
             extraEOSTokens: mutableConfiguration.extraEOSTokens,
             stopStrings: mutableConfiguration.stopStrings,
             eosTokenIds: mutableConfiguration.eosTokenIds,
-            toolCallFormat: mutableConfiguration.toolCallFormat)
+            toolCallFormat: mutableConfiguration.toolCallFormat,
+            thinkingSupport: mutableConfiguration.thinkingSupport)
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,
