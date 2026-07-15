@@ -3,6 +3,8 @@
 import Foundation
 import MLX
 
+private let mtpLogger = Logger(subsystem: "mlx-swift-lm", category: "mtp")
+
 /// Generator of tokens using MTP (Multi-Token Prediction) speculative
 /// decoding.
 ///
@@ -373,9 +375,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     private mutating func switchToPassthrough(reason: String) {
         if !passthroughLoggedOnce {
             // Log one-time only so a quantization-onset round doesn't spam.
-            // The Swift stdlib `print` is intentional here: the iterator is
-            // a low-level component without access to a logger.
-            print("[MTPSpeculativeTokenIterator] passthrough mode: \(reason)")
+            mtpLogger.info("passthrough mode: \(reason)")
             passthroughLoggedOnce = true
         }
         passthroughReason = reason
