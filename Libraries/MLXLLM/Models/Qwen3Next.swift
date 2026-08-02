@@ -354,8 +354,8 @@ final class Qwen3NextSparseMoeBlock: Module {
     }
 }
 
-final class Qwen3NextDecoderLayer: Module {
-    let isLinear: Bool
+public final class Qwen3NextDecoderLayer: Module {
+    public let isLinear: Bool
 
     @ModuleInfo(key: "self_attn") var selfAttn: Qwen3NextAttention?
     @ModuleInfo(key: "linear_attn") var linearAttn: Qwen3NextGatedDeltaNet?
@@ -420,11 +420,20 @@ final class Qwen3NextDecoderLayer: Module {
 public class Qwen3NextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    fileprivate let layers: [Qwen3NextDecoderLayer]
+    public var layers: [Qwen3NextDecoderLayer]
     let norm: RMSNorm
 
-    let ssmIdx: Int
-    let faIdx: Int
+    /// Index, within `layers`, of the first full-attention / linear-attention layer.
+    /// `nil` means the local shard contains no layer of that kind (only possible after
+    /// pipeline sharding, see `pipelineShardHybridNext` in AutoParallelHybrid.swift).
+    var faIdx: Int?
+    var ssmIdx: Int?
+
+    /// Pipeline-parallel state, `nil` unless sharded via `pipelineShardHybridNext`. Plain
+    /// stored properties, ignored by MLXNN's reflection — same pattern as `LFM2Model.shardOffset`.
+    public var pipelineRank: Int? = nil
+    public var pipelineWorldSize: Int? = nil
+    public var pipelineGroup: DistributedGroup? = nil
 
     init(_ args: Qwen3NextConfiguration) {
         precondition(args.vocabularySize > 0)
@@ -447,21 +456,48 @@ public class Qwen3NextModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
-        var hiddenStates = embedTokens(inputs)
+        let localEmbed = embedTokens(inputs)
+        var hiddenStates: MLXArray
+        if let pipelineRank, let pipelineGroup, pipelineRank != 0 {
+            hiddenStates = pipelineGroup.recvLike(localEmbed, source: Int32(pipelineRank - 1))
+        } else {
+            hiddenStates = localEmbed
+        }
 
         var cacheArray = cache
         if cacheArray == nil {
             cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
         }
 
-        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
-        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        let faMask: MLXFast.ScaledDotProductAttentionMaskMode
+        if let faIdx {
+            faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
+        } else {
+            faMask = .none
+        }
+        let ssmMask: MLXArray?
+        if let ssmIdx {
+            ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        } else {
+            ssmMask = nil
+        }
 
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask = layer.isLinear ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+        }
+
+        if let pipelineRank, let pipelineWorldSize, let pipelineGroup {
+            if pipelineRank != pipelineWorldSize - 1 {
+                hiddenStates = pipelineGroup.send(
+                    hiddenStates, dest: Int32((pipelineRank + 1) % pipelineWorldSize))
+            }
+            let gathered = pipelineGroup.allGather(hiddenStates)
+            let batchSize = hiddenStates.dim(0)
+            let totalSize = gathered.dim(0)
+            hiddenStates = gathered[(totalSize - batchSize)..<totalSize]
         }
 
         return norm(hiddenStates)
