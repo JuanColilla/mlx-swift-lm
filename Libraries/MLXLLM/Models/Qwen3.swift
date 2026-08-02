@@ -12,7 +12,7 @@ import MLXNN
 
 // port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3.py
 
-class Qwen3Attention: Module {
+public class Qwen3Attention: Module {
     let args: Qwen3Configuration
     let scale: Float
 
@@ -88,7 +88,7 @@ class Qwen3Attention: Module {
     }
 }
 
-class Qwen3MLP: Module, UnaryLayer {
+public class Qwen3MLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
@@ -104,7 +104,7 @@ class Qwen3MLP: Module, UnaryLayer {
     }
 }
 
-class Qwen3TransformerBlock: Module {
+public class Qwen3TransformerBlock: Module, TransformerLayer {
     @ModuleInfo(key: "self_attn") var attention: Qwen3Attention
     let mlp: Qwen3MLP
 
@@ -134,7 +134,7 @@ class Qwen3TransformerBlock: Module {
 public class Qwen3ModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    fileprivate let layers: [Qwen3TransformerBlock]
+    public var layers: [TransformerLayer]
     let norm: RMSNorm
 
     public init(_ args: Qwen3Configuration) {
@@ -144,7 +144,7 @@ public class Qwen3ModelInner: Module {
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
 
         self.layers = (0 ..< args.hiddenLayers)
-            .map { _ in
+            .map { _ -> TransformerLayer in
                 Qwen3TransformerBlock(args)
             }
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
