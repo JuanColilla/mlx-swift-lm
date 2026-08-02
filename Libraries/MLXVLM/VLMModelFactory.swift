@@ -336,6 +336,14 @@ public final class VLMModelFactory: GenericModelFactory {
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
     ) async throws -> sending ModelContext {
+        try await _load(configuration: configuration, tokenizerLoader: tokenizerLoader, lazy: false)
+    }
+
+    public func _load(
+        configuration: ResolvedModelConfiguration,
+        tokenizerLoader: any TokenizerLoader,
+        lazy: Bool
+    ) async throws -> sending ModelContext {
         let modelDirectory = configuration.modelDirectory
 
         // Load config.json once and decode for both base config and model-specific config
@@ -398,7 +406,7 @@ public final class VLMModelFactory: GenericModelFactory {
 
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization)
+            perLayerQuantization: baseConfig.perLayerQuantization, lazy: lazy)
 
         let tokenizer = try await tokenizerTask
         let processorConfigData: Data

@@ -300,3 +300,16 @@ extension LanguageModel where Self: KVCacheDimensionProvider {
         }
     }
 }
+
+/// A single transformer decoder layer that can be sharded across pipeline-parallel nodes.
+///
+/// Homogeneous decoder layer types (single mask, single cache slot per layer) conform to
+/// this so pipeline sharding code can wrap/replace layers generically without knowing the
+/// concrete model architecture. Hybrid architectures with multiple mask kinds per forward
+/// pass (e.g. Qwen3.5/Qwen3Next's alternating linear/full attention) do not conform to this
+/// and are sharded with architecture-specific code instead.
+public protocol TransformerLayer: Module {
+    func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray
+}

@@ -739,6 +739,7 @@ public final class ChatSession {
     ///   - videos: list of videos (for use with VLMs)
     ///   - audios: list of audios (for use with VLMs)
     /// - Returns: the model's response
+    nonisolated(nonsending)
     public func respond(
         to prompt: String,
         role: Chat.Message.Role = .user,
@@ -764,6 +765,7 @@ public final class ChatSession {
     ///   - video: optional video (for use with VLMs)
     ///   - audio: optional audio (for use with VLMs)
     /// - Returns: the model's response
+    nonisolated(nonsending)
     public func respond(
         to prompt: String,
         role: Chat.Message.Role = .user,
@@ -792,6 +794,7 @@ public final class ChatSession {
     ///
     /// - Parameter messages: chat messages to append before generation
     /// - Returns: the model's response
+    nonisolated(nonsending)
     public func respond(
         to messages: consuming [Chat.Message]
     ) async throws -> String {
