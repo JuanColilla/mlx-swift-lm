@@ -833,13 +833,15 @@ public final class ChatSession {
     ///   - videos: list of videos (for use with VLMs)
     ///   - audios: list of audios (for use with VLMs)
     /// - Returns: the model's response
-    public func respond(
-        to prompt: String,
-        role: Chat.Message.Role = .user,
-        images: consuming [UserInput.Image],
-        videos: consuming [UserInput.Video],
-        audios: consuming [UserInput.Audio]
-    ) async throws -> String {
+    nonisolated(nonsending)
+        public func respond(
+            to prompt: String,
+            role: Chat.Message.Role = .user,
+            images: consuming [UserInput.Image],
+            videos: consuming [UserInput.Video],
+            audios: consuming [UserInput.Audio]
+        ) async throws -> String
+    {
         var output = ""
         for try await chunk in streamResponse(
             to: prompt, role: role, images: images, videos: videos, audios: audios
@@ -858,13 +860,15 @@ public final class ChatSession {
     ///   - video: optional video (for use with VLMs)
     ///   - audio: optional audio (for use with VLMs)
     /// - Returns: the model's response
-    public func respond(
-        to prompt: String,
-        role: Chat.Message.Role = .user,
-        image: consuming UserInput.Image? = nil,
-        video: consuming UserInput.Video? = nil,
-        audio: consuming UserInput.Audio? = nil
-    ) async throws -> String {
+    nonisolated(nonsending)
+        public func respond(
+            to prompt: String,
+            role: Chat.Message.Role = .user,
+            image: consuming UserInput.Image? = nil,
+            video: consuming UserInput.Video? = nil,
+            audio: consuming UserInput.Audio? = nil
+        ) async throws -> String
+    {
         try await respond(
             to: prompt,
             role: role,
@@ -886,9 +890,11 @@ public final class ChatSession {
     ///
     /// - Parameter messages: chat messages to append before generation
     /// - Returns: the model's response
-    public func respond(
-        to messages: consuming [Chat.Message]
-    ) async throws -> String {
+    nonisolated(nonsending)
+        public func respond(
+            to messages: consuming [Chat.Message]
+        ) async throws -> String
+    {
         var output = ""
         for try await chunk in streamResponse(to: messages) {
             output += chunk

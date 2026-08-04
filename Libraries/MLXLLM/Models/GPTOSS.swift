@@ -291,7 +291,7 @@ class MLPBlock: Module {
     }
 }
 
-class GPTOSSTransformerBlock: Module {
+public class GPTOSSTransformerBlock: Module, TransformerLayer {
     @ModuleInfo(key: "self_attn") var selfAttn: AttentionBlock
     @ModuleInfo(key: "mlp") var mlp: MLPBlock
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
@@ -327,11 +327,11 @@ class GPTOSSTransformerBlock: Module {
 public class GPTOSSModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo(key: "norm") var norm: RMSNorm
-    let layerTypes: [String]
-    fileprivate let layers: [GPTOSSTransformerBlock]
+    public var layerTypes: [String]
+    public var layers: [TransformerLayer]
     let windowSize: Int
-    let slidingAttentionIndex: Int
-    let fullAttentionIndex: Int
+    public var slidingAttentionIndex: Int
+    public var fullAttentionIndex: Int
 
     public init(_ config: GPTOSSConfiguration) {
         _embedTokens.wrappedValue = Embedding(
@@ -434,7 +434,7 @@ private func convertMoePackedTensors(blocks: MLXArray, scales: MLXArray) -> MLXA
 public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     public let modelType: String
     public let vocabularySize: Int
-    public let kvHeads: [Int]
+    public var kvHeads: [Int]
     public let model: GPTOSSModelInner
     private let configuration: GPTOSSConfiguration
     @ModuleInfo(key: "lm_head") var lmHead: Linear

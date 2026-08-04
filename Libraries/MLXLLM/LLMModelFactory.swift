@@ -580,6 +580,48 @@ public final class LLMModelFactory: GenericModelFactory {
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
     ) async throws -> ModelContext {
+        try await _load(configuration: configuration, tokenizerLoader: tokenizerLoader, lazy: false)
+    }
+
+    public func _load(
+        configuration: ResolvedModelConfiguration,
+        tokenizerLoader: any TokenizerLoader,
+        lazy: Bool
+    ) async throws -> ModelContext {
+        try await load(
+            configuration: configuration,
+            tokenizerLoader: tokenizerLoader,
+            lazy: lazy,
+            preparingModel: nil
+        )
+    }
+
+    /// Loads a local model after the caller has had a chance to reduce its
+    /// module tree and select the matching subset of weight tensors.
+    ///
+    /// This is intended for pipeline-parallel runtimes. Calling the ordinary
+    /// `load(from:using:lazy:)` path first would attach every transformer
+    /// layer before the runtime can discard the remote ones.
+    public func load(
+        selectivelyFrom directory: URL,
+        using tokenizerLoader: any TokenizerLoader,
+        lazy: Bool = false,
+        preparingModel: @Sendable @escaping (any LanguageModel) throws -> WeightLoadingSelection?
+    ) async throws -> sending ModelContext {
+        try await load(
+            configuration: .init(directory: directory),
+            tokenizerLoader: tokenizerLoader,
+            lazy: lazy,
+            preparingModel: preparingModel
+        )
+    }
+
+    private func load(
+        configuration: ResolvedModelConfiguration,
+        tokenizerLoader: any TokenizerLoader,
+        lazy: Bool,
+        preparingModel: (@Sendable (any LanguageModel) throws -> WeightLoadingSelection?)?
+    ) async throws -> ModelContext {
         let modelDirectory = configuration.modelDirectory
 
         // Load config.json once and decode for both base config and model-specific config
@@ -646,9 +688,14 @@ public final class LLMModelFactory: GenericModelFactory {
         async let tokenizerTask = tokenizerLoader.load(
             from: configuration.tokenizerDirectory)
 
+        let selection = try preparingModel?(model)
+
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization)
+            perLayerQuantization: baseConfig.perLayerQuantization,
+            lazy: lazy,
+            selection: selection
+        )
 
         let tokenizer = try await tokenizerTask
 

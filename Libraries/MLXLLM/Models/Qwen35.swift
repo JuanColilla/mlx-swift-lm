@@ -643,8 +643,8 @@ private func hasPlainAttentionRoute(_ cache: KVCache) -> Bool {
     !(cache is QuantizedKVCacheProtocol) && !(cache is TurboQuantKVCache)
 }
 
-final class Qwen35DecoderLayer: Module {
-    let isLinear: Bool
+public final class Qwen35DecoderLayer: Module {
+    public let isLinear: Bool
 
     @ModuleInfo(key: "self_attn") var selfAttn: Qwen35Attention?
     @ModuleInfo(key: "linear_attn") var linearAttn: Qwen35GatedDeltaNet?
@@ -829,11 +829,22 @@ final class Qwen35DecoderLayer: Module {
 public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    fileprivate let layers: [Qwen35DecoderLayer]
+    public var layers: [Qwen35DecoderLayer]
     let norm: RMSNorm
 
-    let ssmIdx: Int
-    let faIdx: Int
+    /// Index, within `layers`, of the first full-attention / linear-attention layer.
+    /// `nil` means the local shard contains no layer of that kind (only possible after
+    /// pipeline sharding, see `pipelineShardHybrid` in AutoParallelHybrid.swift) — in that
+    /// case the corresponding mask is never computed, since no layer would use it.
+    var faIdx: Int?
+    var ssmIdx: Int?
+
+    /// Pipeline-parallel state, `nil` unless sharded via `pipelineShardHybrid`. Plain stored
+    /// properties (no `@ModuleInfo`/`@ParameterInfo`), so MLXNN's reflection ignores them —
+    /// same pattern as `LFM2Model.shardOffset`.
+    public var pipelineRank: Int? = nil
+    public var pipelineWorldSize: Int? = nil
+    public var pipelineGroup: DistributedGroup? = nil
 
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
@@ -861,19 +872,39 @@ public class Qwen35TextModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
-        if inputs.dim(1) == 1, let caches = cache, let step = decodeStep(inputs, caches) {
+        if pipelineRank == nil, inputs.dim(1) == 1, let caches = cache,
+            let step = decodeStep(inputs, caches)
+        {
             return step
         }
 
-        var hiddenStates = embedTokens(inputs)
+        let localEmbed = embedTokens(inputs)
+        var hiddenStates: MLXArray
+        if let pipelineRank, let pipelineGroup, pipelineRank != 0 {
+            // Rank > 0 never uses its own embedding output — it's computed only to give
+            // recvLike the shape/dtype template, then replaced by what rank-1 sent.
+            hiddenStates = pipelineGroup.recvLike(localEmbed, source: Int32(pipelineRank - 1))
+        } else {
+            hiddenStates = localEmbed
+        }
 
         var cacheArray = cache
         if cacheArray == nil {
             cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
         }
 
-        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
-        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        let faMask: MLXFast.ScaledDotProductAttentionMaskMode
+        if let faIdx {
+            faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
+        } else {
+            faMask = .none
+        }
+        let ssmMask: MLXArray?
+        if let ssmIdx {
+            ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        } else {
+            ssmMask = nil
+        }
 
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
@@ -882,6 +913,22 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+        }
+
+        if let pipelineRank, let pipelineWorldSize, let pipelineGroup {
+            if pipelineRank != pipelineWorldSize - 1 {
+                hiddenStates = pipelineGroup.send(
+                    hiddenStates, dest: Int32((pipelineRank + 1) % pipelineWorldSize))
+            }
+            let gathered = pipelineGroup.allGather(hiddenStates)
+            // Force materialization on every rank, every forward pass — see
+            // the identical comment in AutoParallel.swift's
+            // `PipelineLastLayer.callAsFunction`. `eval()` here is MLX's
+            // lazy-graph evaluator, not a dynamic-code-execution call.
+            eval(gathered)
+            let batchSize = hiddenStates.dim(0)
+            let totalSize = gathered.dim(0)
+            hiddenStates = gathered[(totalSize - batchSize) ..< totalSize]
         }
 
         return norm(hiddenStates)
@@ -969,6 +1016,7 @@ public class Qwen35TextModelInner: Module {
     /// compile concretely.
     private func decodeStep(_ inputs: MLXArray, _ cache: [KVCache?]) -> MLXArray? {
         guard cache.count == layers.count else { return nil }
+        guard let ssmIdx, let faIdx else { return nil }
         // The schedule is only valid when the masks the general path would
         // build both come out empty.
         if createSSMMask(h: inputs, cache: cache[ssmIdx] as? MambaCache) != nil { return nil }
@@ -1038,7 +1086,7 @@ public class Qwen35TextModelInner: Module {
 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
-    public let kvHeads: [Int]
+    public var kvHeads: [Int]
 
     public let model: Qwen35TextModelInner
     let configuration: Qwen35TextConfiguration
@@ -1126,7 +1174,7 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
-    @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
+    @ModuleInfo(key: "language_model") public var languageModel: Qwen35TextModel
 
     public init(_ args: Qwen35Configuration) {
         let textModel = Qwen35TextModel(args.textConfig)

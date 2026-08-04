@@ -92,7 +92,7 @@ class LlamaMLP: Module, UnaryLayer {
     }
 }
 
-class LlamaTransformerBlock: Module {
+class LlamaTransformerBlock: Module, TransformerLayer {
     @ModuleInfo(key: "self_attn") var attention: LlamaAttention
     @ModuleInfo(key: "mlp") var mlp: LlamaMLP
 
@@ -123,7 +123,7 @@ public class LlamaModelInner: Module {
 
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    let layers: [LlamaTransformerBlock]
+    public var layers: [TransformerLayer]
     let norm: RMSNorm
 
     init(_ args: LlamaConfiguration) {
@@ -153,7 +153,7 @@ public class LlamaModelInner: Module {
 public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public let vocabularySize: Int
-    public let kvHeads: [Int]
+    public var kvHeads: [Int]
 
     public let model: LlamaModelInner
 
