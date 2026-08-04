@@ -1,0 +1,52 @@
+{
+  "testNodes": [
+    {
+      "nodeType": "Test Plan",
+      "name": "IntegrationTesting",
+      "children": [
+        {
+          "nodeType": "Test Suite",
+          "name": "VLMConformanceIntegrationTests",
+          "children": [
+            {
+              "nodeType": "Test Case",
+              "name": "smolVLM2ImageGeneration()",
+              "nodeIdentifier": "VLMConformanceIntegrationTests/smolVLM2ImageGeneration()",
+              "result": "Passed"
+            },
+            {
+              "nodeType": "Test Case",
+              "name": "fastVLMImageGenerationCheckpointGate()",
+              "nodeIdentifier": "VLMConformanceIntegrationTests/fastVLMImageGenerationCheckpointGate()",
+              "result": "Skipped"
+            }
+          ]
+        },
+        {
+          "nodeType": "Test Suite",
+          "name": "LongContextConformanceIntegrationTests",
+          "children": [
+            {
+              "nodeType": "Test Case",
+              "name": "qwen35LongContextSentinel()",
+              "nodeIdentifier": "LongContextConformanceIntegrationTests/qwen35LongContextSentinel()",
+              "result": "Failed"
+            }
+          ]
+        },
+        {
+          "nodeType": "Test Suite",
+          "name": "UnmappedSuite",
+          "children": [
+            {
+              "nodeType": "Test Case",
+              "name": "unmappedFailure()",
+              "nodeIdentifier": "UnmappedSuite/unmappedFailure()",
+              "result": "Failed"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

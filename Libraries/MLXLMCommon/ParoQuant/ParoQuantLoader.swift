@@ -347,7 +347,8 @@ public func loadParoQuantModel<T: LanguageModel>(
     from directory: URL,
     typeRegistry: ModelTypeRegistry<T>,
     tokenizerLoader: any TokenizerLoader,
-    toolCallFormat: ToolCallFormat? = nil
+    toolCallFormat: ToolCallFormat? = nil,
+    reasoningConfig: ReasoningConfig? = nil
 ) async throws -> ModelContainer {
     // 1. Parse config.json (flatten VLM text_config if present)
     let configURL = directory.appendingPathComponent("config.json")
@@ -396,7 +397,9 @@ public func loadParoQuantModel<T: LanguageModel>(
 
     var config = ModelConfiguration(
         directory: directory, stopStrings: genConfig?.stopStrings,
-        toolCallFormat: toolCallFormat)
+        toolCallFormat: toolCallFormat,
+        reasoningConfig: reasoningConfig
+            ?? ReasoningConfig.infer(fromTokenizerDirectory: directory))
     config.eosTokenIds = eosTokenIds
 
     // 5. Load raw safetensors (top-level only; do not recurse into

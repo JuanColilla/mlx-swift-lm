@@ -324,7 +324,8 @@ public struct SmolVLMProcessor: UserInputProcessor {
                 targetFPS: { duration in
                     // 1 fps for duration >= 10s, apply a multiplier if smaller
                     max((10 - 0.9 * duration.seconds) * targetVideoFPS, 1)
-                }
+                },
+                maxFrames: maxVideoFrames
             ) { frame in
 
                 let processedFrame = try frame.image

@@ -47,6 +47,7 @@ Package.resolved
 .swiftpm
 
 .build/
+.conformance/
 
 # CocoaPods
 #
@@ -98,7 +99,7 @@ iOSInjectionProject/
 # Local Python tooling for fixture regeneration (uv-managed)
 .python-version
 .venv/
+__pycache__/
 pyproject.toml
 uv.lock
 main.py
-

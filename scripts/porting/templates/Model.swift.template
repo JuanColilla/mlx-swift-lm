@@ -1,0 +1,187 @@
+// Template stub for porting a model from Python mlx-lm.
+// See DOCS/porting-from-mlx-lm-playbook.md steps 3-4 before filling this in.
+// Rename to <<ModelName>>.swift and remove this header once complete.
+//
+// Reference: this mirrors the dense-attention shape of
+// Libraries/MLXLLM/Models/Mixtral.swift. If your architecture has no
+// attention (SSM/Mamba-style), look at Models/Mamba2.swift instead — the
+// Attention/DecoderLayer pieces below become a Mixer/ResidualBlock using
+// MambaCache and createSSMMask instead of KVCache/createAttentionMask.
+
+import Foundation
+import MLX
+import MLXLMCommon
+import MLXNN
+
+// MARK: - Attention (or Mixer, for non-attention architectures)
+
+class <<ModelName>>Attention: Module {
+    let args: <<ModelName>>Configuration
+    let scale: Float
+
+    @ModuleInfo(key: "q_proj") var wq: Linear
+    @ModuleInfo(key: "k_proj") var wk: Linear
+    @ModuleInfo(key: "v_proj") var wv: Linear
+    @ModuleInfo(key: "o_proj") var wo: Linear
+
+    let rope: RoPE
+
+    init(_ args: <<ModelName>>Configuration) {
+        self.args = args
+
+        let dim = args.hiddenSize
+        let heads = args.attentionHeads
+        let kvHeads = args.kvHeads
+        let headDim = dim / heads
+        self.scale = pow(Float(headDim), -0.5)
+
+        self._wq.wrappedValue = Linear(dim, heads * headDim, bias: false)
+        self._wk.wrappedValue = Linear(dim, kvHeads * headDim, bias: false)
+        self._wv.wrappedValue = Linear(dim, kvHeads * headDim, bias: false)
+        self._wo.wrappedValue = Linear(heads * headDim, dim, bias: false)
+
+        self.rope = RoPE(dimensions: headDim, traditional: false, base: args.ropeTheta)
+    }
+
+    func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let (B, L) = (x.dim(0), x.dim(1))
+
+        var queries = wq(x).reshaped(B, L, args.attentionHeads, -1).transposed(0, 2, 1, 3)
+        var keys = wk(x).reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        let values = wv(x).reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+
+        let offset = cache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
+
+        let output = attentionWithCacheUpdate(
+            queries: queries, keys: keys, values: values, cache: cache, scale: scale, mask: mask
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, L, -1)
+
+        return wo(output)
+    }
+}
+
+// MARK: - Feed-forward (dense MLP shown; swap for a MoE block with SwitchGLU
+// if the Python model is sparse — see Mixtral.swift:121-149 for that shape)
+
+class <<ModelName>>MLP: Module {
+    @ModuleInfo(key: "gate_proj") var gate: Linear
+    @ModuleInfo(key: "down_proj") var down: Linear
+    @ModuleInfo(key: "up_proj") var up: Linear
+
+    init(_ args: <<ModelName>>Configuration) {
+        self._gate.wrappedValue = Linear(args.hiddenSize, <<intermediateSize>>, bias: false)
+        self._down.wrappedValue = Linear(<<intermediateSize>>, args.hiddenSize, bias: false)
+        self._up.wrappedValue = Linear(args.hiddenSize, <<intermediateSize>>, bias: false)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        down(silu(gate(x)) * up(x))
+    }
+}
+
+// MARK: - Decoder layer
+
+class <<ModelName>>DecoderLayer: Module {
+    @ModuleInfo(key: "self_attn") var selfAttn: <<ModelName>>Attention
+    @ModuleInfo(key: "mlp") var mlp: <<ModelName>>MLP
+    @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
+    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
+
+    init(_ args: <<ModelName>>Configuration) {
+        self._selfAttn.wrappedValue = <<ModelName>>Attention(args)
+        self._mlp.wrappedValue = <<ModelName>>MLP(args)
+        self._inputLayerNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        self._postAttentionLayerNorm.wrappedValue = RMSNorm(
+            dimensions: args.hiddenSize, eps: args.rmsNormEps)
+    }
+
+    func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let h = x + selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        return h + mlp(postAttentionLayerNorm(h))
+    }
+}
+
+// MARK: - Inner model (embedding + layer stack + final norm)
+
+public class <<ModelName>>ModelInner: Module {
+    let args: <<ModelName>>Configuration
+
+    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    fileprivate let layers: [<<ModelName>>DecoderLayer]
+    @ModuleInfo(key: "norm") var norm: RMSNorm
+
+    init(_ args: <<ModelName>>Configuration) {
+        self.args = args
+        precondition(args.vocabularySize > 0)
+
+        self._embedTokens.wrappedValue = Embedding(
+            embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
+        self.layers = (0 ..< args.hiddenLayers).map { _ in <<ModelName>>DecoderLayer(args) }
+        self._norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        var h = embedTokens(inputs)
+        let mask = createAttentionMask(h: h, cache: cache?.first)
+        for (i, layer) in layers.enumerated() {
+            h = layer(h, mask: mask, cache: cache?[i])
+        }
+        return norm(h)
+    }
+}
+
+// MARK: - Top-level model
+
+public class <<ModelName>>Model: Module, LLMModel, KVCacheDimensionProvider {
+    public let vocabularySize: Int
+    public let kvHeads: [Int]
+
+    public let model: <<ModelName>>ModelInner
+    let configuration: <<ModelName>>Configuration
+
+    @ModuleInfo(key: "lm_head") var lmHead: Linear?
+
+    public init(_ args: <<ModelName>>Configuration) {
+        self.configuration = args
+        self.vocabularySize = args.vocabularySize
+        self.kvHeads = Array(repeating: args.kvHeads, count: args.hiddenLayers)
+        self.model = <<ModelName>>ModelInner(args)
+
+        // TODO: only if the Python config has tie_word_embeddings.
+        self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
+    }
+
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let out = model(inputs, cache: cache)
+        if let lmHead {
+            return lmHead(out)
+        }
+        return model.embedTokens.asLinear(out)
+    }
+
+    // TODO: delete this override entirely if the checkpoint's parameter
+    // names already match your @ModuleInfo(key:) names 1:1 — see
+    // DOCS/porting-from-mlx-lm-playbook.md step 4 (patterns A/B/C) before
+    // writing anything here.
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        weights.filter {
+            !$0.key.contains("self_attn.rotary_emb.inv_freq")
+        }
+    }
+}
+
+// MARK: - LoRA
+
+extension <<ModelName>>Model: LoRAModel {
+    public var loraLayers: [Module] {
+        model.layers
+    }
+}

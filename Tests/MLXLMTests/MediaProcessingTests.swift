@@ -127,4 +127,35 @@ public class MediaProcesingTests: XCTestCase {
         XCTAssert(frames.frames.count == 10)
         XCTAssert(frames.frames[0].shape == [1, 3, 224, 224])
     }
+
+    func testVideoFramesRespectMaximumFrameBudget() async throws {
+        let frames = (0 ..< 150).map { index in
+            VideoFrame(
+                image: .ciImage(
+                    CIImage(color: .red).cropped(
+                        to: CGRect(x: 0, y: 0, width: 16, height: 16))),
+                timeStamp: CMTime(value: Int64(index), timescale: 30)
+            )
+        }
+
+        let result = try await MediaProcessing.asProcessedSequence(
+            .frames(frames), targetFPS: { _ in 30 }, maxFrames: 12)
+
+        XCTAssertEqual(result.frames.count, 12)
+        XCTAssertEqual(result.timestamps.count, 12)
+    }
+
+    func testSamplesPerSecondOverloadRespectMaximumFrameBudget() async throws {
+        guard let fileURL = Bundle.module.url(forResource: "1080p_30", withExtension: "mov")
+        else {
+            XCTFail("Missing file: 1080p_30.mov")
+            return
+        }
+
+        let result = try await MediaProcessing.asProcessedSequence(
+            .url(fileURL), samplesPerSecond: 30, maxFrames: 3)
+
+        XCTAssertEqual(result.frames.count, 3)
+        XCTAssertEqual(result.timestamps.count, 3)
+    }
 }

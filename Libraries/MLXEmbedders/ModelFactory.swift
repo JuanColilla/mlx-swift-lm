@@ -235,7 +235,8 @@ public final class EmbedderModelFactory: GenericModelFactory {
             extraEOSTokens: configuration.extraEOSTokens,
             stopStrings: configuration.stopStrings,
             eosTokenIds: configuration.eosTokenIds,
-            toolCallFormat: configuration.toolCallFormat)
+            toolCallFormat: configuration.toolCallFormat,
+            reasoningConfig: configuration.reasoningConfig)
 
         let pooling = loadPooling(modelDirectory: modelDirectory, model: model)
 

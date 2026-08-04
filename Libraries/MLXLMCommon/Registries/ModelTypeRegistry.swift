@@ -39,4 +39,13 @@ public actor ModelTypeRegistry<T> {
         creators[modelType] != nil
     }
 
+    /// All `model_type` identifiers this registry can currently instantiate,
+    /// sorted for stable output. Used to generate a compatibility matrix
+    /// directly from the live registry instead of hand-maintained prose --
+    /// see DOCS/tech-debt-and-research-backlog.md, "Matriz de compatibilidad
+    /// generada".
+    public var registeredModelTypes: [String] {
+        creators.keys.sorted()
+    }
+
 }

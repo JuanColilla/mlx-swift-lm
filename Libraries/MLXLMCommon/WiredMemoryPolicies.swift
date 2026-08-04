@@ -113,7 +113,7 @@ public struct WiredFixedPolicy: WiredMemoryPolicy, Hashable, Sendable {
     }
 }
 
-/// Budget policy: `baseline + baseBytes + sum(activeSizes)`, optionally capped.
+/// Budget policy: `baseline + baseBytes + kvCacheBytes + sum(activeSizes)`, optionally capped.
 ///
 /// This policy is useful when you want to bake a learned or precomputed budget
 /// (for example, weights + workspace) into the limit calculation while still
@@ -136,8 +136,15 @@ public struct WiredBudgetPolicy: WiredMemoryPolicy, Hashable, Sendable {
     public let identifier: UUID
     /// Base budget in bytes (e.g. weights + workspace).
     public let baseBytes: Int
+    /// Separately accounted KV-cache budget in bytes.
+    public let kvCacheBytes: Int
     /// Optional absolute cap (bytes) for the computed limit.
     public let cap: Int?
+
+    /// Combined fixed demand before active tickets are added.
+    public var totalBaseBytes: Int {
+        saturatingAdd(baseBytes, kvCacheBytes)
+    }
 
     /// Creates a budget policy with an optional cap and stable id.
     public init(
@@ -146,6 +153,25 @@ public struct WiredBudgetPolicy: WiredMemoryPolicy, Hashable, Sendable {
         id: UUID = UUID()
     ) {
         self.baseBytes = max(0, baseBytes)
+        self.kvCacheBytes = 0
+        self.cap = cap
+        self.identifier = id
+    }
+
+    /// Creates a budget policy with an explicit KV-cache component.
+    ///
+    /// Keeping KV cache separate makes diagnostics and admission decisions
+    /// explainable while preserving the existing `baseBytes` initializer.
+    /// The value returned by ``estimateKVCacheBytes(numLayers:kvHeads:headDim:maxTokens:kvBits:kvGroupSize:bytesPerElement:)``
+    /// can be passed directly as `kvCacheBytes`.
+    public init(
+        baseBytes: Int,
+        kvCacheBytes: Int,
+        cap: Int? = nil,
+        id: UUID = UUID()
+    ) {
+        self.baseBytes = max(0, baseBytes)
+        self.kvCacheBytes = max(0, kvCacheBytes)
         self.cap = cap
         self.identifier = id
     }
@@ -160,13 +186,17 @@ public struct WiredBudgetPolicy: WiredMemoryPolicy, Hashable, Sendable {
 
     /// Computes the desired limit for the current active set.
     public func limit(baseline: Int, activeSizes: [Int]) -> Int {
-        let sum = activeSizes.reduce(0, +)
-        return clamp(baseline + baseBytes + sum)
+        clamp(saturatingSum([baseline, totalBaseBytes] + activeSizes))
     }
 
     /// Admission is denied if the projected limit would exceed the cap.
     public func canAdmit(baseline: Int, activeSizes: [Int], newSize: Int) -> Bool {
-        let projected = baseline + baseBytes + activeSizes.reduce(0, +) + max(0, newSize)
+        guard
+            let projected = checkedSum(
+                [baseline, totalBaseBytes] + activeSizes + [max(0, newSize)])
+        else {
+            return false
+        }
         return clamp(projected) == projected
     }
 
@@ -179,4 +209,24 @@ public struct WiredBudgetPolicy: WiredMemoryPolicy, Hashable, Sendable {
         }
         return value
     }
+}
+
+private func checkedSum(_ values: [Int]) -> Int? {
+    var total = 0
+    for value in values {
+        let (result, overflow) = total.addingReportingOverflow(value)
+        guard !overflow else { return nil }
+        total = result
+    }
+    return total
+}
+
+private func saturatingSum(_ values: [Int]) -> Int {
+    values.reduce(0, saturatingAdd)
+}
+
+private func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+    let (result, overflow) = lhs.addingReportingOverflow(rhs)
+    guard overflow else { return result }
+    return rhs >= 0 ? Int.max : Int.min
 }

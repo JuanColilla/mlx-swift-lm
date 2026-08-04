@@ -9,6 +9,7 @@ import Foundation
 /// - a default prompt
 /// - EOS tokens / strings
 /// - tool calling formats
+/// - thinking-mode support
 ///
 /// Some of these are specific to LLMs and VLMs -- embedding models will ignore those properties.
 ///

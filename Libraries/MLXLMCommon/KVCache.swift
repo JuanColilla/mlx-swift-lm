@@ -457,15 +457,35 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        guard n > 0 else { return 0 }
         let trimmed = min(offset, n)
         offset -= trimmed
         return trimmed
     }
 
-    /// Convert to quantized cache for maximum efficiency
+    /// Convert to quantized cache for maximum efficiency.
+    ///
+    /// This compatibility entry point preserves the original nonthrowing API.
+    /// New code should use ``quantized(groupSize:bits:)`` so unsupported
+    /// configurations can be handled without terminating the process.
+    @available(*, deprecated, message: "Use quantized(groupSize:bits:) to handle errors.")
+    public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
+        do {
+            return try quantized(groupSize: groupSize, bits: bits)
+        } catch {
+            preconditionFailure(error.localizedDescription)
+        }
+    }
+
+    /// Convert to quantized cache for maximum efficiency.
     ///
     /// Use `updateQuantized()` and `quantizedScaledDotProductAttention()` for zero-overhead operation.
-    public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
+    ///
+    /// - Throws: ``KVCacheError`` if `groupSize` is not compatible with the key/value head
+    ///   dimensions of the model that produced this cache (no supported group size among
+    ///   32/64/128 evenly divides both). Callers should treat this as a recoverable
+    ///   configuration error (e.g. fall back to an unquantized cache) rather than a crash.
+    public func quantized(groupSize: Int = 64, bits: Int = 4) throws -> QuantizedKVCache {
         if let keys = self.keys, let values = self.values {
             // Quantize the current keys and values
             let currentKeys = keys[.ellipsis, ..<offset, 0...]
@@ -477,16 +497,17 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
                     valueHeadDim: currentValues.dim(3)
                 )
             else {
-                fatalError(
-                    "KV cache quantization requires head dimensions divisible by one of the supported group sizes (32, 64, 128). Requested group size: \(groupSize). Key head dim: \(currentKeys.dim(3)). Value head dim: \(currentValues.dim(3))."
+                throw KVCacheError(
+                    message:
+                        "KV cache quantization requires head dimensions divisible by one of the supported group sizes (32, 64, 128). Requested group size: \(groupSize). Key head dim: \(currentKeys.dim(3)). Value head dim: \(currentValues.dim(3))."
                 )
             }
             let quantizedCache = QuantizedKVCache(groupSize: effectiveGroupSize, bits: bits)
             quantizedCache.offset = self.offset
 
-            let quantizedKeys = quantized(
+            let quantizedKeys = MLX.quantized(
                 currentKeys, groupSize: effectiveGroupSize, bits: bits)
-            let quantizedValues = quantized(
+            let quantizedValues = MLX.quantized(
                 currentValues, groupSize: effectiveGroupSize, bits: bits)
 
             // Set the quantized state
@@ -724,7 +745,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(offset, n)
+        guard n > 0, isTrimmable else { return 0 }
+        let trimmed = min(offset, idx, n)
         offset -= trimmed
         idx -= trimmed
         return trimmed
@@ -784,20 +806,39 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return new
     }
 
-    /// Convert to quantized cache
-    /// Note: This is complex due to the rotating nature and temporal ordering
+    /// Convert to quantized cache.
+    ///
+    /// This compatibility entry point preserves the original nonthrowing API.
+    /// New code should use ``quantized(groupSize:bits:)`` so the unsupported
+    /// rotating-cache conversion can be handled without terminating the process.
+    @available(*, deprecated, message: "Use quantized(groupSize:bits:) to handle errors.")
     public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
-        // For now, throw an error like the Python version does
-        // A full implementation would need to handle the temporal ordering correctly
-        fatalError(
-            "RotatingKVCache quantization not yet implemented - temporal ordering makes this complex"
-        )
+        do {
+            return try quantized(groupSize: groupSize, bits: bits)
+        } catch {
+            preconditionFailure(error.localizedDescription)
+        }
+    }
 
+    /// Convert to quantized cache.
+    ///
+    /// Not yet implemented: the rotating nature and temporal ordering of this cache
+    /// require dedicated handling that the current implementation does not provide.
+    ///
+    /// - Throws: ``KVCacheError`` unconditionally today. Callers (e.g.
+    ///   ``maybeQuantizeKVCache(cache:kvBits:kvGroupSize:quantizedKVStart:kvScheme:)``)
+    ///   should catch this and fall back to leaving the cache unquantized instead of
+    ///   crashing the process.
+    public func quantized(groupSize: Int = 64, bits: Int = 4) throws -> QuantizedKVCache {
         // Future implementation would need to:
         // 1. Put keys/values in temporal order using temporalOrder()
         // 2. Quantize the temporally ordered arrays
         // 3. Store metadata about rotation state
         // 4. Implement corresponding dequantization with rotation restoration
+        throw KVCacheError(
+            message:
+                "RotatingKVCache quantization not yet implemented - temporal ordering makes this complex"
+        )
     }
 }
 
@@ -1071,6 +1112,7 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        guard n > 0 else { return 0 }
         let trimmed = min(offset, n)
         offset -= trimmed
         return trimmed
@@ -1170,7 +1212,8 @@ public class ChunkedKVCache: KVCacheSimple {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(offset - startPosition, n)
+        guard n > 0 else { return 0 }
+        let trimmed = min(max(0, offset - startPosition), n)
         offset -= trimmed
         return trimmed
     }
@@ -1567,8 +1610,14 @@ public class CacheList: BaseKVCache {
 
 // MARK: - Error Types
 
-struct KVCacheError: Error {
-    let message: String
+public struct KVCacheError: Error, LocalizedError, Sendable, Equatable {
+    public let message: String
+
+    public init(message: String) {
+        self.message = message
+    }
+
+    public var errorDescription: String? { message }
 }
 
 // MARK: - Utility Functions
@@ -1689,6 +1738,12 @@ private func restoreCacheFromMetaState(
 ) throws -> KVCache {
     switch className {
     case "KVCache", "KVCacheSimple":
+        guard state.count == 2 else {
+            throw KVCacheError(
+                message:
+                    "Corrupt prompt cache: KVCacheSimple state must have exactly 2 arrays (keys, values), found \(state.count)"
+            )
+        }
         let cache = KVCacheSimple()
         cache.state = state
         cache.metaState = metaState
@@ -1708,18 +1763,42 @@ private func restoreCacheFromMetaState(
             throw KVCacheError(
                 message: "Failed to parse RotatingKVCache maxSize from: \(metaState[1])")
         }
+        guard state.count == 2 else {
+            throw KVCacheError(
+                message:
+                    "Corrupt prompt cache: RotatingKVCache state must have exactly 2 arrays, found \(state.count)"
+            )
+        }
         let cache = RotatingKVCache(maxSize: maxSize)
         cache.state = state
         cache.metaState = metaState
         return cache
 
     case "QuantizedKVCache":
+        guard metaState.count == 4 else {
+            throw KVCacheError(
+                message:
+                    "Corrupt prompt cache: QuantizedKVCache metaState must have exactly 4 values, found \(metaState.count)"
+            )
+        }
+        guard state.count == 4 || state.count == 6 else {
+            throw KVCacheError(
+                message:
+                    "Corrupt prompt cache: QuantizedKVCache state must have exactly 4 or 6 arrays, found \(state.count)"
+            )
+        }
         let cache = QuantizedKVCache()
         cache.state = state
         cache.metaState = metaState
         return cache
 
     case "ChunkedKVCache":
+        guard metaState.count == 2 else {
+            throw KVCacheError(
+                message:
+                    "Corrupt prompt cache: ChunkedKVCache metaState must have exactly 2 values, found \(metaState.count)"
+            )
+        }
         let cache = ChunkedKVCache()
         cache.state = state
         cache.metaState = metaState
@@ -2015,7 +2094,7 @@ public func resolveAffineScheme(_ scheme: String?) -> (bits: Int, groupSize: Int
 }
 
 /// Converts regular caches to quantized caches when:
-/// - kvBits is specified (or kvScheme resolves to a built-in affine scheme)
+/// - kvBits is specified (or kvScheme resolves to a built-in scheme)
 /// - The cache is not already quantized
 /// - The cache offset is greater than quantizedKVStart
 ///
@@ -2077,7 +2156,8 @@ public func maybeQuantizeKVCache(
     }
 
     /// Attempt to convert a single cache to its quantized form. Returns the
-    /// original cache if conversion is not possible for this entry.
+    /// original cache unchanged if conversion is not possible or not (yet)
+    /// supported for this entry -- see ``KVCacheSimple/quantized(groupSize:bits:)``.
     func quantize(_ cache: KVCacheSimple) -> KVCache {
         let state = cache.state
         if state.count == 2 {
@@ -2093,7 +2173,8 @@ public func maybeQuantizeKVCache(
                 return cache
             }
         }
-        return cache.toQuantized(groupSize: effectiveGroupSize, bits: effectiveBits)
+        return (try? cache.quantized(groupSize: effectiveGroupSize, bits: effectiveBits))
+            ?? cache
     }
 
     for i in 0 ..< cache.count {

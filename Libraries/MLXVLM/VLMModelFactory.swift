@@ -403,8 +403,8 @@ public final class VLMModelFactory: GenericModelFactory {
                 conventionsRegistry.reasoningConfig(
                     modelId: modelId, modelType: baseConfig.modelType)
                 ?? model.reasoningConfig
+                ?? ReasoningConfig.infer(fromTokenizerDirectory: configuration.tokenizerDirectory)
         }
-
         // Load tokenizer from model directory (or alternate tokenizer repo),
         // processor config, and weights in parallel using async let.
         // Note: loadProcessorConfig does synchronous I/O but is marked async to enable
