@@ -389,7 +389,9 @@ activo de `feature/distributed-pipeline-port` ni eliminar ramas. El resultado ap
 las decisiones anteriores:
 
 - `develop` parte del upstream oficial `3d292ec` e incorpora el historial de `fork/main`,
-  las dos ramas `upstream/*` y la rama distribuida, incluida su antecesora de carga selectiva.
+  las dos ramas `upstream/*`, la rama distribuida, su antecesora de carga selectiva y la rama
+  intermedia `feature/distributed-group-port-bump`. Todas las referencias remotas del fork
+  comprobadas son ahora antecesoras de `develop`.
 - `ReasoningConfig` y `ChatConventionsProviding` son la única arquitectura de reasoning;
   solo se conserva la inferencia conservadora de templates como fallback.
 - `ChatSession` combina el ledger estructurado oficial con prefill transaccional, cache
