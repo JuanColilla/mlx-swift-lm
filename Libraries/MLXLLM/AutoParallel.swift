@@ -137,6 +137,17 @@ public final class PipelineLastLayer: PipelineWrappedLayer, TransformerLayer {
         }
 
         let gathered = group.allGather(output)
+        // MLX evaluates lazily: `send`/`allGather` only run their real
+        // network I/O when something forces materialization of this node.
+        // A non-sampling rank never calls `.item()`/`.eval()` on anything
+        // downstream of its own forward pass (its logits are discarded),
+        // so without this, its half of the pipeline's send/allGather never
+        // executes — the sampling rank blocks forever waiting for a
+        // contribution the other rank's process never actually sent, until
+        // iOS's Metal GPU-watchdog aborts it. Every rank must materialize
+        // this collective, every forward pass, regardless of whether its
+        // own result is used.
+        eval(gathered)
         let batchSize = output.dim(0)
         let totalSize = gathered.dim(0)
         let startIndex = totalSize - batchSize

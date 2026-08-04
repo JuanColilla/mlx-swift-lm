@@ -495,6 +495,11 @@ public class Qwen3NextModelInner: Module {
                     hiddenStates, dest: Int32((pipelineRank + 1) % pipelineWorldSize))
             }
             let gathered = pipelineGroup.allGather(hiddenStates)
+            // Force materialization on every rank, every forward pass — see
+            // the identical comment in AutoParallel.swift's
+            // `PipelineLastLayer.callAsFunction`. `eval()` here is MLX's
+            // lazy-graph evaluator, not a dynamic-code-execution call.
+            eval(gathered)
             let batchSize = hiddenStates.dim(0)
             let totalSize = gathered.dim(0)
             hiddenStates = gathered[(totalSize - batchSize)..<totalSize]
