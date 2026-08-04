@@ -397,9 +397,10 @@ las decisiones anteriores:
 - `ChatSession` combina el ledger estructurado oficial con prefill transaccional, cache
   versionada, speculative decoding adaptativo y MTP.
 - Se eliminan el runtime WHT, `ThinkingSupport` y el stub público de tensor parallel.
-- `Package.swift` fija `mlx-swift` en `09b5d162bb684ec1e1a557b894c65d1a217ce3c8`.
-  Su historial incluye `5e27a4c` (Bonsai 1-bit), `3c58e36` (DistributedGroup) y el manejo
-  recuperable de errores de inicialización de grupos.
+- `Package.swift` fija `mlx-swift` en `b00051a9c1bf4d42036d841ef2c803b50f82d115`.
+  Su historial incluye `5e27a4c` (Bonsai 1-bit), `3c58e36` (DistributedGroup), `09b5d16`
+  (errores recuperables al inicializar grupos) y el diferido de errores GPU asíncronos para
+  evitar abortos fuera de una frontera Swift capturable.
 - El pipeline ya no invoca los `rebuildCaches()` inexistentes de la rama original. Las capas,
   `kvHeads`, tipos de cache e índices de atención se recortan y recalculan para el shard local.
   Qwen3.5 desactiva su ruta de decode compilada al operar como pipeline, evitando que rangos
@@ -411,7 +412,8 @@ las decisiones anteriores:
 
 - Parse de todos los fuentes Swift: correcto.
 - Type-check de `MLXLMCommon`, `MLXLLM` y `MLXVLM` contra un módulo temporal construido desde
-  la revisión `09b5d16` de `mlx-swift`: correcto.
+  la revisión `09b5d16` de `mlx-swift`, antecesora con la misma API Swift que `b00051a`:
+  correcto. SwiftPM resuelve el manifiesto final directamente en `b00051a`.
 - Type-check del bloque principal de tests afectados, incluidos ChatSession, MTP, adaptive
   speculative decoding, KV cache, reasoning y el nuevo test de alineación del pipeline:
   correcto.
