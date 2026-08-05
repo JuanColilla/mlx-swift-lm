@@ -417,7 +417,7 @@ class GLM4MoELiteMoE: Module, UnaryLayer {
     }
 }
 
-class GLM4MoELiteDecoderLayer: Module {
+class GLM4MoELiteDecoderLayer: Module, TransformerLayer {
     @ModuleInfo(key: "self_attn") var attention: GLM4MoELiteAttention
     let mlp: UnaryLayer
 
@@ -455,7 +455,7 @@ class GLM4MoELiteDecoderLayer: Module {
 public class GLM4MoELiteModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    let layers: [GLM4MoELiteDecoderLayer]
+    public var layers: [TransformerLayer]
     let norm: RMSNorm
 
     init(_ config: GLM4MoELiteConfiguration) {
@@ -486,7 +486,7 @@ public class GLM4MoELiteModelInner: Module {
 
 public class GLM4MoELiteModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
-    public let kvHeads: [Int]
+    public var kvHeads: [Int]
 
     public let model: GLM4MoELiteModelInner
     let configuration: GLM4MoELiteConfiguration
@@ -518,9 +518,13 @@ public class GLM4MoELiteModel: Module, LLMModel, KVCacheDimensionProvider {
                 for k in ["weight", "scales", "biases"] {
                     let key = "\(prefix).mlp.experts.0.\(n).\(k)"
                     if sanitized[key] != nil, let nRoutedExperts = configuration.nRoutedExperts {
-                        let toJoin = (0 ..< nRoutedExperts).map { e in
+                        let toJoin = (0 ..< nRoutedExperts).compactMap { e in
+                            sanitized["\(prefix).mlp.experts.\(e).\(n).\(k)"]
+                        }
+                        guard toJoin.count == nRoutedExperts else { continue }
+                        for e in 0 ..< nRoutedExperts {
                             sanitized.removeValue(
-                                forKey: "\(prefix).mlp.experts.\(e).\(n).\(k)")!
+                                forKey: "\(prefix).mlp.experts.\(e).\(n).\(k)")
                         }
                         sanitized["\(prefix).mlp.switch_mlp.\(n).\(k)"] = MLX.stacked(toJoin)
                     }
@@ -721,4 +725,10 @@ extension GLM4MoELiteModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
     }
+}
+
+// MARK: - Chat conventions
+
+extension GLM4MoELiteModel {
+    public var toolCallFormat: ToolCallFormat? { .glm4 }
 }

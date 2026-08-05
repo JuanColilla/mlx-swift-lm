@@ -66,7 +66,7 @@ private enum AWQ {
 /// The shift table and reorder indices are rebuilt per call rather than cached
 /// as module-level statics — they're tiny (8 × 8 bytes) and only touched at
 /// model load time, so caching bought nothing and only created thread-safety
-/// concerns around unevaluated `MLXArray`s (PR #164 review comment C2).
+/// concerns around unevaluated `MLXArray`s.
 private func unpackAndReorder(_ packed: MLXArray) -> MLXArray {
     let rows = packed.dim(0)
     let cols = packed.dim(1)
@@ -347,32 +347,8 @@ public func loadParoQuantModel<T: LanguageModel>(
     from directory: URL,
     typeRegistry: ModelTypeRegistry<T>,
     tokenizerLoader: any TokenizerLoader,
-    toolCallFormat: ToolCallFormat? = nil
-) async throws -> ModelContainer {
-    try await loadParoQuantModel(
-        from: directory,
-        typeRegistry: typeRegistry,
-        tokenizerLoader: tokenizerLoader,
-        toolCallFormat: toolCallFormat,
-        thinkingSupport: nil)
-}
-
-/// Load a ParoQuant model with explicit thinking-mode metadata.
-///
-/// - Parameters:
-///   - directory: Local path to the model checkpoint directory.
-///   - typeRegistry: Registry used to create the underlying model architecture.
-///   - tokenizerLoader: Loader for tokenizer.
-///   - toolCallFormat: Optional tool-call format for the model configuration.
-///   - thinkingSupport: Optional explicit thinking-mode metadata. Downloaded template
-///     inference is used when this is `nil`.
-/// - Returns: A ``ModelContainer`` ready for inference.
-public func loadParoQuantModel<T: LanguageModel>(
-    from directory: URL,
-    typeRegistry: ModelTypeRegistry<T>,
-    tokenizerLoader: any TokenizerLoader,
     toolCallFormat: ToolCallFormat? = nil,
-    thinkingSupport: ThinkingSupport?
+    reasoningConfig: ReasoningConfig? = nil
 ) async throws -> ModelContainer {
     // 1. Parse config.json (flatten VLM text_config if present)
     let configURL = directory.appendingPathComponent("config.json")
@@ -422,8 +398,8 @@ public func loadParoQuantModel<T: LanguageModel>(
     var config = ModelConfiguration(
         directory: directory, stopStrings: genConfig?.stopStrings,
         toolCallFormat: toolCallFormat,
-        thinkingSupport: thinkingSupport
-            ?? ThinkingSupport.infer(fromTokenizerDirectory: directory))
+        reasoningConfig: reasoningConfig
+            ?? ReasoningConfig.infer(fromTokenizerDirectory: directory))
     config.eosTokenIds = eosTokenIds
 
     // 5. Load raw safetensors (top-level only; do not recurse into

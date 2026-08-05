@@ -40,9 +40,9 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 // MARK: - SwitchGLU
 
 public class SwitchGLU: Module {
-    @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear
-    @ModuleInfo(key: "up_proj") var upProj: SwitchLinear
-    @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
+    @ModuleInfo(key: "gate_proj") public var gateProj: SwitchLinear
+    @ModuleInfo(key: "up_proj") public var upProj: SwitchLinear
+    @ModuleInfo(key: "down_proj") public var downProj: SwitchLinear
 
     let inputDims: Int
     let hiddenDims: Int

@@ -174,6 +174,10 @@ open class BaseKVCache: KVCache {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
 
+    /// RoPE offset for this cache. `open` so subclasses can return a non-scalar
+    /// offset (e.g. a batched cache's per-row `.batch(...)`).
+    open var ropeOffset: RoPEOffset { .scalar(offset) }
+
     public func innerState() -> [MLXArray] { [] }
 
     open func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
@@ -838,7 +842,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 }
 
-private func resolvedKVQuantizationGroupSize(
+func resolvedKVQuantizationGroupSize(
     requested: Int,
     keyHeadDim: Int,
     valueHeadDim: Int
@@ -1625,8 +1629,8 @@ private func cacheClassName(_ cache: KVCache) -> String {
     case is MambaCache: return "MambaCache"
     case is ArraysCache: return "ArraysCache"
     case is RotatingKVCache: return "RotatingKVCache"
-    case is WalshHadamardQuantizedKVCache: return "WalshHadamardQuantizedKVCache"
     case is QuantizedKVCache: return "QuantizedKVCache"
+    case is TurboQuantKVCache: return "TurboQuantKVCache"
     case is KVCacheSimple: return "KVCache"
     case is CacheList: return "CacheList"
     default: return "KVCache"
@@ -1788,27 +1792,6 @@ private func restoreCacheFromMetaState(
         cache.metaState = metaState
         return cache
 
-    case "WalshHadamardQuantizedKVCache":
-        guard
-            metaState.count == 5,
-            metaState.first == WalshHadamardQuantizedKVCache.formatVersion
-        else {
-            throw KVCacheError(
-                message:
-                    "Corrupt prompt cache: WalshHadamardQuantizedKVCache metaState must contain the supported format and four quantization values"
-            )
-        }
-        guard state.count == 4 || state.count == 6 else {
-            throw KVCacheError(
-                message:
-                    "Corrupt prompt cache: WalshHadamardQuantizedKVCache state must have exactly 4 or 6 arrays, found \(state.count)"
-            )
-        }
-        let cache = WalshHadamardQuantizedKVCache()
-        cache.state = state
-        cache.metaState = metaState
-        return cache
-
     case "ChunkedKVCache":
         guard metaState.count == 2 else {
             throw KVCacheError(
@@ -1829,6 +1812,22 @@ private func restoreCacheFromMetaState(
     case "ArraysCache":
         let cache = ArraysCache(size: 0)
         cache.restoreFromMetaState(state: state, savedMetaState: metaState)
+        return cache
+
+    case "TurboQuantKVCache":
+        guard metaState.count >= 5,
+            let bits = Int(metaState[1]),
+            let keyBits = Int(metaState[2]),
+            let valueBits = Int(metaState[3]),
+            let seed = UInt64(metaState[4])
+        else {
+            throw KVCacheError(
+                message: "Invalid TurboQuantKVCache metaState")
+        }
+        let cache = TurboQuantKVCache(
+            bits: bits, keyBits: keyBits, valueBits: valueBits, seed: seed)
+        cache.state = state
+        cache.metaState = metaState
         return cache
 
     case "CacheList":
@@ -2032,23 +2031,15 @@ public func quantizedScaledDotProductAttention(
         let kIndices = MLXArray(0 ..< kL)
         let causalMask = greaterEqual(
             expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
-        scores = MLX.where(causalMask, scores, MLXArray(Float.leastNormalMagnitude))
+        scores = MLX.where(causalMask, scores, MLXArray.maskFill(for: scores.dtype))
 
     case .array(let maskArray):
-        if maskArray.dtype == .bool {
-            scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
-        } else {
-            scores = scores + maskArray
-        }
+        scores = applyMask(maskArray, to: scores)
 
     case .arrays(let maskArrays):
         // Handle multiple mask arrays - just use the first one for simplicity
         if let maskArray = maskArrays.first {
-            if maskArray.dtype == .bool {
-                scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
-            } else {
-                scores = scores + maskArray
-            }
+            scores = applyMask(maskArray, to: scores)
         }
 
     case .none:
@@ -2070,6 +2061,22 @@ public func quantizedScaledDotProductAttention(
     }
 
     return output
+
+    // Apply a boolean/additive mask, broadcasting batched masks over the GQA
+    // head-group axis: per-sequence masks are `[B, 1, L, S]`, but with
+    // `nRepeats > 1` the scores are 5-D `[B, nKVHeads, nRepeats, L, S]`, so a
+    // 4-D mask needs an extra axis to line up `B` with the batch dimension.
+    func applyMask(_ maskArray: MLXArray, to scores: MLXArray) -> MLXArray {
+        var maskArray = maskArray
+        if nRepeats > 1 && maskArray.ndim == 4 {
+            maskArray = expandedDimensions(maskArray, axis: -3)
+        }
+        if maskArray.dtype == .bool {
+            return MLX.where(maskArray, scores, MLXArray.maskFill(for: scores.dtype))
+        } else {
+            return scores + maskArray
+        }
+    }
 }
 
 // MARK: - Dynamic Cache Quantization
@@ -2097,9 +2104,9 @@ public func resolveAffineScheme(_ scheme: String?) -> (bits: Int, groupSize: Int
 ///   - kvGroupSize: Group size for quantization
 ///   - quantizedKVStart: Token count threshold to begin quantizing
 ///   - kvScheme: Scheme selector; overrides kvBits when it names a built-in
-///     affine scheme ("affine4", "affine8") or experimental Walsh-Hadamard
-///     scheme ("wht4", "wht8"). Unrecognized schemes are left to custom cache
-///     implementations and do not quantize here.
+///     affine scheme ("affine4", "affine8") or a TurboQuant scheme
+///     ("turbo4", "turbo4v2", ...). Unrecognized schemes are left to custom
+///     cache implementations and do not quantize here.
 public func maybeQuantizeKVCache(
     cache: inout [KVCache],
     kvBits: Int?,
@@ -2107,22 +2114,27 @@ public func maybeQuantizeKVCache(
     quantizedKVStart: Int = 0,
     kvScheme: String? = nil
 ) {
+    // TurboQuant schemes convert eligible layers to TurboQuantKVCache
+    // (handled in TurboQuantKVCache.swift to keep this file scheme-agnostic).
+    if let scheme = kvScheme, let turbo = resolveTurboScheme(scheme) {
+        maybeTurboQuantizeKVCache(
+            cache: &cache,
+            keyBits: turbo.keyBits,
+            valueBits: turbo.valueBits,
+            quantizedKVStart: quantizedKVStart
+        )
+        return
+    }
+
     // Resolve effective bits: kvScheme overrides kvBits.
     let effectiveBits: Int
     let effectiveGroupSize: Int
-    let useWalshHadamard: Bool
-    if let scheme = kvScheme, let resolved = resolveWalshHadamardScheme(scheme) {
+    if let scheme = kvScheme, let resolved = resolveAffineScheme(scheme) {
         effectiveBits = resolved.bits
         effectiveGroupSize = resolved.groupSize
-        useWalshHadamard = true
-    } else if let scheme = kvScheme, let resolved = resolveAffineScheme(scheme) {
-        effectiveBits = resolved.bits
-        effectiveGroupSize = resolved.groupSize
-        useWalshHadamard = false
     } else if let kvBits {
         effectiveBits = kvBits
         effectiveGroupSize = kvGroupSize
-        useWalshHadamard = false
     } else {
         return
     }
@@ -2147,14 +2159,6 @@ public func maybeQuantizeKVCache(
     /// original cache unchanged if conversion is not possible or not (yet)
     /// supported for this entry -- see ``KVCacheSimple/quantized(groupSize:bits:)``.
     func quantize(_ cache: KVCacheSimple) -> KVCache {
-        if useWalshHadamard {
-            return
-                (try? cache.walshHadamardQuantized(
-                    groupSize: effectiveGroupSize,
-                    bits: effectiveBits
-                )) ?? cache
-        }
-
         let state = cache.state
         if state.count == 2 {
             let keyHeadDim = state[0].dim(3)

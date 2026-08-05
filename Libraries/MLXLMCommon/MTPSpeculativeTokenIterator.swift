@@ -103,7 +103,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         drafter: any MTPDrafterModel,
         mainCache: [KVCache]? = nil,
         parameters: GenerateParameters,
-        blockSize: Int
+        blockSize: Int,
+        components: GenerationComponents = .init()
     ) throws {
         try self.init(
             input: input,
@@ -112,7 +113,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             mainCache: mainCache,
             mainState: nil,
             parameters: parameters,
-            blockSize: blockSize
+            blockSize: blockSize,
+            components: components
         )
     }
 
@@ -128,7 +130,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         mainCache: [KVCache]? = nil,
         mainState: LMOutput.State?,
         parameters: GenerateParameters,
-        blockSize: Int
+        blockSize: Int,
+        components: GenerationComponents = .init()
     ) throws {
         precondition(
             blockSize >= 2,
@@ -146,7 +149,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         self.sampler = parameters.sampler()
-        self.processor = parameters.processor()
+        self.processor = components.logitProcessor(parameters: parameters)
 
         self.maxTokens = parameters.maxTokens
         self.blockSize = blockSize
@@ -472,7 +475,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // Run a new speculation round (may transition to passthrough).
         pendingTokens.removeAll(keepingCapacity: true)
         pendingIndex = 0
-        speculateRound()
+        autoreleasepool { speculateRound() }
 
         if pendingTokens.isEmpty {
             // speculateRound chose passthrough -- fall through.

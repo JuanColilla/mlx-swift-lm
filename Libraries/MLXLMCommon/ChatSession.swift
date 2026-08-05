@@ -281,7 +281,88 @@ public struct ChatSessionCacheSnapshot {
 /// - Note: `ChatSession` is not thread-safe. Each session should be used from a single
 ///   task/thread at a time. The underlying `ModelContainer` handles thread safety for
 ///   model operations.
+/// - Note: A session retains its structured transcript, including referenced media,
+///   until ``clear()`` is called. Long-running VLM sessions should clear or replace
+///   the session when that retained context is no longer needed.
 public final class ChatSession {
+
+    private struct Conversation {
+        var messages: [Chat.Message]
+        /// Exact tokens represented by the main KV cache when its count
+        /// matches the cache offset. An empty value paired with a nonzero
+        /// cache offset is an invalidated ledger and forces a rebuild.
+        var cachedTokens: [Int]
+
+        @discardableResult
+        mutating func record(
+            _ assistant: AssistantGeneration,
+            generatedTokens: [Int],
+            cacheOffset: Int?
+        ) -> Bool {
+            guard assistant.shouldRecord else {
+                // A cancelled or semantically empty generation has no
+                // assistant turn to replay. Its cache may nevertheless
+                // contain generated or lookahead tokens, so invalidate
+                // the ledger and rebuild from the retained messages.
+                cachedTokens.removeAll()
+                return false
+            }
+
+            let cachedTokenCount = cachedTokens.count
+            if let cacheOffset,
+                cacheOffset >= cachedTokenCount,
+                cacheOffset - cachedTokenCount <= generatedTokens.count
+            {
+                cachedTokens.append(
+                    contentsOf: generatedTokens.prefix(cacheOffset - cachedTokenCount))
+            } else {
+                // The iterator/cache relationship could not be proven
+                // (for example, a speculative iterator retained
+                // un-emitted lookahead).
+                cachedTokens.removeAll()
+            }
+
+            messages.append(
+                .assistant(
+                    assistant.content,
+                    toolCalls: assistant.toolCalls.isEmpty ? nil : assistant.toolCalls))
+            return true
+        }
+    }
+
+    private struct GenerationRun {
+        let stream: AsyncStream<Generation>
+        let task: Task<[Int], Never>
+
+        init(_ pair: (AsyncStream<Generation>, Task<[Int], Never>)) {
+            (stream, task) = pair
+        }
+    }
+
+    private struct AssistantGeneration {
+        var content = ""
+        var toolCalls: [ToolCall] = []
+        var stopReason: GenerateStopReason?
+        var wasTerminatedByConsumer = false
+
+        var shouldRecord: Bool {
+            (!content.isEmpty || !toolCalls.isEmpty)
+                && !wasTerminatedByConsumer
+                && stopReason != .cancelled
+        }
+
+        mutating func consume(_ item: Generation) {
+            if let chunk = item.chunk {
+                content += chunk
+            }
+            if let toolCall = item.toolCall {
+                toolCalls.append(toolCall)
+            }
+            if let info = item.info {
+                stopReason = info.stopReason
+            }
+        }
+    }
 
     /// Current version of the high-level `ChatSession` prompt-cache contract.
     ///
@@ -293,13 +374,16 @@ public final class ChatSession {
     public static let cacheFormatVersionMetadataKey =
         "mlx-swift-lm.chat-session-cache.format-version"
 
-    enum Cache {
+    private enum Cache {
         /// `state` is the per-call model state (e.g. M-RoPE rope deltas)
         /// from the last prefill against this cache. It must survive across
         /// turns: without it, a model that anchors positions on carried
         /// state re-derives them from a cold start on the next turn.
         case empty
-        case kvcache([KVCache], draftKVCache: [KVCache]?, state: LMOutput.State?)
+        case kvcache(
+            [KVCache], draftKVCache: [KVCache]?, state: LMOutput.State?,
+            conversation: Conversation?
+        )
         case history([Chat.Message])
     }
 
@@ -316,6 +400,12 @@ public final class ChatSession {
     /// snapshot to both regular and speculative generation tasks. Because a
     /// session is not thread-safe, callers may replace the ticket between turns.
     public var wiredMemoryTicket: WiredMemoryTicket?
+
+    /// Optional behavioral components (e.g. a custom ``LogitProcessor``) applied
+    /// on each generation. The `logitProcessorFactory` is invoked fresh for
+    /// every ``respond(to:role:images:videos:audios:)`` so stateful processors
+    /// do not leak state across turns.
+    public var components: GenerationComponents
     public var additionalContext: [String: any Sendable]?
     public var tools: [ToolSpec]?
     public var toolDispatch: (@Sendable (ToolCall) async throws -> String)?
@@ -336,6 +426,7 @@ public final class ChatSession {
     ///   - instructions: optional system instructions for the session
     ///   - speculativeDecoding: optional speculative decoding configuration for faster generation
     ///   - generateParameters: parameters that control generation
+    ///   - components: optional behavioral components, e.g. a custom ``LogitProcessor``
     ///   - processing: media processing configuration for images/videos
     ///   - tools: optional tool specifications
     ///   - toolDispatch: optional tool dispatch -- required for toolcalls if streaming strings rather than details
@@ -345,6 +436,7 @@ public final class ChatSession {
         instructions: String? = nil,
         speculativeDecoding: SpeculativeDecodingConfig? = nil,
         generateParameters: GenerateParameters = .init(),
+        components: GenerationComponents = .init(),
         processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
         additionalContext: [String: any Sendable]? = nil,
         tools: [ToolSpec]? = nil,
@@ -358,6 +450,7 @@ public final class ChatSession {
         self.processing = processing
         self.generateParameters = generateParameters
         self.wiredMemoryTicket = nil
+        self.components = components
         self.tools = tools
         self.toolDispatch = toolDispatch
         self.additionalContext = additionalContext
@@ -372,6 +465,7 @@ public final class ChatSession {
     ///   - instructions: optional system instructions for the session
     ///   - speculativeDecoding: optional speculative decoding configuration for faster generation
     ///   - generateParameters: parameters that control generation
+    ///   - components: optional behavioral components, e.g. a custom ``LogitProcessor``
     ///   - processing: media processing configuration for images/videos
     ///   - tools: optional tool specifications
     ///   - toolDispatch: optional tool dispatch -- required for toolcalls if streaming strings rather than details
@@ -381,6 +475,7 @@ public final class ChatSession {
         instructions: String? = nil,
         speculativeDecoding: SpeculativeDecodingConfig? = nil,
         generateParameters: GenerateParameters = .init(),
+        components: GenerationComponents = .init(),
         processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
         additionalContext: [String: any Sendable]? = nil,
         tools: [ToolSpec]? = nil,
@@ -394,6 +489,7 @@ public final class ChatSession {
         self.processing = processing
         self.generateParameters = generateParameters
         self.wiredMemoryTicket = nil
+        self.components = components
         self.tools = tools
         self.toolDispatch = toolDispatch
         self.additionalContext = additionalContext
@@ -411,6 +507,7 @@ public final class ChatSession {
     ///   - history: The full array of messages to restore (including system prompt)
     ///   - speculativeDecoding: optional speculative decoding configuration for faster generation
     ///   - generateParameters: parameters that control generation
+    ///   - components: optional behavioral components, e.g. a custom ``LogitProcessor``
     ///   - processing: media processing configuration for images/videos
     ///   - tools: optional tool specifications
     ///   - toolDispatch: optional tool dispatch -- required for toolcalls if streaming strings rather than details
@@ -421,6 +518,7 @@ public final class ChatSession {
         history: consuming [Chat.Message],
         speculativeDecoding: SpeculativeDecodingConfig? = nil,
         generateParameters: GenerateParameters = .init(),
+        components: GenerationComponents = .init(),
         processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
         additionalContext: [String: any Sendable]? = nil,
         tools: [ToolSpec]? = nil,
@@ -434,6 +532,7 @@ public final class ChatSession {
         self.processing = processing
         self.generateParameters = generateParameters
         self.wiredMemoryTicket = nil
+        self.components = components
         self.tools = tools
         self.toolDispatch = toolDispatch
         self.additionalContext = additionalContext
@@ -451,6 +550,7 @@ public final class ChatSession {
     ///   - history: The full array of messages to restore (including system prompt)
     ///   - speculativeDecoding: optional speculative decoding configuration for faster generation
     ///   - generateParameters: parameters that control generation
+    ///   - components: optional behavioral components, e.g. a custom ``LogitProcessor``
     ///   - processing: media processing configuration for images/videos
     ///   - tools: optional tool specifications
     ///   - toolDispatch: optional tool dispatch -- required for toolcalls if streaming strings rather than details
@@ -461,6 +561,7 @@ public final class ChatSession {
         history: [Chat.Message],
         speculativeDecoding: SpeculativeDecodingConfig? = nil,
         generateParameters: GenerateParameters = .init(),
+        components: GenerationComponents = .init(),
         processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
         additionalContext: [String: any Sendable]? = nil,
         tools: [ToolSpec]? = nil,
@@ -474,6 +575,7 @@ public final class ChatSession {
         self.processing = processing
         self.generateParameters = generateParameters
         self.wiredMemoryTicket = nil
+        self.components = components
         self.tools = tools
         self.toolDispatch = toolDispatch
         self.additionalContext = additionalContext
@@ -492,6 +594,10 @@ public final class ChatSession {
     /// > re-tokenized on each call to ``respond(to:role:images:videos:audios:)`` without matching
     /// > KV state, producing incoherent output.
     ///
+    /// > Important: A raw cache does not carry the structured chat transcript.
+    /// > This initializer therefore preserves fragment-based continuation behavior.
+    /// > Use a history initializer when later turns must re-render the full conversation.
+    ///
     /// - Parameters:
     ///   - model: the ``ModelContainer``
     ///   - instructions: optional system instructions for the session — leave `nil` if the
@@ -500,6 +606,7 @@ public final class ChatSession {
     ///     matching the given model
     ///   - speculativeDecoding: optional speculative decoding configuration for faster generation
     ///   - generateParameters: parameters that control generation
+    ///   - components: optional behavioral components, e.g. a custom ``LogitProcessor``
     ///   - processing: media processing configuration for images/videos
     ///   - tools: optional tool specifications
     ///   - toolDispatch: optional tool dispatch -- required for toolcalls if streaming strings rather than details
@@ -510,6 +617,7 @@ public final class ChatSession {
         cache: consuming [KVCache],
         speculativeDecoding: SpeculativeDecodingConfig? = nil,
         generateParameters: GenerateParameters = .init(),
+        components: GenerationComponents = .init(),
         processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
         additionalContext: [String: any Sendable]? = nil,
         tools: [ToolSpec]? = nil,
@@ -517,12 +625,14 @@ public final class ChatSession {
     ) {
         self.model = model
         self.instructions = instructions
-        self.cache = .init(.kvcache(cache, draftKVCache: nil, state: nil))
+        self.cache = .init(
+            .kvcache(cache, draftKVCache: nil, state: nil, conversation: nil))
         self.loadedDraftModel = .init(speculativeDecoding?.draftModel)
         self.loadedMTPDrafter = .init(nil)
         self.processing = processing
         self.generateParameters = generateParameters
         self.wiredMemoryTicket = nil
+        self.components = components
         self.tools = tools
         self.toolDispatch = toolDispatch
         self.additionalContext = additionalContext
@@ -541,6 +651,10 @@ public final class ChatSession {
     /// > re-tokenized on each call to ``respond(to:role:images:videos:audios:)`` without matching
     /// > KV state, producing incoherent output.
     ///
+    /// > Important: A raw cache does not carry the structured chat transcript.
+    /// > This initializer therefore preserves fragment-based continuation behavior.
+    /// > Use a history initializer when later turns must re-render the full conversation.
+    ///
     /// - Parameters:
     ///   - model: the ``ModelContext``
     ///   - instructions: optional system instructions for the session — leave `nil` if the
@@ -549,6 +663,7 @@ public final class ChatSession {
     ///     matching the given model
     ///   - speculativeDecoding: optional speculative decoding configuration for faster generation
     ///   - generateParameters: parameters that control generation
+    ///   - components: optional behavioral components, e.g. a custom ``LogitProcessor``
     ///   - processing: media processing configuration for images/videos
     ///   - tools: optional tool specifications
     ///   - toolDispatch: optional tool dispatch -- required for toolcalls if streaming strings rather than details
@@ -559,6 +674,7 @@ public final class ChatSession {
         cache: consuming [KVCache],
         speculativeDecoding: SpeculativeDecodingConfig? = nil,
         generateParameters: GenerateParameters = .init(),
+        components: GenerationComponents = .init(),
         processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
         additionalContext: [String: any Sendable]? = nil,
         tools: [ToolSpec]? = nil,
@@ -566,12 +682,14 @@ public final class ChatSession {
     ) {
         self.model = ModelContainer(context: model)
         self.instructions = instructions
-        self.cache = .init(.kvcache(cache, draftKVCache: nil, state: nil))
+        self.cache = .init(
+            .kvcache(cache, draftKVCache: nil, state: nil, conversation: nil))
         self.loadedDraftModel = .init(speculativeDecoding?.draftModel)
         self.loadedMTPDrafter = .init(nil)
         self.processing = processing
         self.generateParameters = generateParameters
         self.wiredMemoryTicket = nil
+        self.components = components
         self.tools = tools
         self.toolDispatch = toolDispatch
         self.additionalContext = additionalContext
@@ -590,6 +708,7 @@ public final class ChatSession {
         instructions: String? = nil,
         mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig,
         generateParameters: GenerateParameters = .init(),
+        components: GenerationComponents = .init(),
         processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
         additionalContext: [String: any Sendable]? = nil,
         tools: [ToolSpec]? = nil,
@@ -599,6 +718,7 @@ public final class ChatSession {
             model,
             instructions: instructions,
             generateParameters: generateParameters,
+            components: components,
             processing: processing,
             additionalContext: additionalContext,
             tools: tools,
@@ -613,6 +733,7 @@ public final class ChatSession {
         instructions: String? = nil,
         mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig,
         generateParameters: GenerateParameters = .init(),
+        components: GenerationComponents = .init(),
         processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
         additionalContext: [String: any Sendable]? = nil,
         tools: [ToolSpec]? = nil,
@@ -622,6 +743,7 @@ public final class ChatSession {
             model,
             instructions: instructions,
             generateParameters: generateParameters,
+            components: components,
             processing: processing,
             additionalContext: additionalContext,
             tools: tools,
@@ -637,6 +759,7 @@ public final class ChatSession {
         history: consuming [Chat.Message],
         mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig,
         generateParameters: GenerateParameters = .init(),
+        components: GenerationComponents = .init(),
         processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
         additionalContext: [String: any Sendable]? = nil,
         tools: [ToolSpec]? = nil,
@@ -647,6 +770,7 @@ public final class ChatSession {
             instructions: instructions,
             history: history,
             generateParameters: generateParameters,
+            components: components,
             processing: processing,
             additionalContext: additionalContext,
             tools: tools,
@@ -662,6 +786,7 @@ public final class ChatSession {
         history: [Chat.Message],
         mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig,
         generateParameters: GenerateParameters = .init(),
+        components: GenerationComponents = .init(),
         processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
         additionalContext: [String: any Sendable]? = nil,
         tools: [ToolSpec]? = nil,
@@ -672,6 +797,7 @@ public final class ChatSession {
             instructions: instructions,
             history: history,
             generateParameters: generateParameters,
+            components: components,
             processing: processing,
             additionalContext: additionalContext,
             tools: tools,
@@ -687,6 +813,7 @@ public final class ChatSession {
         cache: consuming [KVCache],
         mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig,
         generateParameters: GenerateParameters = .init(),
+        components: GenerationComponents = .init(),
         processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
         additionalContext: [String: any Sendable]? = nil,
         tools: [ToolSpec]? = nil,
@@ -697,6 +824,7 @@ public final class ChatSession {
             instructions: instructions,
             cache: cache,
             generateParameters: generateParameters,
+            components: components,
             processing: processing,
             additionalContext: additionalContext,
             tools: tools,
@@ -712,6 +840,7 @@ public final class ChatSession {
         cache: consuming [KVCache],
         mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig,
         generateParameters: GenerateParameters = .init(),
+        components: GenerationComponents = .init(),
         processing: UserInput.Processing = .init(resize: CGSize(width: 512, height: 512)),
         additionalContext: [String: any Sendable]? = nil,
         tools: [ToolSpec]? = nil,
@@ -722,6 +851,7 @@ public final class ChatSession {
             instructions: instructions,
             cache: cache,
             generateParameters: generateParameters,
+            components: components,
             processing: processing,
             additionalContext: additionalContext,
             tools: tools,
@@ -739,13 +869,15 @@ public final class ChatSession {
     ///   - videos: list of videos (for use with VLMs)
     ///   - audios: list of audios (for use with VLMs)
     /// - Returns: the model's response
-    public func respond(
-        to prompt: String,
-        role: Chat.Message.Role = .user,
-        images: consuming [UserInput.Image],
-        videos: consuming [UserInput.Video],
-        audios: consuming [UserInput.Audio]
-    ) async throws -> String {
+    nonisolated(nonsending)
+        public func respond(
+            to prompt: String,
+            role: Chat.Message.Role = .user,
+            images: consuming [UserInput.Image],
+            videos: consuming [UserInput.Video],
+            audios: consuming [UserInput.Audio]
+        ) async throws -> String
+    {
         var output = ""
         for try await chunk in streamResponse(
             to: prompt, role: role, images: images, videos: videos, audios: audios
@@ -764,13 +896,15 @@ public final class ChatSession {
     ///   - video: optional video (for use with VLMs)
     ///   - audio: optional audio (for use with VLMs)
     /// - Returns: the model's response
-    public func respond(
-        to prompt: String,
-        role: Chat.Message.Role = .user,
-        image: consuming UserInput.Image? = nil,
-        video: consuming UserInput.Video? = nil,
-        audio: consuming UserInput.Audio? = nil
-    ) async throws -> String {
+    nonisolated(nonsending)
+        public func respond(
+            to prompt: String,
+            role: Chat.Message.Role = .user,
+            image: consuming UserInput.Image? = nil,
+            video: consuming UserInput.Video? = nil,
+            audio: consuming UserInput.Audio? = nil
+        ) async throws -> String
+    {
         try await respond(
             to: prompt,
             role: role,
@@ -792,9 +926,11 @@ public final class ChatSession {
     ///
     /// - Parameter messages: chat messages to append before generation
     /// - Returns: the model's response
-    public func respond(
-        to messages: consuming [Chat.Message]
-    ) async throws -> String {
+    nonisolated(nonsending)
+        public func respond(
+            to messages: consuming [Chat.Message]
+        ) async throws -> String
+    {
         var output = ""
         for try await chunk in streamResponse(to: messages) {
             output += chunk
@@ -860,41 +996,87 @@ public final class ChatSession {
                     SendableBox(context.model)
                 }.consume()
 
+                let appendedMessages = inputMessages.consume()
                 var preparedMessages: [Chat.Message] = []
                 if let instructions {
                     preparedMessages.append(.system(instructions))
                 }
 
-                let kvCache: [KVCache]
+                var kvCache: [KVCache]
                 let storedDraftCache: [KVCache]?
-                let state: LMOutput.State?
+                var state: LMOutput.State?
+                var conversation: Conversation?
                 switch cache {
                 case .empty:
                     kvCache = model.newCache(parameters: generateParameters)
                     storedDraftCache = nil
                     state = nil
+                    conversation = Conversation(messages: [], cachedTokens: [])
 
-                case .kvcache(let currentCache, let draftCache, let currentState):
+                case .kvcache(
+                    let currentCache, let draftCache, let currentState,
+                    let currentConversation
+                ):
                     kvCache = currentCache.map { $0.copy() }
                     storedDraftCache = draftCache?.map { $0.copy() }
                     state = currentState
+                    conversation = currentConversation
 
                 case .history(let history):
                     kvCache = model.newCache(parameters: generateParameters)
                     storedDraftCache = nil
                     state = nil
-                    preparedMessages.append(contentsOf: history)
+                    conversation = Conversation(messages: history, cachedTokens: [])
                 }
 
-                preparedMessages.append(contentsOf: inputMessages.consume())
+                if let conversation {
+                    preparedMessages.append(contentsOf: conversation.messages)
+                }
+                preparedMessages.append(contentsOf: appendedMessages)
                 let userInput = UserInput(
                     chat: preparedMessages,
                     processing: processing,
                     tools: tools,
                     additionalContext: additionalContext
                 )
-                let input = try await processor.prepare(input: userInput)
+                let preparedInput = try await processor.prepare(input: userInput)
                 try Task.checkCancellation()
+
+                var input = preparedInput
+                var reusedCachedPrefix = false
+                if var currentConversation = conversation {
+                    let fullTokenIds = preparedInput.text.tokens.asArray(Int.self)
+                    let cachedTokenIds = currentConversation.cachedTokens
+                    let cachesAreAligned =
+                        !kvCache.isEmpty
+                        && kvCache.allSatisfy { $0.offset == cachedTokenIds.count }
+                    let containsNewMedia = appendedMessages.contains {
+                        !$0.images.isEmpty || !$0.videos.isEmpty || !$0.audios.isEmpty
+                    }
+                    let hasPreparedMedia =
+                        preparedInput.image != nil || preparedInput.video != nil
+                        || preparedInput.audio != nil
+                    let canReusePrefix =
+                        cachesAreAligned
+                        && fullTokenIds.starts(with: cachedTokenIds)
+                        && fullTokenIds.count > cachedTokenIds.count
+                        && !containsNewMedia
+                        && !hasPreparedMedia
+                        && preparedInput.text.mask == nil
+
+                    if canReusePrefix {
+                        input = LMInput(
+                            tokens: MLXArray(fullTokenIds.dropFirst(cachedTokenIds.count)))
+                        reusedCachedPrefix = true
+                    } else if kvCache.first?.offset != 0 {
+                        kvCache = model.newCache(parameters: generateParameters)
+                        state = nil
+                    }
+
+                    currentConversation.messages.append(contentsOf: appendedMessages)
+                    currentConversation.cachedTokens = fullTokenIds
+                    conversation = currentConversation
+                }
 
                 let nextState = try Self.prefill(
                     input: input,
@@ -913,10 +1095,23 @@ public final class ChatSession {
                     let draftModel = await draftContainer.perform { context in
                         SendableBox(context.model)
                     }.consume()
-                    let draftCache =
-                        storedDraftCache ?? draftModel.newCache(parameters: generateParameters)
+                    let canReuseDraftCache =
+                        reusedCachedPrefix
+                        && storedDraftCache?.allSatisfy {
+                            $0.offset
+                                == preparedInput.text.tokens.size - input.text.tokens.size
+                        } == true
+                    let draftCache: [KVCache]
+                    let draftInput: LMInput
+                    if canReuseDraftCache, let storedDraftCache {
+                        draftCache = storedDraftCache
+                        draftInput = input
+                    } else {
+                        draftCache = draftModel.newCache(parameters: generateParameters)
+                        draftInput = preparedInput
+                    }
                     _ = try Self.prefill(
-                        input: input,
+                        input: draftInput,
                         model: draftModel,
                         cache: draftCache,
                         state: nil,
@@ -926,7 +1121,9 @@ public final class ChatSession {
                 }
 
                 try Task.checkCancellation()
-                cache = .kvcache(kvCache, draftKVCache: nextDraftCache, state: nextState)
+                cache = .kvcache(
+                    kvCache, draftKVCache: nextDraftCache, state: nextState,
+                    conversation: conversation)
             }
         }
 
@@ -1170,6 +1367,7 @@ public final class ChatSession {
         let cache = self.cache
         let loadedDraftModel = self.loadedDraftModel
         let generateParameters = self.generateParameters
+        let components = self.components
         let speculativeDecoding = self.speculativeDecoding
         let loadedMTPDrafter = self.loadedMTPDrafter
         let mtpSpeculativeDecoding = self.mtpSpeculativeDecoding
@@ -1187,9 +1385,9 @@ public final class ChatSession {
                     let tokenizer = await model.tokenizer
                     let modelConfiguration = await model.configuration
 
-                    var messages: [Chat.Message] = []
+                    var leadingMessages: [Chat.Message] = []
                     if let instructions {
-                        messages.append(.system(instructions))
+                        leadingMessages.append(.system(instructions))
                     }
 
                     // prepare the cache, if needed.  note:
@@ -1215,41 +1413,203 @@ public final class ChatSession {
                     // across turns alongside the KV cache; updated after each
                     // prefill and stored back at the end of the turn.
                     var lmState: LMOutput.State?
+                    var conversation: Conversation?
                     switch cache {
                     case .empty:
                         kvCache = model.newCache(parameters: generateParameters)
-                        cache = .kvcache(kvCache, draftKVCache: nil, state: nil)
+                        conversation = Conversation(messages: [], cachedTokens: [])
+                        cache = .kvcache(
+                            kvCache, draftKVCache: nil, state: nil, conversation: conversation)
 
-                    case .kvcache(let array, let storedDraftCache, let storedState):
-                        kvCache = array
+                    case .kvcache(
+                        let storedCache, let storedDraftCache, let storedState,
+                        let storedConversation
+                    ):
+                        kvCache = storedCache
                         draftKVCache = storedDraftCache
                         lmState = storedState
+                        conversation = storedConversation
 
                     case .history(let history):
                         // the KVCache is represented by a chat history
                         kvCache = model.newCache(parameters: generateParameters)
-                        cache = .kvcache(kvCache, draftKVCache: nil, state: nil)
-                        messages.append(contentsOf: history)
+                        conversation = Conversation(messages: history, cachedTokens: [])
+                        cache = .kvcache(
+                            kvCache, draftKVCache: nil, state: nil, conversation: conversation)
                     }
 
-                    // prepare the input
-                    messages.append(contentsOf: inputMessages.consume())
+                    var pendingMessages = inputMessages.consume()
 
                     // loop can restart on tool calls
-                    restart: while !messages.isEmpty {
+                    restart: while !pendingMessages.isEmpty {
+                        let templateMessages: [Chat.Message]
+                        let conversationMessageCountBeforePending: Int?
+                        if var currentConversation = conversation {
+                            conversationMessageCountBeforePending =
+                                currentConversation.messages.count
+                            currentConversation.messages.append(contentsOf: pendingMessages)
+                            templateMessages = leadingMessages + currentConversation.messages
+                            conversation = currentConversation
+                        } else {
+                            conversationMessageCountBeforePending = nil
+                            // A cache restored without its transcript cannot be reconciled
+                            // against a complete chat template. Preserve the legacy prefix
+                            // continuation behavior for this explicitly low-level API.
+                            templateMessages = leadingMessages + pendingMessages
+                        }
+                        let containsNewMedia = pendingMessages.contains {
+                            !$0.images.isEmpty || !$0.videos.isEmpty || !$0.audios.isEmpty
+                        }
+
                         let userInput = UserInput(
-                            chat: messages,
+                            chat: templateMessages,
                             processing: processing,
                             tools: tools, additionalContext: additionalContext)
-                        let input = try await processor.prepare(input: userInput)
-                        messages.removeAll()
+                        let preparedInput = try await processor.prepare(input: userInput)
+                        var input = preparedInput
+                        pendingMessages.removeAll()
+
+                        let speculativeMemoryEvaluation: SpeculativeDecodingMemoryEvaluation?
+                        if let speculativeDecoding,
+                            let memoryPolicy = speculativeDecoding.memoryPolicy,
+                            let draftModelBytes = speculativeDecoding.estimatedDraftModelBytes
+                        {
+                            speculativeMemoryEvaluation = memoryPolicy.evaluate(
+                                mainModelBytes:
+                                    SpeculativeDecodingMemoryPolicy.modelWeightBytes(model),
+                                draftModelBytes: draftModelBytes)
+                        } else {
+                            speculativeMemoryEvaluation = nil
+                        }
+                        let willFallBackBeforeLoadingDraft =
+                            speculativeMemoryEvaluation.map {
+                                !$0.shouldUseSpeculativeDecoding && $0.action != .fail
+                            } ?? false
+
+                        var reusedMainCacheWithoutDraft = false
+                        if var currentConversation = conversation {
+                            let fullTokenIds = input.text.tokens.asArray(Int.self)
+                            let cachedTokenIds = currentConversation.cachedTokens
+                            let cacheOffset = kvCache.first?.offset
+                            let allMainCachesAreAligned =
+                                !kvCache.isEmpty
+                                && kvCache.allSatisfy { $0.offset == cachedTokenIds.count }
+                            let draftCacheIsAligned: Bool
+                            let allDraftCachesAreAligned: Bool
+                            if let draftKVCache {
+                                draftCacheIsAligned =
+                                    draftKVCache.first?.offset == cachedTokenIds.count
+                                allDraftCachesAreAligned =
+                                    !draftKVCache.isEmpty
+                                    && draftKVCache.allSatisfy {
+                                        $0.offset == cachedTokenIds.count
+                                    }
+                            } else {
+                                // Tentatively reuse the main cache. If speculative
+                                // decoding is admitted below, both caches are rebuilt
+                                // from `preparedInput`; a fallback can keep this suffix.
+                                draftCacheIsAligned = true
+                                allDraftCachesAreAligned = true
+                            }
+                            let extendsCachedPrefix =
+                                cacheOffset == cachedTokenIds.count
+                                && draftCacheIsAligned
+                                && fullTokenIds.starts(with: cachedTokenIds)
+
+                            if extendsCachedPrefix && !containsNewMedia
+                                && fullTokenIds.count > cachedTokenIds.count
+                                && input.text.mask == nil
+                            {
+                                let suffix = Array(fullTokenIds.dropFirst(cachedTokenIds.count))
+                                input = LMInput(tokens: MLXArray(suffix))
+                                reusedMainCacheWithoutDraft =
+                                    speculativeDecoding != nil
+                                    && !willFallBackBeforeLoadingDraft
+                                    && draftKVCache == nil
+                                    && !cachedTokenIds.isEmpty
+                            } else if cacheOffset != 0 {
+                                let commonPrefixCount = zip(fullTokenIds, cachedTokenIds)
+                                    .prefix { $0 == $1 }
+                                    .count
+                                let trimCount = cachedTokenIds.count - commonPrefixCount
+                                let hasPreparedMedia =
+                                    input.image != nil || input.video != nil || input.audio != nil
+                                let canReuseCommonPrefix =
+                                    commonPrefixCount > 0
+                                    && commonPrefixCount < fullTokenIds.count
+                                    && trimCount > 0
+                                    && allMainCachesAreAligned
+                                    && allDraftCachesAreAligned
+                                    && !containsNewMedia
+                                    && !hasPreparedMedia
+                                    && input.text.mask == nil
+                                    && lmState == nil
+                                    && canTrimPromptCache(kvCache)
+                                    && (draftKVCache.map(canTrimPromptCache) ?? true)
+
+                                if canReuseCommonPrefix {
+                                    let mainTrimmed = trimPromptCache(
+                                        kvCache, numTokens: trimCount)
+                                    let draftTrimmed = draftKVCache.map {
+                                        trimPromptCache($0, numTokens: trimCount)
+                                    }
+                                    let mainTrimIsAligned =
+                                        mainTrimmed == trimCount
+                                        && kvCache.allSatisfy {
+                                            $0.offset == commonPrefixCount
+                                        }
+                                    let draftTrimIsAligned: Bool
+                                    if let draftKVCache {
+                                        draftTrimIsAligned =
+                                            draftTrimmed == trimCount
+                                            && draftKVCache.allSatisfy {
+                                                $0.offset == commonPrefixCount
+                                            }
+                                    } else {
+                                        draftTrimIsAligned = true
+                                    }
+
+                                    if mainTrimIsAligned && draftTrimIsAligned {
+                                        input = LMInput(
+                                            tokens: MLXArray(
+                                                Array(
+                                                    fullTokenIds.dropFirst(
+                                                        commonPrefixCount))))
+                                        reusedMainCacheWithoutDraft =
+                                            speculativeDecoding != nil
+                                            && !willFallBackBeforeLoadingDraft
+                                            && draftKVCache == nil
+                                    } else {
+                                        kvCache = model.newCache(
+                                            parameters: generateParameters)
+                                        draftKVCache = nil
+                                        lmState = nil
+                                    }
+                                } else {
+                                    // The template changed an already-cached portion of the
+                                    // transcript, or this input carries state/media that cannot
+                                    // be rewound safely. Rebuild rather than combining a
+                                    // mismatched prompt with stale model state.
+                                    kvCache = model.newCache(parameters: generateParameters)
+                                    draftKVCache = nil
+                                    lmState = nil
+                                }
+                            }
+
+                            currentConversation.cachedTokens = fullTokenIds
+                            conversation = currentConversation
+                        }
+
+                        guard input.text.tokens.size > 0 else {
+                            throw ChatSessionError.emptyPreparedInput
+                        }
 
                         // Select the token iterator based on speculative decoding configuration.
-                        let (genStream, genTask): (AsyncStream<Generation>, Task<Void, Never>)
+                        let generation: GenerationRun
                         var generationStateSink: ChatSessionStateSink?
-                        func defaultGeneration(mtpFallbackReason: String? = nil) throws -> (
-                            AsyncStream<Generation>, Task<Void, Never>
-                        ) {
+                        func defaultGeneration(
+                            mtpFallbackReason: String? = nil
+                        ) throws -> GenerationRun {
                             // Seed the iterator with the carried state; read
                             // back the post-prefill state (prefill runs in the
                             // iterator's init, and the rope delta does not
@@ -1258,33 +1618,35 @@ public final class ChatSession {
                             let iterator = try TokenIterator(
                                 input: input, model: model, cache: kvCache,
                                 state: lmState,
-                                parameters: generateParameters)
+                                parameters: generateParameters, components: components)
                             lmState = iterator.state
 
                             if let mtpFallbackReason {
                                 let stateSink = ChatSessionStateSink()
                                 generationStateSink = stateSink
-                                return MLXLMCommon.generateTask(
-                                    promptTokenCount: input.text.tokens.size,
-                                    modelConfiguration: modelConfiguration,
-                                    tokenizer: tokenizer,
-                                    iterator: MTPFallbackTokenIterator(
-                                        base: iterator,
-                                        reason: mtpFallbackReason,
-                                        sink: stateSink
-                                    ),
-                                    wiredMemoryTicket: wiredMemoryTicket,
-                                    tools: tools
-                                )
+                                return GenerationRun(
+                                    MLXLMCommon.generateTaskRecordingTokens(
+                                        promptTokenCount: input.text.tokens.size,
+                                        modelConfiguration: modelConfiguration,
+                                        tokenizer: tokenizer,
+                                        iterator: MTPFallbackTokenIterator(
+                                            base: iterator,
+                                            reason: mtpFallbackReason,
+                                            sink: stateSink
+                                        ),
+                                        wiredMemoryTicket: wiredMemoryTicket,
+                                        tools: tools
+                                    ))
                             } else {
-                                return MLXLMCommon.generateTask(
-                                    promptTokenCount: input.text.tokens.size,
-                                    modelConfiguration: modelConfiguration,
-                                    tokenizer: tokenizer,
-                                    iterator: iterator,
-                                    wiredMemoryTicket: wiredMemoryTicket,
-                                    tools: tools
-                                )
+                                return GenerationRun(
+                                    MLXLMCommon.generateTaskRecordingTokens(
+                                        promptTokenCount: input.text.tokens.size,
+                                        modelConfiguration: modelConfiguration,
+                                        tokenizer: tokenizer,
+                                        iterator: iterator,
+                                        wiredMemoryTicket: wiredMemoryTicket,
+                                        tools: tools
+                                    ))
                             }
                         }
 
@@ -1298,7 +1660,7 @@ public final class ChatSession {
                                     drafterBytes: mtpSpeculativeDecoding.estimatedDrafterBytes
                                 ) ?? ""
                             if !preLoadFallbackReason.isEmpty {
-                                (genStream, genTask) = try defaultGeneration(
+                                generation = try defaultGeneration(
                                     mtpFallbackReason: preLoadFallbackReason
                                 )
                             } else {
@@ -1320,7 +1682,7 @@ public final class ChatSession {
                                         drafterBytes: Self.modelWeightBytes(drafter)
                                     ) ?? ""
                                 if !postLoadFallbackReason.isEmpty {
-                                    (genStream, genTask) = try defaultGeneration(
+                                    generation = try defaultGeneration(
                                         mtpFallbackReason: postLoadFallbackReason
                                     )
                                 } else {
@@ -1339,37 +1701,31 @@ public final class ChatSession {
                                         mainCache: kvCache,
                                         mainState: lmState,
                                         parameters: generateParameters,
-                                        blockSize: mtpSpeculativeDecoding.blockSize
+                                        blockSize: mtpSpeculativeDecoding.blockSize,
+                                        components: components
                                     )
                                     lmState = iterator.mainState
                                     let stateSink = ChatSessionStateSink()
                                     generationStateSink = stateSink
 
-                                    (genStream, genTask) = MLXLMCommon.generateTask(
-                                        promptTokenCount: input.text.tokens.size,
-                                        modelConfiguration: modelConfiguration,
-                                        tokenizer: tokenizer,
-                                        iterator: StateReportingMTPTokenIterator(
-                                            base: iterator,
-                                            sink: stateSink
-                                        ),
-                                        wiredMemoryTicket: wiredMemoryTicket,
-                                        tools: tools
+                                    generation = GenerationRun(
+                                        MLXLMCommon.generateTaskRecordingTokens(
+                                            promptTokenCount: input.text.tokens.size,
+                                            modelConfiguration: modelConfiguration,
+                                            tokenizer: tokenizer,
+                                            iterator: StateReportingMTPTokenIterator(
+                                                base: iterator,
+                                                sink: stateSink
+                                            ),
+                                            wiredMemoryTicket: wiredMemoryTicket,
+                                            tools: tools
+                                        )
                                     )
                                 }
                             }
                         } else if let speculativeDecoding {
                             var shouldFallBackBeforeLoadingDraft = false
-                            if let memoryPolicy = speculativeDecoding.memoryPolicy,
-                                let draftModelBytes =
-                                    speculativeDecoding.estimatedDraftModelBytes
-                            {
-                                let memoryEvaluation = memoryPolicy.evaluate(
-                                    mainModelBytes:
-                                        SpeculativeDecodingMemoryPolicy
-                                        .modelWeightBytes(model),
-                                    draftModelBytes: draftModelBytes
-                                )
+                            if let memoryEvaluation = speculativeMemoryEvaluation {
                                 if !memoryEvaluation.shouldUseSpeculativeDecoding {
                                     if memoryEvaluation.action == .fail {
                                         throw SpeculativeDecodingMemoryError(
@@ -1381,7 +1737,7 @@ public final class ChatSession {
                             }
 
                             if shouldFallBackBeforeLoadingDraft {
-                                (genStream, genTask) = try defaultGeneration()
+                                generation = try defaultGeneration()
                             } else {
                                 let cachedDraftContainer = await loadedDraftModel.read { $0 }
                                 let draftContainer: ModelContainer
@@ -1391,15 +1747,13 @@ public final class ChatSession {
                                     draftContainer = try await speculativeDecoding.loadDraftModel()
                                 }
 
-                                // Extract the draft model from its container (same pattern as the main model).
                                 let draftModel = await draftContainer.perform { context in
                                     SendableBox(context.model)
                                 }.consume()
-
                                 let memoryEvaluation = speculativeDecoding.memoryPolicy?.evaluate(
                                     mainModel: model,
-                                    draftModel: draftModel
-                                )
+                                    draftModel: draftModel)
+
                                 if let memoryEvaluation,
                                     !memoryEvaluation.shouldUseSpeculativeDecoding
                                 {
@@ -1408,7 +1762,7 @@ public final class ChatSession {
                                             evaluation: memoryEvaluation)
                                     }
 
-                                    (genStream, genTask) = try defaultGeneration()
+                                    generation = try defaultGeneration()
                                 } else {
                                     if cachedDraftContainer == nil {
                                         await loadedDraftModel.update { storedDraftModel in
@@ -1418,15 +1772,31 @@ public final class ChatSession {
                                         }
                                     }
 
+                                    if reusedMainCacheWithoutDraft {
+                                        // The main cache took a suffix-only path, but
+                                        // speculation was admitted without a matching
+                                        // draft cache. Rebuild both from the full input.
+                                        kvCache = model.newCache(
+                                            parameters: generateParameters)
+                                        draftKVCache = nil
+                                        lmState = nil
+                                        input = preparedInput
+                                    }
+
                                     // Allocate the draft KV cache once and reuse it across turns,
                                     // exactly like the main model's KV cache.
-                                    if draftKVCache == nil {
-                                        draftKVCache = draftModel.newCache(
+                                    let draftCache: [KVCache]
+                                    if let existingDraftCache = draftKVCache {
+                                        draftCache = existingDraftCache
+                                    } else {
+                                        let newDraftCache = draftModel.newCache(
                                             parameters: generateParameters)
+                                        draftKVCache = newDraftCache
                                         cache = .kvcache(
-                                            kvCache, draftKVCache: draftKVCache, state: lmState)
+                                            kvCache, draftKVCache: newDraftCache, state: lmState,
+                                            conversation: conversation)
+                                        draftCache = newDraftCache
                                     }
-                                    let draftCache = draftKVCache!
 
                                     let iterator = try SpeculativeTokenIterator(
                                         input: input,
@@ -1436,33 +1806,37 @@ public final class ChatSession {
                                         draftCache: draftCache,
                                         mainState: lmState,
                                         parameters: generateParameters,
-                                        numDraftTokens: speculativeDecoding.numDraftTokens
+                                        numDraftTokens: speculativeDecoding.numDraftTokens,
+                                        components: components
                                     )
                                     lmState = iterator.mainState
                                     let stateSink = ChatSessionStateSink()
                                     generationStateSink = stateSink
 
-                                    (genStream, genTask) = MLXLMCommon.generateTask(
-                                        promptTokenCount: input.text.tokens.size,
-                                        modelConfiguration: modelConfiguration,
-                                        tokenizer: tokenizer,
-                                        iterator: StateReportingSpeculativeTokenIterator(
-                                            base: iterator,
-                                            sink: stateSink
-                                        ),
-                                        wiredMemoryTicket: wiredMemoryTicket,
-                                        tools: tools
-                                    )
+                                    generation = GenerationRun(
+                                        MLXLMCommon.generateTaskRecordingTokens(
+                                            promptTokenCount: input.text.tokens.size,
+                                            modelConfiguration: modelConfiguration,
+                                            tokenizer: tokenizer,
+                                            iterator: StateReportingSpeculativeTokenIterator(
+                                                base: iterator,
+                                                sink: stateSink
+                                            ),
+                                            wiredMemoryTicket: wiredMemoryTicket,
+                                            tools: tools))
                                 }
                             }
                         } else {
                             // Standard path with no speculative decoding.
-                            (genStream, genTask) = try defaultGeneration()
+                            generation = try defaultGeneration()
                         }
 
                         var pendingToolCalls: [ToolCall] = []
+                        var assistant = AssistantGeneration()
 
-                        for await item in genStream {
+                        for await item in generation.stream {
+                            assistant.consume(item)
+
                             // collect tool calls for dispatch; if no
                             // toolDispatch the caller handles them via
                             // the transform (streamDetails path)
@@ -1470,7 +1844,8 @@ public final class ChatSession {
                                 pendingToolCalls.append(toolCall)
                             } else if let value = transform(item) {
                                 if case .terminated = continuation.yield(value) {
-                                    genTask.cancel()
+                                    assistant.wasTerminatedByConsumer = true
+                                    generation.task.cancel()
                                     break
                                 }
                             }
@@ -1478,32 +1853,55 @@ public final class ChatSession {
 
                         // The generation task is unstructured, so cancellation of
                         // this task (stream onTermination) does not propagate to
-                        // it. Without an explicit cancel, `await genTask.value`
+                        // it. Without an explicit cancel, awaiting its value
                         // would wait for the FULL generation while holding the
                         // cache lock — deadlocking the session's next call (e.g.
                         // a caller that cancels mid-stream and immediately asks
                         // again). The generate loop checks Task.isCancelled per
                         // token, so this stops it promptly.
                         if Task.isCancelled {
-                            genTask.cancel()
+                            assistant.wasTerminatedByConsumer = true
+                            generation.task.cancel()
                         }
 
                         // wait for the task to complete -- this is important in
                         // the case where we broke the loop early as the generation
                         // work may continue (briefly) and use the KVCache
-                        await genTask.value
+                        let generatedTokens = await generation.task.value
+
                         if let generationStateSink {
                             lmState = generationStateSink.load()
+                        }
+
+                        if var currentConversation = conversation {
+                            let recordedAssistant = currentConversation.record(
+                                assistant,
+                                generatedTokens: generatedTokens,
+                                cacheOffset: kvCache.first?.offset)
+                            if !recordedAssistant,
+                                let conversationMessageCountBeforePending
+                            {
+                                // A cancelled or empty generation did not commit an
+                                // assistant turn. Roll back this restart's pending input
+                                // so a later request cannot produce invalid role sequences
+                                // such as user/user on strict chat templates.
+                                currentConversation.messages.removeSubrange(
+                                    conversationMessageCountBeforePending...)
+                            }
+                            conversation = currentConversation
                         }
 
                         // dispatch all tool calls from this generation pass
                         if let toolDispatch, !pendingToolCalls.isEmpty,
                             !Task.isCancelled
                         {
-                            messages.append(.assistant("", toolCalls: pendingToolCalls))
+                            if conversation == nil {
+                                pendingMessages.append(
+                                    .assistant("", toolCalls: pendingToolCalls))
+                            }
                             for toolCall in pendingToolCalls {
                                 let toolResult = try await toolDispatch(toolCall)
-                                messages.append(.tool(toolResult, id: toolCall.id))
+                                pendingMessages.append(.tool(toolResult, id: toolCall.id))
                             }
                             continue restart
                         }
@@ -1511,7 +1909,9 @@ public final class ChatSession {
 
                     // Store the carried state back alongside the KV cache so
                     // the next turn resumes with correct position anchoring.
-                    cache = .kvcache(kvCache, draftKVCache: draftKVCache, state: lmState)
+                    cache = .kvcache(
+                        kvCache, draftKVCache: draftKVCache, state: lmState,
+                        conversation: conversation)
 
                     continuation.finish()
                 }
@@ -1576,7 +1976,7 @@ public final class ChatSession {
     {
         try await cache.read { cache in
             switch cache {
-            case .kvcache(let cache, _, _):
+            case .kvcache(let cache, _, _, _):
                 return try await body(cache)
             default:
                 return try await body(nil)
@@ -1588,6 +1988,12 @@ public final class ChatSession {
     ///
     /// Use one of the initializers that accept a `cache` parameter together with
     /// ``loadPromptCache(url:)`` to restore the saved cache in a future session.
+    ///
+    /// > Important: This saves raw KV state only. It does not save the structured
+    /// > transcript retained by `ChatSession`. A restored raw cache therefore uses
+    /// > fragment-based continuation and is not suitable for conversation-aware
+    /// > structured tool continuations. Persist the messages separately and restore
+    /// > them with a history initializer when the transcript is required.
     ///
     /// - Parameter url: the file URL to write the cache to
     /// - Throws: ``ChatSessionError/noCacheAvailable`` if no generation or prefill has occurred,
@@ -1623,7 +2029,7 @@ public final class ChatSession {
 
         try await cache.read { cache in
             switch cache {
-            case .kvcache(let cache, _, _):
+            case .kvcache(let cache, _, _, _):
                 try savePromptCache(url: url, cache: cache, metadata: persistedMetadata)
             default:
                 throw ChatSessionError.noCacheAvailable
@@ -1688,9 +2094,16 @@ public final class ChatSession {
 public enum ChatSessionError: LocalizedError {
     /// ``ChatSession/saveCache(to:)`` was called before any generation occurred.
     case noCacheAvailable
+    /// The processor produced no tokens for generation.
+    case emptyPreparedInput
 
     public var errorDescription: String? {
-        "No KV cache is available. Call respond() or streamResponse() before saveCache(to:)."
+        switch self {
+        case .noCacheAvailable:
+            "No KV cache is available. Call respond() or streamResponse() before saveCache(to:)."
+        case .emptyPreparedInput:
+            "The chat template produced no uncached tokens for generation."
+        }
     }
 }
 

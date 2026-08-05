@@ -45,11 +45,13 @@ public enum LLMTypeRegistry {
         "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
         "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
+        "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
         "starcoder2": create(Starcoder2Configuration.self, Starcoder2Model.init),
         "cohere": create(CohereConfiguration.self, CohereModel.init),
         "openelm": create(OpenElmConfiguration.self, OpenELMModel.init),
         "internlm2": create(InternLM2Configuration.self, InternLM2Model.init),
+        "deepseek_v2": create(DeepseekV2Configuration.self, DeepseekV2Model.init),
         "deepseek_v3": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
         "granite": create(GraniteConfiguration.self, GraniteModel.init),
         "granitemoehybrid": create(
@@ -82,6 +84,7 @@ public enum LLMTypeRegistry {
         "mamba2": create(Mamba2Configuration.self, Mamba2Model.init),
         "mistral3": create(Mistral3TextConfiguration.self, Mistral3TextModel.init),
         "apertus": create(ApertusConfiguration.self, ApertusModel.init),
+        "hunyuan_v1_dense": create(HunyuanConfiguration.self, HunyuanModel.init),
         "nemotron_labs_diffusion": create(
             NemotronLabsDiffusionConfiguration.self, NemotronLabsDiffusionModel.init),
     ])
@@ -121,7 +124,7 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
     static public let deepSeekR1_7B_4bit = ModelConfiguration(
         id: "mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit",
         defaultPrompt: "Is 9.9 greater or 9.11?",
-        thinkingSupport: .alwaysOn(startTag: "<think>", endTag: "</think>")
+        reasoningConfig: .alwaysOnThinking
     )
 
     static public let falconH1R7B = ModelConfiguration(
@@ -211,6 +214,26 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<turn|>"]
     )
 
+    static public let hunyuan_mt_7b_4bit = ModelConfiguration(
+        id: "mlx-community/Hunyuan-MT-7B-4bit",
+        defaultPrompt: "Translate the following text into Chinese: Hello, how are you?"
+    )
+
+    static public let hunyuan_mt_7b_8bit = ModelConfiguration(
+        id: "mlx-community/Hunyuan-MT-7B-8bit",
+        defaultPrompt: "Translate the following text into Chinese: Hello, how are you?"
+    )
+
+    static public let hy_mt2_7b_4bit = ModelConfiguration(
+        id: "mlx-community/Hy-MT2-7B-4bit",
+        defaultPrompt: "Translate the following text into Chinese: Hello, how are you?"
+    )
+
+    static public let hy_mt2_7b_8bit = ModelConfiguration(
+        id: "mlx-community/Hy-MT2-7B-8bit",
+        defaultPrompt: "Translate the following text into Chinese: Hello, how are you?"
+    )
+
     static public let qwen205b4bit = ModelConfiguration(
         id: "mlx-community/Qwen1.5-0.5B-Chat-4bit",
         defaultPrompt: "why is the sky blue?",
@@ -263,7 +286,7 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         id: "mlx-community/Qwen3.5-2B-4bit",
         defaultPrompt: "Why is the sky blue?",
         extraEOSTokens: ["<|im_end|>"],
-        thinkingSupport: .toggleableViaTemplate(contextKey: "enable_thinking")
+        reasoningConfig: .thinkTagsWithEnableThinking
     )
 
     static public let qwen3_6_27b_4bit = ModelConfiguration(
@@ -305,7 +328,7 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
     static public let deepseek_r1_4bit = ModelConfiguration(
         id: "mlx-community/DeepSeek-R1-4bit",
         defaultPrompt: "Tell me about the history of Spain.",
-        thinkingSupport: .alwaysOn(startTag: "<think>", endTag: "</think>")
+        reasoningConfig: .alwaysOnThinking
     )
 
     static public let granite3_3_2b_4bit = ModelConfiguration(
@@ -426,6 +449,10 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             gemma3n_E2B_it_lm_4bit,
             gemma4_e4b_it_4bit,
             gemma4_e2b_it_4bit,
+            hunyuan_mt_7b_4bit,
+            hunyuan_mt_7b_8bit,
+            hy_mt2_7b_4bit,
+            hy_mt2_7b_8bit,
             granite3_3_2b_4bit,
             granite_4_0_h_tiny_4bit_dwq,
             llama3_1_8B_4bit,
@@ -527,10 +554,12 @@ public final class LLMModelFactory: GenericModelFactory {
     public typealias ContainerType = ModelContainer
 
     public init(
-        typeRegistry: ModelTypeRegistry<LanguageModel>, modelRegistry: AbstractModelRegistry
+        typeRegistry: ModelTypeRegistry<LanguageModel>, modelRegistry: AbstractModelRegistry,
+        conventionsRegistry: ChatConventionsRegistry = .shared
     ) {
         self.typeRegistry = typeRegistry
         self.modelRegistry = modelRegistry
+        self.conventionsRegistry = conventionsRegistry
     }
 
     /// Shared instance with default behavior.
@@ -543,9 +572,55 @@ public final class LLMModelFactory: GenericModelFactory {
     /// registry of model id to configuration, e.g. `mlx-community/Llama-3.2-3B-Instruct-4bit`
     public let modelRegistry: AbstractModelRegistry
 
+    /// resolvers for chat conventions that are keyed on model id rather than declared
+    /// by the model itself, e.g. DeepSeek-R1
+    public let conventionsRegistry: ChatConventionsRegistry
+
     public func _load(
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
+    ) async throws -> ModelContext {
+        try await _load(configuration: configuration, tokenizerLoader: tokenizerLoader, lazy: false)
+    }
+
+    public func _load(
+        configuration: ResolvedModelConfiguration,
+        tokenizerLoader: any TokenizerLoader,
+        lazy: Bool
+    ) async throws -> ModelContext {
+        try await load(
+            configuration: configuration,
+            tokenizerLoader: tokenizerLoader,
+            lazy: lazy,
+            preparingModel: nil
+        )
+    }
+
+    /// Loads a local model after the caller has had a chance to reduce its
+    /// module tree and select the matching subset of weight tensors.
+    ///
+    /// This is intended for pipeline-parallel runtimes. Calling the ordinary
+    /// `load(from:using:lazy:)` path first would attach every transformer
+    /// layer before the runtime can discard the remote ones.
+    public func load(
+        selectivelyFrom directory: URL,
+        using tokenizerLoader: any TokenizerLoader,
+        lazy: Bool = false,
+        preparingModel: @Sendable @escaping (any LanguageModel) throws -> WeightLoadingSelection?
+    ) async throws -> sending ModelContext {
+        try await load(
+            configuration: .init(directory: directory),
+            tokenizerLoader: tokenizerLoader,
+            lazy: lazy,
+            preparingModel: preparingModel
+        )
+    }
+
+    private func load(
+        configuration: ResolvedModelConfiguration,
+        tokenizerLoader: any TokenizerLoader,
+        lazy: Bool,
+        preparingModel: (@Sendable (any LanguageModel) throws -> WeightLoadingSelection?)?
     ) async throws -> ModelContext {
         let modelDirectory = configuration.modelDirectory
 
@@ -576,7 +651,7 @@ public final class LLMModelFactory: GenericModelFactory {
         }
 
         // Load EOS token IDs from config.json, with optional override from generation_config.json
-        var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
+        var eosTokenIds = baseConfig.effectiveEOSTokenIds
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         let generationConfig: GenerationConfigFile? =
             if let generationData = try? Data(contentsOf: generationConfigURL) {
@@ -592,19 +667,35 @@ public final class LLMModelFactory: GenericModelFactory {
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
         mutableConfiguration.stopStrings.formUnion(generationConfig?.stopStrings ?? [])
+        // Chat conventions. Precedence: an explicit value on the configuration
+        // (registry entry or caller) wins; then a registered resolver, which sees
+        // the repo id the model cannot; then the model's own declaration.
+        let modelId = configuration.name
         if mutableConfiguration.toolCallFormat == nil {
-            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
-                from: baseConfig.modelType, configData: configData)
+            mutableConfiguration.toolCallFormat =
+                conventionsRegistry.toolCallFormat(
+                    modelId: modelId, modelType: baseConfig.modelType)
+                ?? model.toolCallFormat
         }
-        mutableConfiguration.inferThinkingSupportIfNeeded()
-
+        if mutableConfiguration.reasoningConfig == nil {
+            mutableConfiguration.reasoningConfig =
+                conventionsRegistry.reasoningConfig(
+                    modelId: modelId, modelType: baseConfig.modelType)
+                ?? model.reasoningConfig
+                ?? ReasoningConfig.infer(fromTokenizerDirectory: configuration.tokenizerDirectory)
+        }
         // Load tokenizer and weights in parallel
         async let tokenizerTask = tokenizerLoader.load(
             from: configuration.tokenizerDirectory)
 
+        let selection = try preparingModel?(model)
+
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization)
+            perLayerQuantization: baseConfig.perLayerQuantization,
+            lazy: lazy,
+            selection: selection
+        )
 
         let tokenizer = try await tokenizerTask
 
@@ -628,7 +719,7 @@ public final class LLMModelFactory: GenericModelFactory {
             stopStrings: mutableConfiguration.stopStrings,
             eosTokenIds: mutableConfiguration.eosTokenIds,
             toolCallFormat: mutableConfiguration.toolCallFormat,
-            thinkingSupport: mutableConfiguration.thinkingSupport)
+            reasoningConfig: mutableConfiguration.reasoningConfig)
 
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,

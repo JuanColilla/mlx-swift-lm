@@ -12,7 +12,7 @@ import MLXNN
 
 // port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3_moe.py
 
-class Qwen3MoEAttention: Module {
+public class Qwen3MoEAttention: Module {
     let args: Qwen3MoEConfiguration
     let scale: Float
 
@@ -95,7 +95,7 @@ class Qwen3MoEAttention: Module {
     }
 }
 
-class Qwen3MoEMLP: Module, UnaryLayer {
+public class Qwen3MoEMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
@@ -111,7 +111,7 @@ class Qwen3MoEMLP: Module, UnaryLayer {
     }
 }
 
-class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
+public class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
     let numExperts: Int
     let topK: Int
     let normTopkProb: Bool
@@ -130,7 +130,7 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
         )
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let gates = gate(x)
         let softGates = MLX.softmax(gates, axis: -1, precise: true)
 
@@ -147,7 +147,7 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
     }
 }
 
-class Qwen3MoeDecoderLayer: Module {
+public class Qwen3MoeDecoderLayer: Module, TransformerLayer {
     let args: Qwen3MoEConfiguration
     let layerIdx: Int
 
@@ -176,7 +176,7 @@ class Qwen3MoeDecoderLayer: Module {
         }
     }
 
-    func callAsFunction(
+    public func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         var r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
@@ -190,7 +190,7 @@ class Qwen3MoeDecoderLayer: Module {
 public class Qwen3MoEModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    fileprivate let layers: [Qwen3MoeDecoderLayer]
+    public var layers: [TransformerLayer]
     let norm: RMSNorm
     let args: Qwen3MoEConfiguration
 
@@ -223,7 +223,7 @@ public class Qwen3MoEModelInner: Module {
 
 public class Qwen3MoEModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
-    public let kvHeads: [Int]
+    public var kvHeads: [Int]
 
     public let model: Qwen3MoEModelInner
     let configuration: Qwen3MoEConfiguration
@@ -258,20 +258,28 @@ public class Qwen3MoEModel: Module, LLMModel, KVCacheDimensionProvider {
             sanitizedWeights["lm_head.weight"] = nil
         }
 
-        if sanitizedWeights["model.layers.0.mlp.experts.0.up_proj.weight"] == nil {
-            return sanitizedWeights
-        }
+        let presentLayers = Set(weights.keys.compactMap { key -> Int? in
+            guard key.hasPrefix("model.layers."), key.contains(".mlp.experts.") else {
+                return nil
+            }
+            let remainder = key.dropFirst("model.layers.".count)
+            let digits = remainder.prefix { $0.isNumber }
+            return Int(digits)
+        })
 
-        for l in 0 ..< configuration.hiddenLayers {
+        for l in presentLayers.sorted() {
             let prefix = "model.layers.\(l)"
             for n in ["up_proj", "down_proj", "gate_proj"] {
-                if sanitizedWeights["\(prefix).mlp.experts.0.\(n).weight"] != nil {
-                    let toJoin = (0 ..< configuration.numExperts).map { e in
-                        sanitizedWeights.removeValue(
-                            forKey: "\(prefix).mlp.experts.\(e).\(n).weight")!
-                    }
-                    sanitizedWeights["\(prefix).mlp.switch_mlp.\(n).weight"] = MLX.stacked(toJoin)
+                let expertCount = configuration.numExperts
+                let toJoin = (0 ..< expertCount).compactMap { expert in
+                    weights["\(prefix).mlp.experts.\(expert).\(n).weight"]
                 }
+                guard toJoin.count == expertCount else { continue }
+                for expert in 0 ..< expertCount {
+                    sanitizedWeights.removeValue(
+                        forKey: "\(prefix).mlp.experts.\(expert).\(n).weight")
+                }
+                sanitizedWeights["\(prefix).mlp.switch_mlp.\(n).weight"] = MLX.stacked(toJoin)
             }
         }
 
@@ -363,4 +371,10 @@ extension Qwen3MoEModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
     }
+}
+
+// MARK: - Chat conventions
+
+extension Qwen3MoEModel {
+    public var reasoningConfig: ReasoningConfig? { .thinkTagsWithEnableThinking }
 }

@@ -264,7 +264,7 @@ class LFM2MLP: Module, UnaryLayer {
     }
 }
 
-class LFM2DecoderLayer: Module {
+class LFM2DecoderLayer: Module, TransformerLayer {
     let isAttentionLayer: Bool
 
     @ModuleInfo(key: "self_attn") var attention: LFM2Attention?
@@ -313,7 +313,7 @@ public class LFM2ModelInner: Module {
     let vocabularySize: Int
     let numHiddenLayers: Int
 
-    fileprivate let layers: [LFM2DecoderLayer]
+    public var layers: [TransformerLayer]
 
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo(key: "embedding_norm") var embeddingNorm: RMSNorm
@@ -359,10 +359,11 @@ public class LFM2ModelInner: Module {
 
 public class LFM2Model: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
-    public let kvHeads: [Int]
+    public var kvHeads: [Int]
 
     public let model: LFM2ModelInner
     let configuration: LFM2Configuration
+    public var shardOffset: Int = 0
 
     public init(_ args: LFM2Configuration) {
         self.configuration = args
@@ -399,8 +400,8 @@ public class LFM2Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        (0 ..< configuration.hiddenLayers).map { layerIdx in
-            if configuration.fullAttnIdxs.contains(layerIdx) {
+        model.layers.indices.map { layerIdx in
+            if configuration.fullAttnIdxs.contains(layerIdx + shardOffset) {
                 KVCacheSimple()
             } else {
                 MambaCache()
@@ -413,4 +414,10 @@ extension LFM2Model: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
     }
+}
+
+// MARK: - Chat conventions
+
+extension LFM2Model {
+    public var toolCallFormat: ToolCallFormat? { .lfm2 }
 }

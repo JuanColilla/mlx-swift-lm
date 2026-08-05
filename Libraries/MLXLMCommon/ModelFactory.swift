@@ -66,7 +66,7 @@ public protocol ModelConfigurationValidating {
 /// This contains the following:
 ///
 /// - ``ModelConfiguration``: identifier for the model
-/// - ``LanguageModel``: the model itself, see ``generate(input:cache:parameters:context:wiredMemoryTicket:tools:)``
+/// - ``LanguageModel``: the model itself, see ``generate(input:cache:parameters:context:components:wiredMemoryTicket:tools:)``
 /// - ``UserInputProcessor``: can convert ``UserInput`` into ``LMInput``
 /// - `Tokenizer` -- the tokenizer used by ``UserInputProcessor``
 ///
@@ -118,11 +118,33 @@ public protocol GenericModelFactory<ContextType, ContainerType>: Sendable {
         tokenizerLoader: any TokenizerLoader
     ) async throws -> ContextType
 
+    /// Variant of ``_load(configuration:tokenizerLoader:)`` that additionally accepts a
+    /// `lazy` flag: when `true`, conforming factories that support pipeline-parallel
+    /// sharding leave weight arrays as an unevaluated MLX graph so that layers discarded
+    /// after sharding never materialize into RAM. Factories that don't support this
+    /// (``EmbedderModelFactory``, ``MTPDrafterModelFactory``) fall back to the default
+    /// implementation below, which ignores `lazy` and forwards to the non-lazy overload.
+    func _load(
+        configuration: ResolvedModelConfiguration,
+        tokenizerLoader: any TokenizerLoader,
+        lazy: Bool
+    ) async throws -> ContextType
+
     /// Wrap a ``ContextType`` in a ``ContainerType``.
     ///
     /// The `ContainerType` is a `Sendable` container for managing the model contained
     /// in the `ContextType`.
     func _wrap(_ context: ContextType) -> ContainerType
+}
+
+extension GenericModelFactory {
+    public func _load(
+        configuration: ResolvedModelConfiguration,
+        tokenizerLoader: any TokenizerLoader,
+        lazy: Bool
+    ) async throws -> ContextType {
+        try await _load(configuration: configuration, tokenizerLoader: tokenizerLoader)
+    }
 }
 
 extension GenericModelFactory {
@@ -161,12 +183,14 @@ extension GenericModelFactory {
         using tokenizerLoader: any TokenizerLoader,
         configuration: ModelConfiguration,
         useLatest: Bool = false,
+        lazy: Bool = false,
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
     ) async throws -> sending ContextType {
         let resolved = try await resolve(
             configuration: configuration, from: downloader,
             useLatest: useLatest, progressHandler: progressHandler)
-        return try await _load(configuration: resolved, tokenizerLoader: tokenizerLoader)
+        return try await _load(
+            configuration: resolved, tokenizerLoader: tokenizerLoader, lazy: lazy)
     }
 
     /// Load a model from a ``Downloader`` and ``ModelConfiguration``,
@@ -176,12 +200,14 @@ extension GenericModelFactory {
         using tokenizerLoader: any TokenizerLoader,
         configuration: ModelConfiguration,
         useLatest: Bool = false,
+        lazy: Bool = false,
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
     ) async throws -> ContainerType {
         let resolved = try await resolve(
             configuration: configuration, from: downloader,
             useLatest: useLatest, progressHandler: progressHandler)
-        let context = try await _load(configuration: resolved, tokenizerLoader: tokenizerLoader)
+        let context = try await _load(
+            configuration: resolved, tokenizerLoader: tokenizerLoader, lazy: lazy)
         return _wrap(context)
     }
 
@@ -191,19 +217,23 @@ extension GenericModelFactory {
     /// the given directory.
     public func load(
         from directory: URL,
-        using tokenizerLoader: any TokenizerLoader
+        using tokenizerLoader: any TokenizerLoader,
+        lazy: Bool = false
     ) async throws -> sending ContextType {
         try await _load(
-            configuration: .init(directory: directory), tokenizerLoader: tokenizerLoader)
+            configuration: .init(directory: directory), tokenizerLoader: tokenizerLoader,
+            lazy: lazy)
     }
 
     /// Load a model from a local directory, producing a ``ModelContainer``.
     public func loadContainer(
         from directory: URL,
-        using tokenizerLoader: any TokenizerLoader
+        using tokenizerLoader: any TokenizerLoader,
+        lazy: Bool = false
     ) async throws -> ContainerType {
         let context = try await _load(
-            configuration: .init(directory: directory), tokenizerLoader: tokenizerLoader)
+            configuration: .init(directory: directory), tokenizerLoader: tokenizerLoader,
+            lazy: lazy)
         return _wrap(context)
     }
 
@@ -281,12 +311,13 @@ public func loadModel(
     using tokenizerLoader: any TokenizerLoader,
     configuration: ModelConfiguration,
     useLatest: Bool = false,
+    lazy: Bool = false,
     progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
 ) async throws -> sending ModelContext {
     try await load {
         try await $0.load(
             from: downloader, using: tokenizerLoader, configuration: configuration,
-            useLatest: useLatest, progressHandler: progressHandler)
+            useLatest: useLatest, lazy: lazy, progressHandler: progressHandler)
     }
 }
 
@@ -307,12 +338,13 @@ public func loadModelContainer(
     using tokenizerLoader: any TokenizerLoader,
     configuration: ModelConfiguration,
     useLatest: Bool = false,
+    lazy: Bool = false,
     progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
 ) async throws -> sending ModelContainer {
     try await load {
         try await $0.loadContainer(
             from: downloader, using: tokenizerLoader, configuration: configuration,
-            useLatest: useLatest, progressHandler: progressHandler)
+            useLatest: useLatest, lazy: lazy, progressHandler: progressHandler)
     }
 }
 
@@ -335,13 +367,14 @@ public func loadModel(
     id: String,
     revision: String = "main",
     useLatest: Bool = false,
+    lazy: Bool = false,
     progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
 ) async throws -> sending ModelContext {
     try await load {
         try await $0.load(
             from: downloader, using: tokenizerLoader,
             configuration: .init(id: id, revision: revision),
-            useLatest: useLatest, progressHandler: progressHandler)
+            useLatest: useLatest, lazy: lazy, progressHandler: progressHandler)
     }
 }
 
@@ -364,13 +397,14 @@ public func loadModelContainer(
     id: String,
     revision: String = "main",
     useLatest: Bool = false,
+    lazy: Bool = false,
     progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
 ) async throws -> sending ModelContainer {
     try await load {
         try await $0.loadContainer(
             from: downloader, using: tokenizerLoader,
             configuration: .init(id: id, revision: revision),
-            useLatest: useLatest, progressHandler: progressHandler)
+            useLatest: useLatest, lazy: lazy, progressHandler: progressHandler)
     }
 }
 
@@ -385,10 +419,11 @@ public func loadModelContainer(
 /// - Returns: a ``ModelContext``
 public func loadModel(
     from directory: URL,
-    using tokenizerLoader: any TokenizerLoader
+    using tokenizerLoader: any TokenizerLoader,
+    lazy: Bool = false
 ) async throws -> sending ModelContext {
     try await load {
-        try await $0.load(from: directory, using: tokenizerLoader)
+        try await $0.load(from: directory, using: tokenizerLoader, lazy: lazy)
     }
 }
 
@@ -403,10 +438,11 @@ public func loadModel(
 /// - Returns: a ``ModelContainer``
 public func loadModelContainer(
     from directory: URL,
-    using tokenizerLoader: any TokenizerLoader
+    using tokenizerLoader: any TokenizerLoader,
+    lazy: Bool = false
 ) async throws -> sending ModelContainer {
     try await load {
-        try await $0.loadContainer(from: directory, using: tokenizerLoader)
+        try await $0.loadContainer(from: directory, using: tokenizerLoader, lazy: lazy)
     }
 }
 

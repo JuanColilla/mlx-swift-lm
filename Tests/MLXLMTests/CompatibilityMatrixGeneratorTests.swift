@@ -48,12 +48,12 @@ struct CompatibilityMatrixGeneratorTests {
         print("\n### LLM recommended models (\(llmModels.count) registered)")
         for model in llmModels {
             let toolFormat = model.toolCallFormat?.rawValue ?? "-"
-            let thinking = model.thinkingSupport.map(describeThinkingSupport) ?? "-"
+            let reasoning = model.reasoningConfig.map(describeReasoningConfig) ?? "-"
             let eos =
                 model.extraEOSTokens.isEmpty
                 ? "-" : model.extraEOSTokens.sorted().joined(separator: ",")
             print(
-                "- \(model.name) | toolCallFormat=\(toolFormat) | thinking=\(thinking) | extraEOS=\(eos)"
+                "- \(model.name) | toolCallFormat=\(toolFormat) | reasoning=\(reasoning) | extraEOS=\(eos)"
             )
         }
 
@@ -74,14 +74,14 @@ struct CompatibilityMatrixGeneratorTests {
         #expect(!embedderTypes.isEmpty)
     }
 
-    private func describeThinkingSupport(_ support: ThinkingSupport) -> String {
-        switch support {
+    private func describeReasoningConfig(_ config: ReasoningConfig) -> String {
+        switch config.promptStrategy {
         case .none:
             "none"
-        case .toggleableViaTemplate(let contextKey):
-            "template-toggle(\(contextKey))"
-        case .alwaysOn(let startTag, let endTag):
-            "always-on(\(startTag)…\(endTag))"
+        case .templateFlag(let key, let defaultOn):
+            "template-toggle(\(key),default=\(defaultOn))"
+        case .alwaysOn:
+            "always-on(\(config.startDelimiter)…\(config.endDelimiter))"
         }
     }
 }

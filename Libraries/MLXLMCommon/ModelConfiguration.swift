@@ -119,8 +119,8 @@ public struct ModelConfiguration: Sendable {
     /// Tool call format for this model (nil = default JSON format)
     public var toolCallFormat: ToolCallFormat?
 
-    /// How the model exposes extended reasoning, or `nil` when it is unknown.
-    public var thinkingSupport: ThinkingSupport?
+    /// Reasoning (chain-of-thought) protocol for this model (nil = non-reasoning model)
+    public var reasoningConfig: ReasoningConfig? = nil
 
     public init(
         id: String, revision: String = "main",
@@ -130,27 +130,7 @@ public struct ModelConfiguration: Sendable {
         stopStrings: Set<String>? = nil,
         eosTokenIds: Set<Int> = [],
         toolCallFormat: ToolCallFormat? = nil,
-    ) {
-        self.init(
-            id: id, revision: revision,
-            tokenizerSource: tokenizerSource,
-            defaultPrompt: defaultPrompt,
-            extraEOSTokens: extraEOSTokens,
-            stopStrings: stopStrings,
-            eosTokenIds: eosTokenIds,
-            toolCallFormat: toolCallFormat,
-            thinkingSupport: nil)
-    }
-
-    public init(
-        id: String, revision: String = "main",
-        tokenizerSource: TokenizerSource? = nil,
-        defaultPrompt: String = "",
-        extraEOSTokens: Set<String> = [],
-        stopStrings: Set<String>? = nil,
-        eosTokenIds: Set<Int> = [],
-        toolCallFormat: ToolCallFormat? = nil,
-        thinkingSupport: ThinkingSupport?
+        reasoningConfig: ReasoningConfig? = nil
     ) {
         self.id = .id(id, revision: revision)
         self.tokenizerSource = tokenizerSource
@@ -159,7 +139,7 @@ public struct ModelConfiguration: Sendable {
         self.stopStrings = stopStrings
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
-        self.thinkingSupport = thinkingSupport
+        self.reasoningConfig = reasoningConfig
     }
 
     public init(
@@ -170,27 +150,7 @@ public struct ModelConfiguration: Sendable {
         stopStrings: Set<String>? = nil,
         eosTokenIds: Set<Int> = [],
         toolCallFormat: ToolCallFormat? = nil,
-    ) {
-        self.init(
-            directory: directory,
-            tokenizerSource: tokenizerSource,
-            defaultPrompt: defaultPrompt,
-            extraEOSTokens: extraEOSTokens,
-            stopStrings: stopStrings,
-            eosTokenIds: eosTokenIds,
-            toolCallFormat: toolCallFormat,
-            thinkingSupport: nil)
-    }
-
-    public init(
-        directory: URL,
-        tokenizerSource: TokenizerSource? = nil,
-        defaultPrompt: String = "",
-        extraEOSTokens: Set<String> = [],
-        stopStrings: Set<String>? = nil,
-        eosTokenIds: Set<Int> = [],
-        toolCallFormat: ToolCallFormat? = nil,
-        thinkingSupport: ThinkingSupport?
+        reasoningConfig: ReasoningConfig? = nil
     ) {
         self.id = .directory(directory)
         self.tokenizerSource = tokenizerSource
@@ -199,7 +159,7 @@ public struct ModelConfiguration: Sendable {
         self.stopStrings = stopStrings
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
-        self.thinkingSupport = thinkingSupport
+        self.reasoningConfig = reasoningConfig
     }
 
     /// Maps this configuration's behavioral properties into a
@@ -219,7 +179,7 @@ public struct ModelConfiguration: Sendable {
             stopStrings: stopStrings,
             eosTokenIds: eosTokenIds,
             toolCallFormat: toolCallFormat,
-            thinkingSupport: thinkingSupport)
+            reasoningConfig: reasoningConfig)
     }
 
 }
