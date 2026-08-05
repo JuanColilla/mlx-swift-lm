@@ -28,6 +28,30 @@ import Testing
         #expect(sanitized["model.layers.5.mlp.switch_mlp.gate_proj.weight"] != nil)
     }
 
+    @Test func deepseekV3SanitizeSkipsIncompleteExpertLayer() throws {
+        let model = DeepseekV3Model(try Self.deepseekV3Configuration())
+        let sanitized = model.sanitize(weights: Self.partialExpertWeightsWithIncompleteLayer())
+
+        #expect(sanitized["model.layers.5.mlp.switch_mlp.gate_proj.weight"] == nil)
+        #expect(sanitized["model.layers.6.mlp.switch_mlp.gate_proj.weight"] != nil)
+    }
+
+    @Test func qwen3MoESanitizeSkipsIncompleteExpertLayer() throws {
+        let model = Qwen3MoEModel(try Self.qwen3MoEConfiguration())
+        let sanitized = model.sanitize(weights: Self.partialExpertWeightsWithIncompleteLayer())
+
+        #expect(sanitized["model.layers.5.mlp.switch_mlp.gate_proj.weight"] == nil)
+        #expect(sanitized["model.layers.6.mlp.switch_mlp.gate_proj.weight"] != nil)
+    }
+
+    @Test func qwen3NextSanitizeSkipsIncompleteExpertLayer() throws {
+        let model = Qwen3NextModel(try Self.qwen3NextConfiguration())
+        let sanitized = model.sanitize(weights: Self.partialExpertWeightsWithIncompleteLayer())
+
+        #expect(sanitized["model.layers.5.mlp.switch_mlp.gate_proj.weight"] == nil)
+        #expect(sanitized["model.layers.6.mlp.switch_mlp.gate_proj.weight"] != nil)
+    }
+
     private static func partialExpertWeights() -> [String: MLXArray] {
         var weights: [String: MLXArray] = [:]
         for layer in 4 ..< 8 {
@@ -39,6 +63,12 @@ import Testing
                 }
             }
         }
+        return weights
+    }
+
+    private static func partialExpertWeightsWithIncompleteLayer() -> [String: MLXArray] {
+        var weights = partialExpertWeights()
+        weights["model.layers.5.mlp.experts.1.gate_proj.weight"] = nil
         return weights
     }
 
