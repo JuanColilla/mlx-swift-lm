@@ -459,15 +459,26 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             }
         }
 
-        for l in 0 ..< args.numHiddenLayers {
+        let presentLayers = Set(weights.keys.compactMap { key -> Int? in
+            guard key.hasPrefix("model.layers."), key.contains(".mlp.experts.") else {
+                return nil
+            }
+            let remainder = key.dropFirst("model.layers.".count)
+            let digits = remainder.prefix { $0.isNumber }
+            return Int(digits)
+        })
+
+        for l in presentLayers.sorted() {
             let prefix = "model.layers.\(l)"
             for (_, projName) in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")] {
                 for key in ["weight", "scales", "biases"] {
                     let firstKey = "\(prefix).mlp.experts.0.\(projName).\(key)"
                     if weights[firstKey] != nil {
-                        let joined = (0 ..< (args.nRoutedExperts ?? 1)).map {
-                            weights["\(prefix).mlp.experts.\($0).\(projName).\(key)"]!
+                        let expertCount = args.nRoutedExperts ?? 1
+                        let joined = (0 ..< expertCount).compactMap {
+                            weights["\(prefix).mlp.experts.\($0).\(projName).\(key)"]
                         }
+                        guard joined.count == expertCount else { continue }
                         newWeights["\(prefix).mlp.switch_mlp.\(projName).\(key)"] = stacked(joined)
                     }
                 }
