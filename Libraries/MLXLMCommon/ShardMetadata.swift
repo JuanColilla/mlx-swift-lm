@@ -17,6 +17,7 @@ public struct MemorySize: Codable, Hashable, Sendable {
 /// particular node's hardware.
 public struct ModelMetadata: Codable, Hashable, Sendable {
     public let modelId: String
+    public let modelType: String
     public let prettyName: String
     public let storageSize: MemorySize
     public let nLayers: Int
@@ -25,6 +26,7 @@ public struct ModelMetadata: Codable, Hashable, Sendable {
 
     public init(
         modelId: String,
+        modelType: String,
         prettyName: String,
         storageSize: MemorySize,
         nLayers: Int,
@@ -32,6 +34,7 @@ public struct ModelMetadata: Codable, Hashable, Sendable {
         supportsTensor: Bool = false
     ) {
         self.modelId = modelId
+        self.modelType = modelType
         self.prettyName = prettyName
         self.storageSize = storageSize
         self.nLayers = nLayers
