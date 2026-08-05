@@ -8,6 +8,77 @@ import MLXLMCommon
 
 // MARK: - Auto Parallel Entry Point
 
+public enum PipelineWeightLayout {
+    public static func sourcePrefixes(forModelType modelType: String) -> [String]? {
+        switch modelType {
+        case "llama", "deepseek_v3", "qwen3_moe", "qwen3", "lfm2", "gpt_oss", "glm4_moe_lite",
+            "qwen3_next":
+            return ["model.layers."]
+        case "qwen3_5", "qwen3_5_moe":
+            return [
+                "model.language_model.layers.", "language_model.model.layers.",
+                "model.layers.", "language_model.layers.", "layers.",
+            ]
+        default:
+            return nil
+        }
+    }
+
+    public static func destinationPrefix(forModelType modelType: String) -> String {
+        switch modelType {
+        case "qwen3_5", "qwen3_5_moe": return "language_model.model.layers."
+        default: return "model.layers."
+        }
+    }
+}
+
+public func pipelineAutoParallelSelection(
+    model: any LanguageModel, modelShardMeta: ShardMetadata
+) -> WeightLoadingSelection? {
+    let layers = getLayers(from: model)
+    guard !layers.isEmpty else { return nil }
+    let safeStart = max(0, min(modelShardMeta.startLayer, layers.count))
+    let safeEnd = max(safeStart, min(modelShardMeta.endLayer, layers.count))
+    guard safeStart < safeEnd else { return nil }
+
+    setLayers(on: model, newLayers: Array(layers[safeStart ..< safeEnd]), shardOffset: safeStart)
+
+    return .pipelineLayers(
+        range: safeStart ..< safeEnd,
+        sourcePrefixes: PipelineWeightLayout.sourcePrefixes(
+            forModelType: modelShardMeta.modelMeta.modelType) ?? ["model.layers."],
+        destinationPrefix: PipelineWeightLayout.destinationPrefix(
+            forModelType: modelShardMeta.modelMeta.modelType)
+    )
+}
+
+public func pipelineAutoParallelWrapBoundaries(
+    model: any LanguageModel, group: DistributedGroup, modelShardMeta: ShardMetadata
+) {
+    let layers = getLayers(from: model)
+    guard !layers.isEmpty else { return }
+    let deviceRank = modelShardMeta.deviceRank
+    let worldSize = modelShardMeta.worldSize
+
+    let first = PipelineFirstLayer(originalLayer: layers[0], r: deviceRank, group: group)
+    let last = PipelineLastLayer(
+        originalLayer: layers.last!, r: deviceRank, s: worldSize, group: group)
+    var wrapped = layers
+    wrapped[0] = first
+    wrapped[wrapped.count - 1] = last
+    if model is GPTOSSModel {
+        last.forceDType = .bfloat16
+    }
+    setLayers(
+        on: model,
+        newLayers: wrapped,
+        shardOffset: pipelineAutoParallelWrapBoundaryShardOffset(for: modelShardMeta))
+}
+
+func pipelineAutoParallelWrapBoundaryShardOffset(for modelShardMeta: ShardMetadata) -> Int {
+    modelShardMeta.startLayer
+}
+
 /// Shards a homogeneous-architecture model for pipeline parallelism: keeps only
 /// `modelShardMeta.startLayer..<modelShardMeta.endLayer` locally, and wraps the first/last
 /// layer of that range with the send/recv/allGather glue needed to stitch ranks together.
@@ -20,42 +91,10 @@ public func pipelineAutoParallel(
     group: DistributedGroup,
     modelShardMeta: ShardMetadata
 ) -> any LanguageModel {
-    let layers = getLayers(from: model)
-
-    guard !layers.isEmpty else {
-        print("Warning: pipelineAutoParallel could not find any layers in model")
+    guard pipelineAutoParallelSelection(model: model, modelShardMeta: modelShardMeta) != nil else {
         return model
     }
-
-    let startLayer = modelShardMeta.startLayer
-    let endLayer = modelShardMeta.endLayer
-    let deviceRank = modelShardMeta.deviceRank
-    let worldSize = modelShardMeta.worldSize
-
-    let safeStart = max(0, min(startLayer, layers.count))
-    let safeEnd = max(safeStart, min(endLayer, layers.count))
-
-    let subsetLayers = Array(layers[safeStart..<safeEnd])
-    guard !subsetLayers.isEmpty else {
-        print("Warning: pipelineAutoParallel layer range [\(safeStart), \(safeEnd)) is empty")
-        return model
-    }
-
-    let first = PipelineFirstLayer(originalLayer: subsetLayers[0], r: deviceRank, group: group)
-    let last = PipelineLastLayer(
-        originalLayer: subsetLayers.last!, r: deviceRank, s: worldSize, group: group)
-
-    var newLayers = subsetLayers
-    newLayers[0] = first
-    newLayers[newLayers.count - 1] = last
-    if model is GPTOSSModel {
-        // MLX GPTOSS bugged? layer output becomes f32 from bf16 — replicated as-is from
-        // Infer Ring, not re-investigated (ADR INV-MODEL-01).
-        last.forceDType = .bfloat16
-    }
-
-    setLayers(on: model, newLayers: newLayers, shardOffset: safeStart)
-
+    pipelineAutoParallelWrapBoundaries(model: model, group: group, modelShardMeta: modelShardMeta)
     return model
 }
 
