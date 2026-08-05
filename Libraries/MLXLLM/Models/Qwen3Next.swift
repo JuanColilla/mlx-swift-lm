@@ -564,21 +564,28 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
             sanitizedWeights[key] = nil
         }
 
-        if sanitizedWeights["model.layers.0.mlp.experts.0.up_proj.weight"] == nil {
-            return sanitizedWeights
-        }
+        let presentLayers = Set(weights.keys.compactMap { key -> Int? in
+            guard key.hasPrefix("model.layers."), key.contains(".mlp.experts.") else {
+                return nil
+            }
+            let remainder = key.dropFirst("model.layers.".count)
+            let digits = remainder.prefix { $0.isNumber }
+            return Int(digits)
+        })
 
-        for l in 0 ..< configuration.hiddenLayers {
+        for l in presentLayers.sorted() {
             let prefix = "model.layers.\(l).mlp"
             for n in ["up_proj", "down_proj", "gate_proj"] {
-                let key = "\(prefix).experts.0.\(n).weight"
-                if sanitizedWeights[key] != nil {
-                    let toJoin = (0 ..< configuration.numExperts).map { e in
-                        sanitizedWeights.removeValue(
-                            forKey: "\(prefix).experts.\(e).\(n).weight")!
-                    }
-                    sanitizedWeights["\(prefix).switch_mlp.\(n).weight"] = MLX.stacked(toJoin)
+                let expertCount = configuration.numExperts
+                let toJoin = (0 ..< expertCount).compactMap { expert in
+                    weights["\(prefix).experts.\(expert).\(n).weight"]
                 }
+                guard toJoin.count == expertCount else { continue }
+                for expert in 0 ..< expertCount {
+                    sanitizedWeights.removeValue(
+                        forKey: "\(prefix).experts.\(expert).\(n).weight")
+                }
+                sanitizedWeights["\(prefix).switch_mlp.\(n).weight"] = MLX.stacked(toJoin)
             }
         }
 
