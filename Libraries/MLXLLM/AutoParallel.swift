@@ -69,7 +69,14 @@ public func pipelineAutoParallelWrapBoundaries(
     if model is GPTOSSModel {
         last.forceDType = .bfloat16
     }
-    setLayers(on: model, newLayers: wrapped, shardOffset: 0)
+    setLayers(
+        on: model,
+        newLayers: wrapped,
+        shardOffset: pipelineAutoParallelWrapBoundaryShardOffset(for: modelShardMeta))
+}
+
+func pipelineAutoParallelWrapBoundaryShardOffset(for modelShardMeta: ShardMetadata) -> Int {
+    modelShardMeta.startLayer
 }
 
 /// Shards a homogeneous-architecture model for pipeline parallelism: keeps only

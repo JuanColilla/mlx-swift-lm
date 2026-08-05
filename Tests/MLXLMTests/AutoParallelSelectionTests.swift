@@ -30,12 +30,34 @@ import Testing
             "qwen3_next",
         ] {
             #expect(PipelineWeightLayout.sourcePrefixes(forModelType: type) == ["model.layers."])
+            #expect(PipelineWeightLayout.destinationPrefix(forModelType: type) == "model.layers.")
         }
+        let qwen35Prefixes = [
+            "model.language_model.layers.", "language_model.model.layers.",
+            "model.layers.", "language_model.layers.", "layers.",
+        ]
         for type in ["qwen3_5", "qwen3_5_moe"] {
             #expect(
-                PipelineWeightLayout.sourcePrefixes(forModelType: type)?.contains("model.layers.")
-                    == true)
+                PipelineWeightLayout.sourcePrefixes(forModelType: type) == qwen35Prefixes)
+            #expect(
+                PipelineWeightLayout.destinationPrefix(forModelType: type)
+                    == "language_model.model.layers.")
         }
         #expect(PipelineWeightLayout.sourcePrefixes(forModelType: "unknown_arch") == nil)
+    }
+
+    @Test func wrappingUsesShardStartAsSetLayersOffset() {
+        let metadata = ShardMetadata(
+            modelMeta: ModelMetadata(
+                modelId: "test/lfm2", modelType: "lfm2", prettyName: "LFM2 Test",
+                storageSize: MemorySize(), nLayers: 6, hiddenSize: 8),
+            deviceRank: 1,
+            worldSize: 2,
+            startLayer: 2,
+            endLayer: 5,
+            nLayers: 6)
+
+        #expect(
+            pipelineAutoParallelWrapBoundaryShardOffset(for: metadata) == metadata.startLayer)
     }
 }
