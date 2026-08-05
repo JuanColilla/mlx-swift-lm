@@ -105,6 +105,14 @@ import Testing
         }
     }
 
+    @Test func glm4MoELiteSanitizeSkipsIncompleteExpertLayer() throws {
+        let model = GLM4MoELiteModel(try Self.glm4MoELiteConfiguration())
+        let sanitized = model.sanitize(weights: Self.partialExpertWeightsWithIncompleteLayer())
+
+        #expect(sanitized["model.layers.5.mlp.switch_mlp.gate_proj.weight"] == nil)
+        #expect(sanitized["model.layers.6.mlp.switch_mlp.gate_proj.weight"] != nil)
+    }
+
     private static func partialExpertWeights() -> [String: MLXArray] {
         var weights: [String: MLXArray] = [:]
         for layer in 4 ..< 8 {

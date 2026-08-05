@@ -518,9 +518,13 @@ public class GLM4MoELiteModel: Module, LLMModel, KVCacheDimensionProvider {
                 for k in ["weight", "scales", "biases"] {
                     let key = "\(prefix).mlp.experts.0.\(n).\(k)"
                     if sanitized[key] != nil, let nRoutedExperts = configuration.nRoutedExperts {
-                        let toJoin = (0 ..< nRoutedExperts).map { e in
+                        let toJoin = (0 ..< nRoutedExperts).compactMap { e in
+                            sanitized["\(prefix).mlp.experts.\(e).\(n).\(k)"]
+                        }
+                        guard toJoin.count == nRoutedExperts else { continue }
+                        for e in 0 ..< nRoutedExperts {
                             sanitized.removeValue(
-                                forKey: "\(prefix).mlp.experts.\(e).\(n).\(k)")!
+                                forKey: "\(prefix).mlp.experts.\(e).\(n).\(k)")
                         }
                         sanitized["\(prefix).mlp.switch_mlp.\(n).\(k)"] = MLX.stacked(toJoin)
                     }
