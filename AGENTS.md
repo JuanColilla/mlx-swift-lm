@@ -38,6 +38,16 @@ ese rol vía fetch URL. No cambiar esta configuración sin confirmarlo con el
 usuario primero (romper esto puede hacer que un push termine en el
 repo oficial por error).
 
+### Remote `inferring` (solo lectura)
+
+Existe además un remote `inferring` →
+`https://github.com/N1k1tung/mlx-swift-lm.git`, otro fork de terceros del que
+se traen referencias puntualmente. **Nunca hacer push ahí.**
+
+De él proceden los tags `ios-distrib-*` presentes en local; no son tags de
+este fork y por tanto la convención de sufijo `v` descrita abajo no les
+aplica.
+
 ## Flujo de trabajo habitual
 
 1. `git fetch origin` para comprobar si hay novedades del oficial.
