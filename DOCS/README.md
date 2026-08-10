@@ -1,7 +1,7 @@
 # MLX Swift LM Research Reports
 
-Fecha inicial: 2026-07-01. Actualizado: 2026-07-15 (rama
-`feature/complete-improvement-backlog`).
+Fecha inicial: 2026-07-01. Contenido actualizado: 2026-07-15 (rama
+`feature/complete-improvement-backlog`). Índice revisado: 2026-08-11.
 
 Esta carpeta resume una investigación técnica del framework `mlx-swift-lm` y
 la implementación posterior de su backlog sobre `main`.
@@ -25,21 +25,25 @@ la implementación posterior de su backlog sobre `main`.
 
 Los 11 bloques operativos están implementados y validados:
 
-- benchmark JSON, sampling y matriz de compatibilidad generada desde los
-  registros vivos;
-- estimación de KV cache, composición con presupuesto wired y regresiones de
+- benchmark JSON, sampling y [matriz de compatibilidad](compatibility-matrix.md)
+  generada desde los registros vivos;
+- estimación de KV cache, composición con
+  [presupuesto wired](unified-memory-policy-scoping.md) y regresiones de
   long-context;
-- ticket de memoria, prefill sin tokens visibles y persistencia versionada en
-  `ChatSession`;
-- speculative decoding adaptativo opt-in con telemetría y fallback sticky;
+- ticket de memoria, prefill sin tokens visibles y
+  [persistencia versionada](cache-persistence-api.md) en `ChatSession`;
+- [speculative decoding adaptativo](adaptive-speculative-decoding-scoping.md)
+  opt-in con telemetría y fallback sticky;
 - [MTP de producción](mtp-production-scoping.md) en `ChatSession`, con gates
   de memoria, continuidad multiturno, fallback cuantizado y benchmark JSON;
-- metadata tipada y conservadora para thinking/tool compatibility;
+- metadata tipada y conservadora para
+  [thinking/tool compatibility](tool-thinking-compatibility-layer.md);
 - [dashboard de conformance](conformance-dashboard.md) y guardas VLM
   ejecutables sin convertir ausencias en éxitos;
-- detokenización streaming acotada y menor materialización transitoria de
-  vídeo/audio;
-- prototipo experimental WHT para KV cache, con equivalencia y persistencia.
+- [detokenización streaming acotada](detokenizer-media-investigation.md) y menor
+  materialización transitoria de vídeo/audio;
+- [prototipo experimental WHT](wht-kv-cache-prototype.md) para KV cache, con
+  equivalencia y persistencia.
 
 Se conservan como guías o investigación, no como promesas automáticas de
 runtime: [long-context-recipes.md](long-context-recipes.md),
