@@ -46,7 +46,7 @@ private final class MTPChatTarget: Module, LanguageModel, KVCacheDimensionProvid
         _ input: LMInput,
         cache: [KVCache],
         state: LMOutput.State?,
-        windowSize: Int?
+        prefill: PrefillParameters
     ) throws -> PrepareResult {
         preparedStateSequence.append(state?[mtpSessionStateKey])
         return .tokens(input.text)

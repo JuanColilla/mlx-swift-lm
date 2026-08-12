@@ -255,7 +255,9 @@ public class Qwen3MoEModel: Module, LLMModel, KVCacheDimensionProvider {
         var sanitizedWeights = weights
 
         if configuration.tieWordEmbeddings {
-            sanitizedWeights["lm_head.weight"] = nil
+            sanitizedWeights = sanitizedWeights.filter { key, _ in
+                !key.hasPrefix("lm_head.")
+            }
         }
 
         let presentLayers = Set(weights.keys.compactMap { key -> Int? in
