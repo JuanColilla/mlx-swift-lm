@@ -2092,7 +2092,7 @@ private final class PrefillStateTrackingModel: Module, LanguageModel, KVCacheDim
         _ input: LMInput,
         cache: [KVCache],
         state: LMOutput.State?,
-        windowSize: Int?
+        prefill: PrefillParameters
     ) throws -> PrepareResult {
         .tokens(input.text)
     }

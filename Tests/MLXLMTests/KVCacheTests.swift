@@ -1337,6 +1337,7 @@ private func writeCorruptSimpleCacheFile(className: String, arrayCount: Int, met
     #expect(throws: KVCacheError.self) {
         _ = try cache.toQuantized(groupSize: 64, bits: 4)
     }
+}
 
 // MARK: - RotatingKVCache.logicalView
 //

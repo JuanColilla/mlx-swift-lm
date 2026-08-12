@@ -360,7 +360,7 @@ private final class AdaptiveTransitionLanguageModel: Module, LanguageModel,
         _ input: LMInput,
         cache: [KVCache],
         state: LMOutput.State?,
-        windowSize: Int?
+        prefill: PrefillParameters
     ) throws -> PrepareResult {
         .tokens(input.text)
     }
