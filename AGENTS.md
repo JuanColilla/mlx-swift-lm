@@ -38,6 +38,23 @@ ese rol vía fetch URL. No cambiar esta configuración sin confirmarlo con el
 usuario primero (romper esto puede hacer que un push termine en el
 repo oficial por error).
 
+### Remote `fork` (nuestro fork, lectura y escritura)
+
+`origin` sabe empujar al fork pero **no sabe leerlo**: su fetch URL apunta al
+oficial, así que `origin/main` es el oficial y las ramas del fork no aparecen
+por ningún lado. Por eso existe además:
+
+```
+fork  fetch/push: https://github.com/JuanColilla/mlx-swift-lm.git
+```
+
+Úsalo siempre que necesites **ver** el estado real del fork
+(`git ls-remote --heads fork`, `git fetch fork`). Sin él es fácil creer que
+una rama se perdió cuando lo que pasa es que solo vive en remoto — ocurrió:
+en agosto de 2026 `develop` y `main` locales apuntaban a un commit del
+oficial, sin nada del fork, mientras la integración completa estaba a salvo
+en `fork/develop`.
+
 ### Remote `inferring` (solo lectura)
 
 Existe además un remote `inferring` →
@@ -48,16 +65,68 @@ De él proceden los tags `ios-distrib-*` presentes en local; no son tags de
 este fork y por tanto la convención de sufijo `v` descrita abajo no les
 aplica.
 
+## Modelo de ramas: solo `develop` y `main`
+
+Desde agosto de 2026 el fork tiene **exactamente dos ramas**, local y
+remotamente:
+
+- **`develop`** — rama de integración y única en la que se trabaja. Contiene
+  el oficial fusionado más todo lo propio.
+- **`main`** — espejo de `develop` (mismo árbol), actualizado con un merge
+  explícito cuando `develop` está estable.
+
+Las 14 ramas que existían antes (`feature/*`, `upstream/*`, `wip/pre-*`,
+`codex/*`) se consolidaron y se borraron; sus puntas quedaron como tags
+`archive/<rama>` **solo en local**, no en el fork. Todo commit único de
+aquellas ramas es antecesor de `develop`, así que no hay contenido que
+rescatar de ellas.
+
+El criterio de integración vive en
+[`knowledge/2026-08-04-develop-branch-unification-report.md`](knowledge/2026-08-04-develop-branch-unification-report.md):
+el upstream es la base arquitectónica y lo propio se porta encima, nunca al
+revés. Léelo antes de resolver conflictos con el oficial.
+
 ## Flujo de trabajo habitual
 
 1. `git fetch origin` para comprobar si hay novedades del oficial.
-2. Si hay cambios nuevos en `origin/main` (oficial) y no hay commits propios
-   divergentes, hacer fast-forward de `main` local.
-3. Desarrollar variaciones propias (docs, research, parches) en ramas
-   locales normales (ej. `docs/...`, `feature/...`).
-4. Mergear a `main` cuando esté estable.
-5. `git push origin main` sube el resultado al fork (nunca al oficial —
-   no se abren PRs al oficial salvo que el usuario lo pida explícitamente).
+2. Fusionar `origin/main` en `develop` resolviendo según el informe anterior.
+3. Compilar y pasar tests (ver los avisos de entorno más abajo).
+4. `git push fork develop:develop`.
+5. Cuando `develop` esté estable, actualizar `main` con un merge de `develop`
+   y empujar. Nunca se abren PRs al oficial salvo que el usuario lo pida.
+
+Para trabajar en algo grande, crea un worktree en
+`../mlx-swift-lm-worktrees/<nombre>` y bórralo al terminar, en vez de dejar
+una rama viva.
+
+## Avisos de entorno (agosto 2026)
+
+**`MLXFoundationModelsTests` no puede ejecutarse con Xcode 27 beta.** El
+`.swiftinterface` de FoundationModels declara inicializadores con
+`metadata: [String: any ConvertibleToGeneratedContent]` que el dylib real no
+exporta (`Transcript.Reasoning.init`,
+`LanguageModelExecutorGenerationRequest.init`). Referenciarlos compila y mata
+el proceso al cargar la imagen — SIGSEGV en 0x0, sin traza útil. No es
+arreglable desde aquí: solo afecta a ese target de tests, y `MLXLMTests` sí
+pasa entero. En la librería el mismo problema existía con
+`Response.Action.updateMetadata`, resuelto no referenciando el símbolo (ver
+el TODO en `MLXLanguageModel.emitMetadata`, con el mismo patrón que el de
+`emitUsage`). Para auditar si un símbolo del sistema existe de verdad:
+`nm -u` sobre el `.o` + `dyld_info -exports` sobre el framework, y `comm -23`
+entre ambos conjuntos — leer el interface no basta.
+
+**El repo vive bajo `~/Documents`, que iCloud sincroniza.** Dos consecuencias:
+
+1. `swift build` falla al firmar `mlx-swift_Cmlx.bundle` con *"resource fork,
+   Finder information, or similar detritus not allowed"*, porque el
+   proveedor de ficheros marca el bundle con `com.apple.FinderInfo`. `xattr -cr`
+   no basta: se vuelve a poner. Workaround: compilar fuera de iCloud con
+   `swift build --scratch-path /tmp/<algo>`.
+2. Aparecen duplicados con sufijo ` 2`/` 3` — incluso dentro de `.git/refs`.
+   Los `.swift` duplicados rompen la compilación (`invalid redeclaration`).
+   Antes de commitear, `git status` y comprobar que el índice no arrastra
+   ninguno: `git commit` publica el índice entero, no solo lo que acabas de
+   añadir con `git add <ruta>`.
 
 ## Convención de tags: sufijo `v`
 
