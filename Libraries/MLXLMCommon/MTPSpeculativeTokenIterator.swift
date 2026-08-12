@@ -218,6 +218,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         var carriedState = mainState
         carriedState?[mtpLastHiddenStatesKey] = nil
         carriedState?[mtpSharedKVStatesKey] = nil
+        carriedState?[mtpSharedKVSourceIndicesKey] = nil
         carriedState?[mtpEmitFlagKey] = nil
         var prefillState = carriedState ?? LMOutput.State()
         prefillState[mtpEmitFlagKey] = true
@@ -431,6 +432,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         var verifyState = mainState ?? LMOutput.State()
         verifyState[mtpLastHiddenStatesKey] = nil
         verifyState[mtpSharedKVStatesKey] = nil
+        verifyState[mtpSharedKVSourceIndicesKey] = nil
         verifyState[mtpEmitFlagKey] = true
         let verifyTokens = concatenated([bonusToken, flatDraftTokens])
         let verifyInput = LMInput.Text(tokens: verifyTokens)

@@ -716,7 +716,29 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             into channel: LanguageModelExecutorGenerationChannel
         ) async {
             generationObserver?(.updateMetadata(values, entryID: entryID))
-            await channel.send(.response(entryID: entryID, action: .updateMetadata(values)))
+
+            // TODO: same FM-27 SDK symbol drift as `emitUsage` below -- restore
+            // the channel send (commented out at the end of this block) once the
+            // shipping dylib matches its own interface.
+            //
+            // The FM-27 `.swiftinterface` declares
+            //   Response.Action.updateMetadata([String: any ConvertibleToGeneratedContent])
+            // but the shipping FoundationModels dylib only exports the older
+            //   Response.Action.updateMetadata([String: any Sendable & Codable & Equatable])
+            // Verified empirically on macOS 27 (24A5408c): a binary that
+            // references the interface's symbol dies at image load with
+            // `dyld: Symbol not found:
+            // _$s16FoundationModels38LanguageModelExecutorGenerationChannelV8Response\
+            // V6ActionV14updateMetadatayAGSDySSAA29ConvertibleToGeneratedContent_pGFZ`
+            // before `main` runs -- so this cannot be guarded at runtime, only
+            // by not referencing the symbol at all.
+            //
+            // Effect: the framework does not receive our per-response metadata
+            // (model id, request id, `incompleteOutput`), so consumer-visible
+            // metadata for these responses is absent. Tests still observe it
+            // through `generationObserver` above.
+            //   await channel.send(
+            //       .response(entryID: entryID, action: .updateMetadata(values)))
         }
 
         static func emitUsage(
