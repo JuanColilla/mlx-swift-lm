@@ -5,16 +5,18 @@
 
 import MLXLMCommon
 
+/// Detokenized routing for ordinary, unframed tool-call formats.
+/// Framed protocols are selected by `ToolCallFormat` and bypass this router.
 struct AllowedToolOutputRouter {
     enum Event: Sendable, Equatable {
         case reasoning(String)
         case response(String)
         case toolCall(MLXLMCommon.ToolCall)
+        case rejectedToolCall(RejectedToolCall)
     }
 
     private var reasoningEmitter: ReasoningEventEmitter?
     private let toolProcessor: ToolCallProcessor
-    private let allowedToolNames: Set<String>
 
     init(
         format: ToolCallFormat,
@@ -22,10 +24,6 @@ struct AllowedToolOutputRouter {
         reasoning: (config: ReasoningConfig, primedInside: Bool)? = nil
     ) {
         self.toolProcessor = ToolCallProcessor(format: format, tools: tools)
-        self.allowedToolNames = Set(
-            tools.compactMap { tool in
-                (tool["function"] as? [String: any Sendable])?["name"] as? String
-            })
         self.reasoningEmitter = reasoning.map {
             ReasoningEventEmitter(config: $0.config, primedInside: $0.primedInside)
         }
@@ -74,12 +72,14 @@ struct AllowedToolOutputRouter {
     }
 
     private func route(_ outputs: [ToolCallProcessor.Output]) -> [Event] {
-        outputs.compactMap { output in
+        outputs.map { output in
             switch output {
             case .response(let text):
                 .response(text)
             case .toolCall(let call):
-                allowedToolNames.contains(call.function.name) ? .toolCall(call) : nil
+                .toolCall(call)
+            case .rejectedToolCall(let rejection):
+                .rejectedToolCall(rejection)
             }
         }
     }

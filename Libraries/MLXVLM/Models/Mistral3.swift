@@ -571,19 +571,16 @@ private enum Language {
             return out
         }
 
-        func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
             let layerTypes =
                 config.layerTypes
                 ?? Array(repeating: "full_attention", count: config.numHiddenLayers)
 
-            return layerTypes.map { layerType in
-                if layerType == "sliding_attention", let slidingWindow = config.slidingWindow {
-                    return RotatingKVCache(maxSize: slidingWindow)
-                } else if let capacity = parameters?.effectiveKVCacheCapacity {
-                    return capacity.makeRotatingCache()
-                } else {
-                    return KVCacheSimple()
-                }
+            return try layerTypes.map { layerType in
+                try makeHybridAttentionKVCache(
+                    parameters: parameters,
+                    slidingWindow: config.slidingWindow,
+                    usesSlidingWindow: layerType == "sliding_attention")
             }
         }
     }
@@ -767,6 +764,8 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: config.textConfig.tieWordEmbeddings)
         var newWeights: [String: MLXArray] = [:]
 
         for (key, value) in weights {
@@ -822,8 +821,8 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         return newWeights
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        languageModel.newCache(parameters: parameters)
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try languageModel.newCache(parameters: parameters)
     }
 }
 

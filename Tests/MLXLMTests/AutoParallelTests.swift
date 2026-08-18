@@ -4,7 +4,7 @@ import XCTest
 @testable import MLXLLM
 
 final class AutoParallelTests: XCTestCase {
-    func testSetLayersKeepsLlamaCacheMetadataAlignedWithLocalShard() {
+    func testSetLayersKeepsLlamaCacheMetadataAlignedWithLocalShard() throws {
         let configuration = LlamaConfiguration(
             hiddenSize: 32,
             hiddenLayers: 4,
@@ -21,6 +21,6 @@ final class AutoParallelTests: XCTestCase {
 
         XCTAssertEqual(model.model.layers.count, 2)
         XCTAssertEqual(model.kvHeads.count, 2)
-        XCTAssertEqual(model.newCache(parameters: nil).count, 2)
+        XCTAssertEqual(try model.newCache(parameters: nil).count, 2)
     }
 }

@@ -58,6 +58,9 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
+        // Fork propio: b00051a desciende del tag 0.31.6 oficial (git describe:
+        // 0.31.6-8-gb00051a), asi que cubre el minimo que exige upstream, y ademas
+        // aporta Bonsai 1-bit, DistributedGroup y el diferido de errores Metal.
         .package(
             url: "https://github.com/JuanColilla/mlx-swift",
             revision: "b00051a9c1bf4d42036d841ef2c803b50f82d115"),

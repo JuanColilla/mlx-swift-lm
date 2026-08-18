@@ -712,9 +712,9 @@ private enum PixtralLanguage {
             return out
         }
 
-        func newCache(parameters: GenerateParameters?) -> [KVCache] {
-            (0 ..< config.numHiddenLayers).map { _ in
-                if let capacity = parameters?.effectiveKVCacheCapacity {
+        func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+            try (0 ..< config.numHiddenLayers).map { _ in
+                if let capacity = try parameters?.effectiveKVCacheCapacity() {
                     return capacity.makeRotatingCache()
                 } else {
                     return KVCacheSimple()
@@ -903,6 +903,8 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: config.textConfig.tieWordEmbeddings)
         var newWeights: [String: MLXArray] = [:]
 
         for (key, value) in weights {
@@ -947,8 +949,8 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
         return newWeights
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        languageModel.newCache(parameters: parameters)
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try languageModel.newCache(parameters: parameters)
     }
 }
 
