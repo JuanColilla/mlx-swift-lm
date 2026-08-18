@@ -517,12 +517,12 @@ public class GraniteMoeHybridModel: Module, LLMModel, KVCacheDimensionProvider {
         return out / logitsScaling
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        configuration.layerTypes.map { layerType in
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try configuration.layerTypes.map { layerType in
             if layerType == "mamba" {
                 return MambaCache()
             } else {
-                return KVCacheSimple()
+                return try makeAttentionKVCache(parameters: parameters)
             }
         }
     }
@@ -530,9 +530,8 @@ public class GraniteMoeHybridModel: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = weights
 
-        if configuration.tieWordEmbeddings {
-            sanitized["lm_head.weight"] = nil
-        }
+        sanitized = filterLMHeadWeights(
+            from: sanitized, tiedWordEmbeddings: configuration.tieWordEmbeddings)
 
         for (key, value) in weights {
             if key.contains("conv1d.weight"), value.dim(-1) != 1 {

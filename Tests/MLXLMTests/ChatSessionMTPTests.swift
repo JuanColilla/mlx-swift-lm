@@ -26,6 +26,7 @@ private final class MTPChatDrafter: Module, MTPDrafterModel {
         lastToken: MLXArray,
         lastHidden: MLXArray,
         sharedKV: [String: (MLXArray, MLXArray)],
+        positionDeltas: MLXArray?,
         queryOffset: Int,
         blockSize: Int,
         sampler: any LogitSampler

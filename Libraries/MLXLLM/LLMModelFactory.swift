@@ -214,6 +214,48 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<turn|>"]
     )
 
+    static public let translategemma_4b_it_4bit = ModelConfiguration(
+        id: "mlx-community/translategemma-4b-it-4bit",
+        defaultPrompt: "Hello, how are you?",
+        extraEOSTokens: ["<end_of_turn>"],
+        messageGenerator: TranslateGemma3MessageGenerator()
+    )
+
+    static public let translategemma_4b_it_8bit = ModelConfiguration(
+        id: "mlx-community/translategemma-4b-it-8bit",
+        defaultPrompt: "Hello, how are you?",
+        extraEOSTokens: ["<end_of_turn>"],
+        messageGenerator: TranslateGemma3MessageGenerator()
+    )
+
+    static public let translategemma_12b_it_4bit = ModelConfiguration(
+        id: "mlx-community/translategemma-12b-it-4bit",
+        defaultPrompt: "Hello, how are you?",
+        extraEOSTokens: ["<end_of_turn>"],
+        messageGenerator: TranslateGemma3MessageGenerator()
+    )
+
+    static public let translategemma_12b_it_8bit = ModelConfiguration(
+        id: "mlx-community/translategemma-12b-it-8bit",
+        defaultPrompt: "Hello, how are you?",
+        extraEOSTokens: ["<end_of_turn>"],
+        messageGenerator: TranslateGemma3MessageGenerator()
+    )
+
+    static public let translategemma_27b_it_4bit = ModelConfiguration(
+        id: "mlx-community/translategemma-27b-it-4bit",
+        defaultPrompt: "Hello, how are you?",
+        extraEOSTokens: ["<end_of_turn>"],
+        messageGenerator: TranslateGemma3MessageGenerator()
+    )
+
+    static public let translategemma_27b_it_8bit = ModelConfiguration(
+        id: "mlx-community/translategemma-27b-it-8bit",
+        defaultPrompt: "Hello, how are you?",
+        extraEOSTokens: ["<end_of_turn>"],
+        messageGenerator: TranslateGemma3MessageGenerator()
+    )
+
     static public let hunyuan_mt_7b_4bit = ModelConfiguration(
         id: "mlx-community/Hunyuan-MT-7B-4bit",
         defaultPrompt: "Translate the following text into Chinese: Hello, how are you?"
@@ -449,6 +491,12 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             gemma3n_E2B_it_lm_4bit,
             gemma4_e4b_it_4bit,
             gemma4_e2b_it_4bit,
+            translategemma_4b_it_4bit,
+            translategemma_4b_it_8bit,
+            translategemma_12b_it_4bit,
+            translategemma_12b_it_8bit,
+            translategemma_27b_it_4bit,
+            translategemma_27b_it_8bit,
             hunyuan_mt_7b_4bit,
             hunyuan_mt_7b_8bit,
             hy_mt2_7b_4bit,
@@ -667,15 +715,17 @@ public final class LLMModelFactory: GenericModelFactory {
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
         mutableConfiguration.stopStrings.formUnion(generationConfig?.stopStrings ?? [])
-        // Chat conventions. Precedence: an explicit value on the configuration
-        // (registry entry or caller) wins; then a registered resolver, which sees
-        // the repo id the model cannot; then the model's own declaration.
+        // Chat conventions. An explicit value on the configuration wins, followed
+        // by a registered resolver that sees the repo id. Checkpoint metadata then
+        // resolves the model declaration against the selected tool template.
         let modelId = configuration.name
         if mutableConfiguration.toolCallFormat == nil {
             mutableConfiguration.toolCallFormat =
                 conventionsRegistry.toolCallFormat(
                     modelId: modelId, modelType: baseConfig.modelType)
-                ?? model.toolCallFormat
+                ?? ToolCallFormat.resolved(
+                    forTokenizerDirectory: configuration.tokenizerDirectory,
+                    modelFormat: model.toolCallFormat)
         }
         if mutableConfiguration.reasoningConfig == nil {
             mutableConfiguration.reasoningConfig =
@@ -699,13 +749,14 @@ public final class LLMModelFactory: GenericModelFactory {
 
         let tokenizer = try await tokenizerTask
 
-        let messageGenerator =
-            if let model = model as? LLMModel {
-                model.messageGenerator(tokenizer: tokenizer)
-            } else {
-                DefaultMessageGenerator()
-            }
-
+        let messageGenerator: any MessageGenerator
+        if let configuredMessageGenerator = mutableConfiguration.messageGenerator {
+            messageGenerator = configuredMessageGenerator
+        } else if let model = model as? LLMModel {
+            messageGenerator = model.messageGenerator(tokenizer: tokenizer)
+        } else {
+            messageGenerator = DefaultMessageGenerator()
+        }
         // Build a ModelConfiguration for the ModelContext
         let tokenizerSource: TokenizerSource? =
             configuration.tokenizerDirectory == modelDirectory
@@ -719,7 +770,8 @@ public final class LLMModelFactory: GenericModelFactory {
             stopStrings: mutableConfiguration.stopStrings,
             eosTokenIds: mutableConfiguration.eosTokenIds,
             toolCallFormat: mutableConfiguration.toolCallFormat,
-            reasoningConfig: mutableConfiguration.reasoningConfig)
+            reasoningConfig: mutableConfiguration.reasoningConfig,
+            messageGenerator: mutableConfiguration.messageGenerator)
 
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,

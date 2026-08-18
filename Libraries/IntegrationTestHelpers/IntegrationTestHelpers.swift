@@ -105,6 +105,100 @@ public enum HarmonyProtocolTests {
     }
 }
 
+// MARK: - Muse Glimmer tokenizer contract
+
+public enum MuseGlimmerProtocolTests {
+    /// Exercises Meta's production Onyx control vocabulary and ATEM chat
+    /// template without loading the 30B checkpoint.
+    public static func realTokenizerContract(tokenizer: any Tokenizer) throws {
+        let expectedControlTokenIDs = [
+            "<|begin_of_text|>": 200_000,
+            "<|end_of_text|>": 200_001,
+            "<|eom|>": 200_007,
+            "<|eot|>": 200_008,
+            "<|start|>": 200_022,
+            "<|message|>": 200_023,
+        ]
+        for (token, expectedID) in expectedControlTokenIDs {
+            try check(
+                tokenizer.convertTokenToId(token) == expectedID,
+                "Muse Glimmer tokenizer resolved \(token) to "
+                    + "\(String(describing: tokenizer.convertTokenToId(token))); expected \(expectedID)"
+            )
+            try check(
+                tokenizer.encode(text: token, addSpecialTokens: false) == [expectedID],
+                "Muse Glimmer tokenizer did not encode \(token) atomically")
+        }
+
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "weather.get",
+                    "description": "Get weather",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "city": ["type": "string"] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                        "required": ["city"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ]
+        ]
+        guard
+            var decoder = ToolCallFormat.atem.makeProtocolTokenStreamDecoder(
+                tokenizer: tokenizer, tools: tools, stopStrings: [])
+        else {
+            throw IntegrationTestFailure(
+                "ATEM protocol adapter rejected the production Muse Glimmer tokenizer")
+        }
+        let payload =
+            "<atem:function_calls><atem:invoke name=\"weather.get\">"
+            + "<atem:parameter name=\"city\">Paris</atem:parameter>"
+            + "</atem:invoke></atem:function_calls>"
+        let frameTokens =
+            tokenizer.encode(text: " to=weather.get", addSpecialTokens: false)
+            + [200_023]
+            + tokenizer.encode(text: payload, addSpecialTokens: false)
+            + [200_008]
+        var parsedCalls: [ToolCall] = []
+        for token in frameTokens {
+            _ = decoder.push(token) { event in
+                if case .toolCall(let call) = event { parsedCalls.append(call) }
+                return true
+            }
+        }
+        try check(parsedCalls.count == 1, "Onyx decoder did not emit the production ATEM call")
+        let call = parsedCalls[0]
+        guard let callID = call.id else {
+            throw IntegrationTestFailure("Onyx decoder emitted a tool call without an id")
+        }
+        let messages = DefaultMessageGenerator().generate(messages: [
+            .user("Weather in Paris?"),
+            .assistant("", toolCalls: [call]),
+            .tool(
+                #"{"forecast":"sunny"}"#, id: callID,
+                name: call.function.name),
+        ])
+        let rendered = try tokenizer.applyChatTemplate(
+            messages: messages, tools: tools, additionalContext: nil)
+        let text = tokenizer.decode(tokenIds: rendered, skipSpecialTokens: false)
+        try check(
+            text.contains(#"<atem:invoke name="weather.get">"#),
+            "Muse Glimmer template omitted the structured ATEM call")
+        try check(
+            text.contains(#"<tool_output name="weather.get">"#),
+            "Muse Glimmer template did not correlate the tool result by call id")
+        try check(
+            text.hasSuffix("<|start|>assistant"),
+            "Muse Glimmer template omitted the assistant continuation prompt")
+        try check(
+            decoder.additionalStopTokenIDs == Set([200_001, 200_008]),
+            "Onyx decoder did not declare <|end_of_text|>/<|eot|> as stop tokens")
+    }
+}
+
 // MARK: - Network Retry
 
 /// Transient network failures worth retrying on a flaky CI network — chiefly
@@ -346,6 +440,8 @@ public enum ChatSessionTests {
                 responseText += text
             case .toolCall(let toolCall):
                 toolCalls.append(toolCall)
+            case .rejectedToolCall(let rejection):
+                throw RejectedToolCallError(rejection)
             case .info(let completionInfo):
                 info = completionInfo
             }
@@ -426,6 +522,8 @@ public enum ChatSessionTests {
                 followUpText += text
             case .toolCall(let call):
                 followUpCalls.append(call)
+            case .rejectedToolCall(let rejection):
+                throw RejectedToolCallError(rejection)
             case .info(let info):
                 completion = info
             }
@@ -885,8 +983,8 @@ public enum ToolCallTests {
     public static func qwen35FormatAutoDetection(container: LLModelContainer) async throws {
         let config = await container.configuration
         try check(
-            config.toolCallFormat == ToolCallFormat.xmlFunction,
-            "Expected .xmlFunction tool call format, got: \(String(describing: config.toolCallFormat))"
+            config.toolCallFormat == ToolCallFormat.qwen35,
+            "Expected .qwen35 tool call format, got: \(String(describing: config.toolCallFormat))"
         )
     }
 
@@ -980,6 +1078,8 @@ public enum ToolCallTests {
                     text += chunk
                 case .toolCall(let toolCall):
                     toolCalls.append(toolCall)
+                case .rejectedToolCall(let rejection):
+                    throw RejectedToolCallError(rejection)
                 case .info:
                     break
                 }

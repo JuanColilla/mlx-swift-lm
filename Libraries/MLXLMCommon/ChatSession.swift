@@ -351,11 +351,13 @@ public final class ChatSession {
     private struct AssistantGeneration {
         var content = ""
         var toolCalls: [ToolCall] = []
+        var rejectedToolCalls: [RejectedToolCall] = []
         var stopReason: GenerateStopReason?
         var wasTerminatedByConsumer = false
 
         var shouldRecord: Bool {
             (!content.isEmpty || !toolCalls.isEmpty)
+                && rejectedToolCalls.isEmpty
                 && !wasTerminatedByConsumer
                 && stopReason != .cancelled
         }
@@ -366,6 +368,9 @@ public final class ChatSession {
             }
             if let toolCall = item.toolCall {
                 toolCalls.append(toolCall)
+            }
+            if let rejection = item.rejectedToolCall {
+                rejectedToolCalls.append(rejection)
             }
             if let info = item.info {
                 stopReason = info.stopReason
@@ -472,6 +477,26 @@ public final class ChatSession {
     /// This is mutually exclusive with ``speculativeDecoding``. Use an
     /// initializer whose required label is `mtpSpeculativeDecoding:` to opt in.
     public private(set) var mtpSpeculativeDecoding: MTPSpeculativeDecodingConfig?
+
+    /// Unified KV / recurrent-cache status for this session.
+    ///
+    /// If the session owns a realized cache, this reports its actual request,
+    /// topology, strategy state, and progress. Otherwise it reports the cache
+    /// planned by the current ``generateParameters``.
+    public func cacheStatus() async throws -> KVCacheStatus {
+        let parameters = generateParameters
+        if let realized = await cache.read({ cache -> KVCacheStatus? in
+            guard case .kvcache(let stored) = cache else { return nil }
+            return KVCacheStatus(
+                cache: stored.main.cache,
+                plan: stored.main.plan,
+                phase: .realized,
+                processedTokenCount: stored.main.processedTokenCount)
+        }) {
+            return realized
+        }
+        return try await model.cacheStatus(parameters: parameters)
+    }
 
     /// Initialize the `ChatSession`.
     ///
@@ -1159,7 +1184,7 @@ public final class ChatSession {
                 var conversation: Conversation?
                 switch cache {
                 case .empty:
-                    kvCache = model.newCache(parameters: generateParameters)
+                    kvCache = try model.newCache(parameters: generateParameters)
                     storedDraftCache = nil
                     state = nil
                     conversation = Conversation(messages: [], cachedTokens: [])
@@ -1171,7 +1196,7 @@ public final class ChatSession {
                     conversation = stored.conversation
 
                 case .history(let history):
-                    kvCache = model.newCache(parameters: generateParameters)
+                    kvCache = try model.newCache(parameters: generateParameters)
                     storedDraftCache = nil
                     state = nil
                     conversation = Conversation(messages: history, cachedTokens: [])
@@ -1217,7 +1242,7 @@ public final class ChatSession {
                             tokens: MLXArray(fullTokenIds.dropFirst(cachedTokenIds.count)))
                         reusedCachedPrefix = true
                     } else if kvCache.first?.offset != 0 {
-                        kvCache = model.newCache(parameters: generateParameters)
+                        kvCache = try model.newCache(parameters: generateParameters)
                         state = nil
                     }
 
@@ -1255,7 +1280,7 @@ public final class ChatSession {
                         draftCache = storedDraftCache
                         draftInput = input
                     } else {
-                        draftCache = draftModel.newCache(parameters: generateParameters)
+                        draftCache = try draftModel.newCache(parameters: generateParameters)
                         draftInput = preparedInput
                     }
                     _ = try Self.prefill(
@@ -1411,6 +1436,8 @@ public final class ChatSession {
     ///   - videos: list of videos (for use with VLMs)
     ///   - audios: list of audios (for use with VLMs)
     /// - Returns: a stream of string chunks from the model
+    /// - Throws: ``RejectedToolCallError`` if the model emits a rejected tool
+    ///   call, or an error produced during generation.
     public func streamResponse(
         to prompt: String,
         role: Chat.Message.Role = .user,
@@ -1418,9 +1445,10 @@ public final class ChatSession {
         videos: consuming [UserInput.Video] = [],
         audios: consuming [UserInput.Audio] = []
     ) -> AsyncThrowingStream<String, Error> {
-        streamMap(to: prompt, role: role, images: images, videos: videos, audios: audios) {
-            $0.chunk
-        }
+        streamMap(
+            to: prompt, role: role, images: images, videos: videos, audios: audios,
+            failOnRejectedToolCall: true
+        ) { $0.chunk }
     }
 
     /// Produces a streaming response after appending a batch of structured chat messages.
@@ -1430,12 +1458,12 @@ public final class ChatSession {
     ///
     /// - Parameter messages: chat messages to append before generation
     /// - Returns: a stream of string chunks from the model
+    /// - Throws: ``RejectedToolCallError`` if the model emits a rejected tool
+    ///   call, or an error produced during generation.
     public func streamResponse(
         to messages: consuming [Chat.Message]
     ) -> AsyncThrowingStream<String, Error> {
-        streamMap(messages: messages) {
-            $0.chunk
-        }
+        streamMap(messages: messages, failOnRejectedToolCall: true) { $0.chunk }
     }
 
     /// Produces a streaming response to a prompt as `Generation`.
@@ -1447,6 +1475,10 @@ public final class ChatSession {
     ///   - videos: list of videos (for use with VLMs)
     ///   - audios: list of audios (for use with VLMs)
     /// - Returns: a stream of `Generation` from the model
+    ///
+    /// Rejected calls are emitted as ``Generation/rejectedToolCall(_:)``. When
+    /// automatic tool dispatch is configured, the stream instead throws
+    /// ``RejectedToolCallError`` before dispatching any call from that turn.
     public func streamDetails(
         to prompt: String,
         role: Chat.Message.Role = .user,
@@ -1466,6 +1498,10 @@ public final class ChatSession {
     ///
     /// - Parameter messages: chat messages to append before generation
     /// - Returns: a stream of `Generation` from the model
+    ///
+    /// Rejected calls are emitted as ``Generation/rejectedToolCall(_:)``. When
+    /// automatic tool dispatch is configured, the stream instead throws
+    /// ``RejectedToolCallError`` before dispatching any call from that turn.
     public func streamDetails(
         to messages: consuming [Chat.Message]
     ) -> AsyncThrowingStream<Generation, Error> {
@@ -1489,18 +1525,21 @@ public final class ChatSession {
         images: consuming [UserInput.Image] = [],
         videos: consuming [UserInput.Video] = [],
         audios: consuming [UserInput.Audio] = [],
+        failOnRejectedToolCall: Bool = false,
         transform: @Sendable @escaping (Generation) -> R?
     ) -> AsyncThrowingStream<R, Error> {
         streamMap(
             messages: [
                 .init(role: role, content: prompt, images: images, videos: videos, audios: audios)
             ],
+            failOnRejectedToolCall: failOnRejectedToolCall,
             transform: transform
         )
     }
 
     private func streamMap<R: Sendable>(
         messages: consuming [Chat.Message],
+        failOnRejectedToolCall: Bool = false,
         transform: @Sendable @escaping (Generation) -> R?
     ) -> AsyncThrowingStream<R, Error> {
         let (stream, continuation) = AsyncThrowingStream<R, Error>.makeStream()
@@ -1568,22 +1607,54 @@ public final class ChatSession {
                     switch cache {
                     case .empty:
                         kvCache = KVCacheStorage(
-                            model.newCache(parameters: generateParameters), plan: kvCachePlan)
+                            try model.newCache(parameters: generateParameters), plan: kvCachePlan)
                         conversation = Conversation(messages: [], cachedTokens: [])
                         cache = .kvcache(
                             .init(main: kvCache, conversation: conversation))
 
                     case .kvcache(let stored):
-                        try stored.requirePlan(kvCachePlan)
-                        kvCache = stored.main
-                        draftKVCache = stored.draft
-                        lmState = stored.state
-                        conversation = stored.conversation
+                        let realizedStatus = KVCacheStatus(
+                            cache: stored.main.cache,
+                            plan: stored.main.plan,
+                            phase: .realized,
+                            processedTokenCount: stored.main.processedTokenCount)
+                        let desiredStatus = try model.cacheStatus(
+                            parameters: generateParameters)
+
+                        // The plan captures the typed/legacy strategy and capacity; the
+                        // realized layer kinds additionally catch layout changes the plan
+                        // alone cannot see.
+                        if var restored = stored.conversation,
+                            stored.main.plan != kvCachePlan
+                                || realizedStatus.layers.map(\.kind)
+                                    != desiredStatus.layers.map(\.kind)
+                        {
+                            // Cache-affecting generation parameters changed. Because a
+                            // structured transcript is retained, rebuild the cache from it
+                            // rather than silently continuing with the old cache policy.
+                            restored.cachedTokens.removeAll()
+                            restored.uncommittedTokens.removeAll()
+                            kvCache = KVCacheStorage(
+                                try model.newCache(parameters: generateParameters),
+                                plan: kvCachePlan)
+                            draftKVCache = nil
+                            lmState = nil
+                            conversation = restored
+                        } else {
+                            // Either the realized policy is unchanged, or this is a
+                            // restored raw cache with no transcript to rebuild from.
+                            // In the latter case, requirePlan rejects a changed policy.
+                            try stored.requirePlan(kvCachePlan)
+                            kvCache = stored.main
+                            draftKVCache = stored.draft
+                            lmState = stored.state
+                            conversation = stored.conversation
+                        }
 
                     case .history(let history):
                         // the KVCache is represented by a chat history
                         kvCache = KVCacheStorage(
-                            model.newCache(parameters: generateParameters), plan: kvCachePlan)
+                            try model.newCache(parameters: generateParameters), plan: kvCachePlan)
                         conversation = Conversation(messages: history, cachedTokens: [])
                         cache = .kvcache(
                             .init(main: kvCache, conversation: conversation))
@@ -1621,17 +1692,8 @@ public final class ChatSession {
                         let containsNewMedia = pendingMessages.contains {
                             !$0.images.isEmpty || !$0.videos.isEmpty || !$0.audios.isEmpty
                         }
-                        let structuredToolCallCount = templateMessages.reduce(into: 0) {
-                            count, message in
-                            // GPT-OSS renders at most one call from each
-                            // assistant message. Other protocols ignore this
-                            // model-specific boundary count.
-                            if message.role == .assistant,
-                                message.tool?.calls?.isEmpty == false
-                            {
-                                count += 1
-                            }
-                        }
+                        let structuredToolCallCount = modelConfiguration.toolCallFormat?
+                            .promptCacheStructuredToolCallCount(in: templateMessages)
 
                         let userInput = UserInput(
                             chat: templateMessages,
@@ -1756,7 +1818,7 @@ public final class ChatSession {
 
                             case .rebuild:
                                 kvCache = KVCacheStorage(
-                                    model.newCache(parameters: generateParameters),
+                                    try model.newCache(parameters: generateParameters),
                                     plan: kvCachePlan)
                                 draftKVCache = nil
                                 lmState = nil
@@ -1979,7 +2041,7 @@ public final class ChatSession {
                                         // speculation was admitted without a matching
                                         // draft cache. Rebuild both from the full input.
                                         kvCache = KVCacheStorage(
-                                            model.newCache(parameters: generateParameters),
+                                            try model.newCache(parameters: generateParameters),
                                             plan: kvCachePlan)
                                         draftKVCache = nil
                                         lmState = nil
@@ -1990,7 +2052,7 @@ public final class ChatSession {
                                     // exactly like the main model's KV cache.
                                     if draftKVCache == nil {
                                         draftKVCache = KVCacheStorage(
-                                            draftModel.newCache(
+                                            try draftModel.newCache(
                                                 parameters: generateParameters),
                                             plan: kvCachePlan)
                                         cache = .kvcache(
@@ -2096,6 +2158,21 @@ public final class ChatSession {
                             conversation = currentConversation
                         }
 
+                        if let rejection = assistant.rejectedToolCalls.first,
+                            failOnRejectedToolCall || toolDispatch != nil
+                        {
+                            // The failed turn was rolled back above. Persist the
+                            // invalidated token ledger before surfacing the error
+                            // so the next request cannot reuse rejected output.
+                            cache = .kvcache(
+                                .init(
+                                    main: kvCache,
+                                    draft: draftKVCache,
+                                    state: lmState,
+                                    conversation: conversation))
+                            throw RejectedToolCallError(rejection)
+                        }
+
                         // dispatch all tool calls from this generation pass
                         if let toolDispatch, !pendingToolCalls.isEmpty,
                             !Task.isCancelled
@@ -2106,7 +2183,10 @@ public final class ChatSession {
                             }
                             for toolCall in pendingToolCalls {
                                 let toolResult = try await toolDispatch(toolCall)
-                                pendingMessages.append(.tool(toolResult, id: toolCall.id))
+                                pendingMessages.append(
+                                    .tool(
+                                        toolResult, id: toolCall.id,
+                                        name: toolCall.function.name))
                             }
                             continue restart
                         }
@@ -2176,10 +2256,11 @@ public final class ChatSession {
         await cache.read { _ in }
     }
 
-    /// Return the effective per-layer state of the configured KV-cache strategy.
+    /// Return the legacy runtime-only view of the configured KV-cache strategy.
     ///
     /// The report is `nil` until a typed or legacy cache configuration exists,
     /// or when the session currently stores history rather than a realized cache.
+    @available(*, deprecated, message: "Use cacheStatus() for unified cache diagnostics.")
     public func kvCacheRuntimeReport() async throws -> KVCacheRuntimeReport? {
         let kvCachePlan = try generateParameters.kvCachePlan()
         return try await cache.read { cache in
@@ -2344,7 +2425,7 @@ public enum ChatSessionError: LocalizedError {
         case .emptyPreparedInput:
             "The chat template produced no uncached tokens for generation."
         case .kvCacheConfigurationChanged:
-            "KV-cache configuration changed after the session cache was realized. Call clear() before continuing with the new configuration."
+            "KV-cache configuration changed after the session cache was realized. Clear the session or respond() to rebuild the cache from its retained transcript."
         }
     }
 }

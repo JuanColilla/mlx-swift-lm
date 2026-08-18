@@ -406,28 +406,25 @@ public class Gemma3TextModel: Module, LLMModel {
         return processedWeights
     }
 
-    public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
-        var caches = [KVCache]()
+    public func newCache(parameters: GenerateParameters? = nil) throws -> [KVCache] {
         let slidingWindow = config.slidingWindow
         let slidingWindowPattern = config.slidingWindowPattern
 
-        for i in 0 ..< config.hiddenLayers {
+        return try (0 ..< config.hiddenLayers).map { i in
             let isGlobalLayer = (i % slidingWindowPattern == slidingWindowPattern - 1)
-
             if isGlobalLayer {
-                // For global layers, use standard cache but with reasonable step size for long sequences
-                let cache = StandardKVCache()
-                cache.step = 1024  // Larger step size for efficiency with long sequences
-                caches.append(cache)
+                // Global (full-attention) layers honor maxKVSize. When unbounded,
+                // use a larger allocation step for long-context efficiency.
+                let cache = try makeAttentionKVCache(parameters: parameters)
+                if let simple = cache as? StandardKVCache {
+                    simple.step = 1024
+                }
+                return cache
             } else {
-                // For sliding window layers, use rotating cache
-                caches.append(
-                    RotatingKVCache(maxSize: slidingWindow, keep: 0)
-                )
+                return try makeSlidingWindowKVCache(
+                    parameters: parameters, window: slidingWindow)
             }
         }
-
-        return caches
     }
 
     /// Handles prompt processing for sequences
@@ -461,6 +458,62 @@ public class Gemma3TextModel: Module, LLMModel {
 
     /// Prefill chunk size when the caller sets none, tuned for this path on Apple Silicon.
     private static let defaultPrefillChunkSize = 128
+}
+
+/// Message generator for TranslateGemma, Google's translation fine-tunes of Gemma 3.
+///
+/// TranslateGemma's chat template needs each user turn tagged with `source_lang_code` /
+/// `target_lang_code` (ISO 639-1); supply them via `UserInput.additionalContext`. Without
+/// those codes this behaves exactly like `DefaultMessageGenerator`.
+public struct TranslateGemma3MessageGenerator: MessageGenerator {
+    public init() {}
+
+    public func generate(from input: UserInput) -> [Message] {
+        guard
+            let source = input.additionalContext?["source_lang_code"] as? String,
+            let target = input.additionalContext?["target_lang_code"] as? String
+        else {
+            return DefaultMessageGenerator().generate(from: input)
+        }
+        return translationMessages(from: input, source: source, target: target)
+    }
+
+    private func translationMessages(
+        from input: UserInput, source: String, target: String
+    ) -> [Message] {
+        let messages: [Chat.Message]
+        switch input.prompt {
+        case .text(let text):
+            messages = [.user(text)]
+        case .chat(let chat):
+            messages = chat
+        case .messages(let raw):
+            // Already model-specific dictionaries; pass through unchanged.
+            return raw
+        }
+
+        // The TranslateGemma template only supports alternating user/assistant turns.
+        return messages.compactMap { message in
+            switch message.role {
+            case .user:
+                return [
+                    "role": "user",
+                    "content": [
+                        [
+                            "type": "text",
+                            "source_lang_code": source,
+                            "target_lang_code": target,
+                            "text": message.content,
+                        ]
+                    ],
+                ]
+            case .assistant:
+                return ["role": "assistant", "content": message.content]
+            case .system, .tool:
+                return nil
+            }
+        }
+    }
 }
 
 extension Gemma3TextModel: LoRAModel {

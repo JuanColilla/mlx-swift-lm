@@ -162,8 +162,8 @@ public class ChatSessionTests: XCTestCase {
             base(input, cache: cache, state: state)
         }
 
-        func newCache(parameters: GenerateParameters?) -> [KVCache] {
-            base.newCache(parameters: parameters)
+        func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+            try base.newCache(parameters: parameters)
         }
     }
 
@@ -268,8 +268,8 @@ public class ChatSessionTests: XCTestCase {
             LMOutput(logits: inner(batched(input.tokens), cache: cache), state: state)
         }
 
-        func newCache(parameters: GenerateParameters?) -> [KVCache] {
-            inner.newCache(parameters: parameters)
+        func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+            try inner.newCache(parameters: parameters)
         }
     }
 
@@ -841,6 +841,191 @@ public class ChatSessionTests: XCTestCase {
         func didSample(token: MLXArray) {}
     }
 
+    private struct LiteralTokenizer: Tokenizer {
+        let tokenByCharacter: [Character: Int]
+        let characterByToken: [Int: Character]
+
+        init(output: String) {
+            let characters = Array(Set(output)).sorted { String($0) < String($1) }
+            tokenByCharacter = Dictionary(
+                uniqueKeysWithValues: characters.enumerated().map { ($0.element, $0.offset + 1) })
+            characterByToken = Dictionary(
+                uniqueKeysWithValues: tokenByCharacter.map { ($0.value, $0.key) })
+        }
+
+        var bosToken: String? { nil }
+        var eosToken: String? { nil }
+        var unknownToken: String? { nil }
+        var eosTokenId: Int? { 99 }
+        var unknownTokenId: Int? { 98 }
+
+        func tokens(for output: String) -> [Int] {
+            output.compactMap { tokenByCharacter[$0] }
+        }
+
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { [97] }
+
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+            String(tokenIds.compactMap { characterByToken[$0] })
+        }
+
+        func convertTokenToId(_ token: String) -> Int? {
+            token.count == 1 ? token.first.flatMap { tokenByCharacter[$0] } : nil
+        }
+
+        func convertIdToToken(_ id: Int) -> String? {
+            characterByToken[id].map(String.init)
+        }
+
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] {
+            [97]
+        }
+    }
+
+    private final class TokenSequenceState: @unchecked Sendable {
+        private let lock = NSLock()
+        private let tokens: [Int32]
+        private var index = 0
+
+        init(tokens: [Int]) {
+            self.tokens = tokens.map(Int32.init)
+        }
+
+        var current: Int32 {
+            lock.withLock { tokens[min(index, tokens.count - 1)] }
+        }
+
+        func advance() {
+            lock.withLock { index = min(index + 1, tokens.count - 1) }
+        }
+    }
+
+    private struct ForceTokenSequenceProcessor: LogitProcessor {
+        let state: TokenSequenceState
+
+        func prompt(_ prompt: MLXArray) {}
+
+        func process(logits: MLXArray) -> MLXArray {
+            let indices = MLXArray(0 ..< Int32(logits.dim(-1)))
+            return MLX.where(
+                indices .== MLXArray(state.current), logits, MLXArray(-Float.infinity))
+        }
+
+        func didSample(token: MLXArray) {
+            state.advance()
+        }
+    }
+
+    private func rejectionSession(
+        output: String,
+        messageGenerator: any MessageGenerator = DefaultMessageGenerator(),
+        tools: [ToolSpec]? = nil,
+        toolDispatch: (@Sendable (ToolCall) async throws -> String)? = nil
+    ) -> ChatSession {
+        let tokenizer = LiteralTokenizer(output: output)
+        let configuration = ModelConfiguration(
+            id: "rejected-tool-call-test",
+            eosTokenIds: [99],
+            toolCallFormat: .json)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: configuration,
+            messageGenerator: messageGenerator)
+        let outputTokens = tokenizer.tokens(for: output) + [99]
+        let components = GenerationComponents {
+            ForceTokenSequenceProcessor(state: TokenSequenceState(tokens: outputTokens))
+        }
+        return ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(
+                maxTokens: outputTokens.count + 1, temperature: 0),
+            components: components,
+            tools: tools,
+            toolDispatch: toolDispatch)
+    }
+
+    func testStreamDetailsEmitsRejectedToolCallAndCompletionCount() async throws {
+        let session = rejectionSession(output: #"<tool_call>{"#)
+        var rejection: RejectedToolCall?
+        var info: GenerateCompletionInfo?
+        var chunks: [String] = []
+
+        for try await event in session.streamDetails(to: "trigger") {
+            if let value = event.rejectedToolCall { rejection = value }
+            if let value = event.info { info = value }
+            if let value = event.chunk { chunks.append(value) }
+        }
+
+        XCTAssertEqual(rejection?.reason, .incompleteOutput)
+        XCTAssertEqual(info?.rejectedToolCallCount, 1)
+        XCTAssertTrue(chunks.isEmpty)
+    }
+
+    func testTextStreamThrowsRejectedToolCallError() async throws {
+        let session = rejectionSession(output: #"<tool_call>{"#)
+
+        do {
+            for try await _ in session.streamResponse(to: "trigger") {}
+            XCTFail("Expected RejectedToolCallError")
+        } catch let error as RejectedToolCallError {
+            XCTAssertEqual(error.rejection.reason, .incompleteOutput)
+        }
+    }
+
+    func testRejectedGenerationIsNotCommittedToConversation() async throws {
+        let (recordedMessages, continuation) = AsyncStream<[RecordedMessage]>.makeStream()
+        let session = rejectionSession(
+            output: #"<tool_call>{"#,
+            messageGenerator: RecordingMessageGenerator(continuation: continuation))
+
+        for prompt in ["first", "second"] {
+            do {
+                for try await _ in session.streamResponse(to: prompt) {}
+                XCTFail("Expected RejectedToolCallError")
+            } catch is RejectedToolCallError {
+                // Expected. The next request must start from a clean transcript.
+            }
+        }
+        continuation.finish()
+
+        var calls: [[RecordedMessage]] = []
+        for await call in recordedMessages { calls.append(call) }
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls[0], [.init(role: .user, content: "first")])
+        XCTAssertEqual(calls[1], [.init(role: .user, content: "second")])
+    }
+
+    func testRejectedGenerationPreventsPartialToolDispatch() async throws {
+        let dispatchCount = CallCounter()
+        let output =
+            #"<tool_call>{"name":"allowed","arguments":{}}</tool_call><tool_call>{"#
+        let tools: [ToolSpec] = [
+            [
+                "type": "function",
+                "function": ["name": "allowed"] as [String: any Sendable],
+            ]
+        ]
+        let session = rejectionSession(
+            output: output,
+            tools: tools,
+            toolDispatch: { _ in
+                dispatchCount.increment()
+                return "should not execute"
+            })
+
+        do {
+            for try await _ in session.streamDetails(to: "trigger") {}
+            XCTFail("Expected RejectedToolCallError")
+        } catch let error as RejectedToolCallError {
+            XCTAssertEqual(error.rejection.reason, .incompleteOutput)
+        }
+        XCTAssertEqual(dispatchCount.value, 0)
+    }
+
     /// Thread-safe counter for asserting how many times a `@Sendable` factory runs.
     private final class CallCounter: @unchecked Sendable {
         private let lock = NSLock()
@@ -898,6 +1083,32 @@ public class ChatSessionTests: XCTestCase {
 
         // two turns -> two fresh processor instances
         XCTAssertEqual(counter.value, 2)
+    }
+
+    /// Parameter-dependent components must fail through the real session API
+    /// before prompt prefill starts.
+    func testChatSessionRunsGenerationComponentValidation() async throws {
+        let inputProcessor = TestInputProcessor()
+        let components = try GenerationComponents().applyingThinkingBudget(
+            ThinkingBudgetConfiguration(
+                maximumTokenCount: 100,
+                transitionOverride: .immediate),
+            reasoning: .alwaysOnThinking,
+            tokenizer: inputProcessor.tokenizer)
+        let session = ChatSession(
+            model(processor: inputProcessor),
+            generateParameters: GenerateParameters(maxTokens: 1),
+            components: components)
+
+        do {
+            _ = try await session.respond(to: "hello")
+            XCTFail("Expected generation-component validation to reject maxTokens")
+        } catch let error as ThinkingBudgetError {
+            guard case .insufficientGenerationTokenLimit = error else {
+                XCTFail("Unexpected thinking-budget error: \(error)")
+                return
+            }
+        }
     }
 
     /// Passing an empty ``GenerationComponents()`` must be non-breaking: the
@@ -1257,7 +1468,7 @@ public class ChatSessionTests: XCTestCase {
     func testSpeculativeDecodingRunsWithCarriedModelState() async throws {
         let context = model()
         let parameters = GenerateParameters(maxTokens: 4, temperature: 0.0)
-        let cache = context.model.newCache(parameters: parameters)
+        let cache = try context.model.newCache(parameters: parameters)
         let stateKey = LMOutput.Key<MLXArray>("test.carriedState")
         var state = LMOutput.State()
         state[stateKey] = MLXArray([Int32(1)])
@@ -1343,7 +1554,7 @@ public class ChatSessionTests: XCTestCase {
     func testSpeculativeDecodingFallsBackForPrebuiltCacheWithoutDraftCache() async throws {
         let context = model()
         let parameters = GenerateParameters(maxTokens: 4, temperature: 0.0)
-        let cache = context.model.newCache(parameters: parameters)
+        let cache = try context.model.newCache(parameters: parameters)
         let input = try await context.processor.prepare(
             input: UserInput(chat: [.user("cached prefix")]))
         _ = try TokenIterator(
@@ -1751,7 +1962,7 @@ public class ChatSessionTests: XCTestCase {
 
         // Warm a cache directly, the way a caller building a prefix cache in
         // process would, and pair it with its state without going through disk.
-        let cache = context.model.newCache(parameters: parameters)
+        let cache = try context.model.newCache(parameters: parameters)
         let input = try await context.processor.prepare(
             input: UserInput(chat: [.user("cached prefix")]))
         let iterator = try TokenIterator(
@@ -1921,7 +2132,7 @@ public class ChatSessionTests: XCTestCase {
         }
     }
 
-    func testChangingKVCacheConfigurationRequiresClearingRealizedCache() async throws {
+    func testCacheStatusPreservesTheRealizedRequestWhenParametersChange() async throws {
         let initialConfiguration = KVCacheConfiguration(
             strategy: .turboQuant(.qualityFirst))
         let session = ChatSession(
@@ -1931,15 +2142,10 @@ public class ChatSessionTests: XCTestCase {
 
         session.generateParameters.kvCache = KVCacheConfiguration(strategy: .fullPrecision)
 
-        do {
-            _ = try await session.kvCacheRuntimeReport()
-            XCTFail("Expected a realized cache to reject configuration changes")
-        } catch ChatSessionError.kvCacheConfigurationChanged(
-            let previous, let requested)
-        {
-            XCTAssertEqual(previous, initialConfiguration)
-            XCTAssertEqual(requested, KVCacheConfiguration(strategy: .fullPrecision))
-        }
+        let status = try await session.cacheStatus()
+        XCTAssertEqual(status.phase, .realized)
+        XCTAssertEqual(status.requestSource, .typed)
+        XCTAssertEqual(status.requestedConfiguration, initialConfiguration)
     }
 
     func testSessionRetainsCacheReplacementTriggeredDuringDecode() async throws {
@@ -1967,9 +2173,16 @@ public class ChatSessionTests: XCTestCase {
             return quantized.offset
         }
         let firstOffset = try XCTUnwrap(observedFirstOffset)
-        let optionalFirstReport = try await session.kvCacheRuntimeReport()
-        let firstReport = try XCTUnwrap(optionalFirstReport)
-        XCTAssertEqual(firstReport.processedTokenCount, firstOffset)
+        let firstStatus = try await session.cacheStatus()
+        XCTAssertEqual(firstStatus.processedTokenCount, firstOffset)
+        XCTAssertEqual(firstStatus.phase, .realized)
+        XCTAssertEqual(firstStatus.requestSource, .typed)
+        XCTAssertEqual(firstStatus.requestedStrategy, .affine)
+        XCTAssertGreaterThan(firstStatus.compressedLayerCount, 0)
+        XCTAssertTrue(
+            firstStatus.layers.contains {
+                $0.state == .active && $0.resolvedStrategy == .affine
+            })
 
         _ = try await session.respond(to: "hello again")
         try await session.withCache { cache in
@@ -1978,6 +2191,116 @@ public class ChatSessionTests: XCTestCase {
                 cache.first { $0 is QuantizedKVCache } as? QuantizedKVCache)
             XCTAssertGreaterThan(quantized.offset, firstOffset)
         }
+    }
+
+    func testModelContainerReportsCappedSlidingAndFullAttentionCaches() async throws {
+        let container = ModelContainer(context: model())
+        let parameters = GenerateParameters(maxTokens: 1, maxKVSize: 64)
+
+        let status = try await container.cacheStatus(parameters: parameters)
+
+        XCTAssertEqual(status.requestSource, .legacy)
+        XCTAssertEqual(status.requestedConfiguration?.capacity?.maxTokens, 64)
+        XCTAssertEqual(status.capacityDisposition, .fullyApplied)
+        XCTAssertEqual(status.layers.count, 8)
+        XCTAssertTrue(status.attentionMaxSizes.allSatisfy { $0 == 64 })
+    }
+
+    func testModelContainerPreservesNativeSlidingWindowForTypedCapacity() async throws {
+        let container = ModelContainer(context: model())
+        let capacity = try KVCacheConfiguration.Capacity(
+            maxTokens: 64, preservedPrefixTokens: 3)
+        let parameters = GenerateParameters(
+            maxTokens: 1,
+            kvCache: KVCacheConfiguration(capacity: capacity))
+
+        let status = try await container.cacheStatus(parameters: parameters)
+
+        XCTAssertEqual(status.requestSource, .typed)
+        XCTAssertEqual(status.requestedConfiguration?.capacity, capacity)
+        XCTAssertEqual(status.capacityDisposition, .fullyApplied)
+        XCTAssertEqual(status.capacityAppliedLayerCount, 1)
+        XCTAssertEqual(status.layers.count, 8)
+        XCTAssertEqual(
+            status.attentionMaxSizes.compactMap { $0 },
+            [512, 512, 512, 512, 512, 64, 512, 512])
+    }
+
+    func testSessionReportsRealizedRawCacheInsteadOfPlannedLayout() async throws {
+        let rawCache: [KVCache] = Array(repeating: 0, count: 8).map { _ in KVCacheSimple() }
+        let session = ChatSession(
+            model(),
+            cache: rawCache,
+            generateParameters: GenerateParameters(maxTokens: 1, maxKVSize: 64))
+
+        let status = try await session.cacheStatus()
+
+        XCTAssertEqual(status.phase, .realized)
+        XCTAssertEqual(status.requestSource, .legacy)
+        XCTAssertEqual(status.requestedConfiguration?.capacity?.maxTokens, 64)
+        XCTAssertEqual(status.capacityDisposition, .ignored)
+        XCTAssertTrue(status.attentionMaxSizes.allSatisfy { $0 == nil })
+    }
+
+    func testSessionRebuildsStructuredCacheWhenMaxKVSizeChanges() async throws {
+        let session = ChatSession(
+            model(), generateParameters: GenerateParameters(maxTokens: 1))
+
+        _ = try await session.respond(to: "first")
+        let initial = try await session.cacheStatus()
+        XCTAssertEqual(initial.capacityDisposition, .notRequested)
+        XCTAssertTrue(initial.attentionMaxSizes.contains(512))
+        XCTAssertTrue(initial.attentionMaxSizes.contains(nil))
+
+        session.generateParameters = GenerateParameters(maxTokens: 1, maxKVSize: 64)
+        let stale = try await session.cacheStatus()
+        XCTAssertEqual(stale.phase, .realized)
+        XCTAssertNil(stale.requestedConfiguration)
+
+        _ = try await session.respond(to: "second")
+        let limited = try await session.cacheStatus()
+        XCTAssertEqual(limited.capacityDisposition, .fullyApplied)
+        XCTAssertEqual(limited.requestSource, .legacy)
+        XCTAssertTrue(limited.attentionMaxSizes.allSatisfy { $0 == 64 })
+        await session.withCache { cache in
+            XCTAssertEqual(cache?.count, 8)
+            XCTAssertTrue(cache?.allSatisfy { $0.maxSize == 64 } == true)
+        }
+
+        session.generateParameters = GenerateParameters(maxTokens: 1)
+        _ = try await session.respond(to: "third")
+        let restored = try await session.cacheStatus()
+        XCTAssertEqual(restored.capacityDisposition, .notRequested)
+        XCTAssertTrue(restored.attentionMaxSizes.contains(512))
+        XCTAssertTrue(restored.attentionMaxSizes.contains(nil))
+    }
+
+    func testSessionRebuildsWhenTypedRequestRestoresNativeWindows() async throws {
+        let session = ChatSession(
+            model(),
+            generateParameters: GenerateParameters(maxTokens: 1, maxKVSize: 64))
+
+        _ = try await session.respond(to: "legacy")
+        let legacy = try await session.cacheStatus()
+        XCTAssertEqual(legacy.capacityDisposition, .fullyApplied)
+        XCTAssertEqual(legacy.requestSource, .legacy)
+        XCTAssertTrue(legacy.attentionMaxSizes.allSatisfy { $0 == 64 })
+
+        let capacity = try KVCacheConfiguration.Capacity(maxTokens: 64)
+        session.generateParameters = GenerateParameters(
+            maxTokens: 1,
+            kvCache: KVCacheConfiguration(
+                capacity: capacity,
+                compatibility: .allowPartial))
+
+        _ = try await session.respond(to: "typed")
+        let typed = try await session.cacheStatus()
+        XCTAssertEqual(typed.requestSource, .typed)
+        XCTAssertEqual(typed.capacityDisposition, .fullyApplied)
+        XCTAssertEqual(typed.capacityAppliedLayerCount, 1)
+        XCTAssertEqual(
+            typed.attentionMaxSizes.compactMap { $0 },
+            [512, 512, 512, 512, 512, 64, 512, 512])
     }
 
     /// something that looks like a view model

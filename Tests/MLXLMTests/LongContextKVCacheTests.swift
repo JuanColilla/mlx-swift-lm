@@ -142,7 +142,7 @@ struct LongContextKVCacheTests {
     }
 
     @Test
-    func testMaxKVSizeAndKVBitsKeepRotatingCacheUnquantized() {
+    func testMaxKVSizeAndKVBitsKeepRotatingCacheUnquantized() throws {
         let model = KVCacheSelectionModel()
         let parameters = GenerateParameters(
             maxKVSize: 8,
@@ -150,7 +150,7 @@ struct LongContextKVCacheTests {
             kvGroupSize: 64,
             quantizedKVStart: 0
         )
-        var caches = model.newCache(parameters: parameters)
+        var caches = try model.newCache(parameters: parameters)
         for cache in caches {
             _ = cache.update(
                 keys: MLXArray.ones([1, 1, 1, 64], dtype: .bfloat16),

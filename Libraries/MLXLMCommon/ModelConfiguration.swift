@@ -122,6 +122,15 @@ public struct ModelConfiguration: Sendable {
     /// Reasoning (chain-of-thought) protocol for this model (nil = non-reasoning model)
     public var reasoningConfig: ReasoningConfig? = nil
 
+    /// Overrides the ``MessageGenerator`` the model would otherwise supply.
+    ///
+    /// A model class is shared by every checkpoint of its model type, so a fine-tune that
+    /// needs a different chat-template shape cannot express that on the model itself without
+    /// affecting its siblings -- e.g. TranslateGemma, which loads through the same `gemma3`
+    /// text path as plain Gemma 3. Set this on the registry entry (or by the caller) instead.
+    /// `nil` keeps the model's own default.
+    public var messageGenerator: (any MessageGenerator)? = nil
+
     public init(
         id: String, revision: String = "main",
         tokenizerSource: TokenizerSource? = nil,
@@ -130,7 +139,8 @@ public struct ModelConfiguration: Sendable {
         stopStrings: Set<String>? = nil,
         eosTokenIds: Set<Int> = [],
         toolCallFormat: ToolCallFormat? = nil,
-        reasoningConfig: ReasoningConfig? = nil
+        reasoningConfig: ReasoningConfig? = nil,
+        messageGenerator: (any MessageGenerator)? = nil
     ) {
         self.id = .id(id, revision: revision)
         self.tokenizerSource = tokenizerSource
@@ -140,6 +150,7 @@ public struct ModelConfiguration: Sendable {
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
         self.reasoningConfig = reasoningConfig
+        self.messageGenerator = messageGenerator
     }
 
     public init(
@@ -150,7 +161,8 @@ public struct ModelConfiguration: Sendable {
         stopStrings: Set<String>? = nil,
         eosTokenIds: Set<Int> = [],
         toolCallFormat: ToolCallFormat? = nil,
-        reasoningConfig: ReasoningConfig? = nil
+        reasoningConfig: ReasoningConfig? = nil,
+        messageGenerator: (any MessageGenerator)? = nil
     ) {
         self.id = .directory(directory)
         self.tokenizerSource = tokenizerSource
@@ -160,6 +172,7 @@ public struct ModelConfiguration: Sendable {
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
         self.reasoningConfig = reasoningConfig
+        self.messageGenerator = messageGenerator
     }
 
     /// Maps this configuration's behavioral properties into a
@@ -179,13 +192,42 @@ public struct ModelConfiguration: Sendable {
             stopStrings: stopStrings,
             eosTokenIds: eosTokenIds,
             toolCallFormat: toolCallFormat,
-            reasoningConfig: reasoningConfig)
+            reasoningConfig: reasoningConfig,
+            messageGenerator: messageGenerator)
     }
 
 }
 
 extension ModelConfiguration: Equatable {
 
+    // Keep in sync with the stored properties above: synthesis is impossible because
+    // `messageGenerator` is not `Equatable`, so a new property will not appear here on its own.
+    public static func == (lhs: ModelConfiguration, rhs: ModelConfiguration) -> Bool {
+        lhs.id == rhs.id
+            && lhs.tokenizerSource == rhs.tokenizerSource
+            && lhs.defaultPrompt == rhs.defaultPrompt
+            && lhs.extraEOSTokens == rhs.extraEOSTokens
+            && lhs.stopStrings == rhs.stopStrings
+            && lhs.eosTokenIds == rhs.eosTokenIds
+            && lhs.toolCallFormat == rhs.toolCallFormat
+            && lhs.reasoningConfig == rhs.reasoningConfig
+            && sameMessageGenerator(lhs.messageGenerator, rhs.messageGenerator)
+    }
+
+    /// ``MessageGenerator`` is not `Equatable` -- generators are stateless, so identity of
+    /// the concrete type is the meaningful comparison.
+    private static func sameMessageGenerator(
+        _ lhs: (any MessageGenerator)?, _ rhs: (any MessageGenerator)?
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            true
+        case (.some(let lhs), .some(let rhs)):
+            ObjectIdentifier(type(of: lhs)) == ObjectIdentifier(type(of: rhs))
+        default:
+            false
+        }
+    }
 }
 
 extension ModelConfiguration.Identifier: Equatable {

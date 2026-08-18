@@ -84,6 +84,12 @@ final class Qwen35ContinuationTests: XCTestCase {
 
     // MARK: - Tests
 
+    func testDeclaresDualDialectToolFormat() throws {
+        let model = try makeTinyModel()
+        XCTAssertEqual(model.toolCallFormat, .qwen35)
+        XCTAssertEqual(model.reasoningConfig, QwenReasoningProtocol.tagged)
+    }
+
     /// A warm continuation (prefix already in the cache, remainder prefilled
     /// on top — the ChatSession cross-turn / tool-restart flow) must produce
     /// the same next-token logits as one cold prefill of the concatenation.
@@ -102,13 +108,13 @@ final class Qwen35ContinuationTests: XCTestCase {
         let t1 = textTokens(40)
         let t2 = textTokens(8, seed: 3)
 
-        let fullCache = model.newCache(parameters: nil)
+        let fullCache = try model.newCache(parameters: nil)
         let (fullLogits, _) = try lastLogits(
             model.prepare(
                 LMInput(text: .init(tokens: concatenated([t1, t2], axis: 1))),
                 cache: fullCache, state: nil, prefill: .init()))
 
-        let warmCache = model.newCache(parameters: nil)
+        let warmCache = try model.newCache(parameters: nil)
         let (_, state) = try lastLogits(
             model.prepare(
                 LMInput(text: .init(tokens: t1)), cache: warmCache, state: nil, prefill: .init()))
@@ -130,7 +136,7 @@ final class Qwen35ContinuationTests: XCTestCase {
         MLXRandom.seed(19)
         let model = try makeTinyModel()
 
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         XCTAssertNoThrow(
             try model.prepare(
                 LMInput(text: .init(tokens: textTokens(40))), cache: cache, state: nil,
@@ -182,13 +188,13 @@ final class Qwen35ContinuationTests: XCTestCase {
             [textTokens(3, seed: 8), visionStart, imageRun, textTokens(5, seed: 10)], axis: 1)
         let full = concatenated([turn1, turn2, turn3, turn4], axis: 1)
 
-        let coldCache = model.newCache(parameters: nil)
+        let coldCache = try model.newCache(parameters: nil)
         let (coldLogits, _) = try lastLogits(
             model.prepare(
                 LMInput(text: .init(tokens: full), image: bothImages), cache: coldCache,
                 state: nil, prefill: .init()))
 
-        let warmCache = model.newCache(parameters: nil)
+        let warmCache = try model.newCache(parameters: nil)
         let (_, turn1State) = try lastLogits(
             model.prepare(
                 LMInput(text: .init(tokens: turn1)), cache: warmCache, state: nil,

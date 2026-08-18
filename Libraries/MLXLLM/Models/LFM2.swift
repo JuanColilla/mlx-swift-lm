@@ -399,10 +399,10 @@ public class LFM2Model: Module, LLMModel, KVCacheDimensionProvider {
         return sanitizedWeights
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        model.layers.indices.map { layerIdx in
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try model.layers.indices.map { layerIdx in
             if configuration.fullAttnIdxs.contains(layerIdx + shardOffset) {
-                KVCacheSimple()
+                try makeAttentionKVCache(parameters: parameters)
             } else {
                 MambaCache()
             }

@@ -58,9 +58,19 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
+        // Fork propio: 8f74acc desciende del tag 0.31.6 oficial (git describe:
+        // 0.31.6-15-g8f74acc), asi que cubre el minimo que exige upstream, y ademas
+        // aporta Bonsai 1-bit, DistributedGroup y el diferido de errores Metal.
+        //
+        // Tiene que ser `revision:` y no un requisito de version: en el fork el
+        // tag 0.31.6 apunta a 0bb916c, ANTERIOR a esos tres parches, asi que un
+        // `from: "0.31.6"` resolveria, compilaria, y los perderia en silencio.
+        // Y tiene que ser ESTA revision y no otra: MLXHub pinnea el mismo fork
+        // por revision exacta, y dos revisiones distintas del mismo paquete no
+        // resuelven.
         .package(
             url: "https://github.com/JuanColilla/mlx-swift",
-            revision: "b00051a9c1bf4d42036d841ef2c803b50f82d115"),
+            revision: "8f74acc071f2a710bce9766769b9698398febcc9"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
