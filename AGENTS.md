@@ -158,6 +158,17 @@ base es `v3.31.4-fork.1`, la segunda `v3.31.4-fork.2`, etc. Al fusionar
   — el nombre es solo para que nosotros sepamos a qué base está pegada
   cada variante.
 
+**Límite verificado (2026-08-26):** SPM **no** resuelve automáticamente la
+variante más reciente en dependencias por rango (`from:`, `upToNextMajor`).
+Probado contra `v0.31.6-fork.1` real en `mlx-swift`: `from: "0.31.6"` y
+`from: "0.31.6-fork.1"` resuelven a `0.31.6` (el oficial, ignora el
+pre-release); solo `.exact("0.31.6-fork.1")` la coge. En este repo es
+irrelevante porque `Package.swift` fija `mlx-swift` por `revision:` (SHA
+exacto), no por rango — nunca se depende de esa resolución automática. Los
+tags siguen sirviendo como marcador ordenado y trazable, y son consumibles
+con `.exact(...)` si algún día hiciera falta, pero no cumplen "Xcode coge
+siempre la más nueva" en resolución por rango.
+
 **Tags heredados con el esquema antiguo** (`3.31.4v`, `3.31.5v`, `3.31.6v`,
 `v3.31.5`) se dejan como están, sin retaguear — son historial, no se
 resuelven con Xcode y no hay que reproducir ese formato en tags nuevos.
