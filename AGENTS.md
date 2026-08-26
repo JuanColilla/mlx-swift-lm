@@ -128,23 +128,52 @@ entre ambos conjuntos — leer el interface no basta.
    ninguno: `git commit` publica el índice entero, no solo lo que acabas de
    añadir con `git add <ruta>`.
 
-## Convención de tags: sufijo `v`
+## Convención de tags: `vX.X.X-fork.N`
 
-Los tags que terminan en **`v`** marcan una **variante custom del fork**,
-para diferenciarlos de los tags del oficial:
+Esquema vigente desde 2026-08-26. Los tags de variante propia siguen
+`vX.X.X-fork.N`:
 
-- `3.31.4` → tag oficial de upstream (mismo commit o antecesor directo).
-- `3.31.4v` → tag nuestro en el fork, construido sobre esa misma base,
-  con nuestras variaciones (ej. `DOCS/` de investigación) incluidas.
+- `X.X.X` = último tag oficial de upstream (`origin`) sobre el que está
+  construida la variante.
+- `N` = contador incremental de variantes propias sobre esa base; se
+  reinicia a 1 cada vez que se sube la base a un tag oficial más nuevo.
 
-Al crear un tag nuevo tras un merge estable:
-1. Identificar el último tag oficial relevante (`git ls-remote --tags
-   https://github.com/ml-explore/mlx-swift-lm.git`).
-2. Usar ese mismo número + sufijo `v` (o incrementar el patch + `v` si el
-   HEAD ya tiene commits oficiales por delante del último tag oficial).
-3. Tag anotado (`git tag -a <version>v -m "..."`) apuntando al commit
-   mergeado en `main`.
-4. `git push origin <version>v` para subirlo al fork.
+Ejemplo: si el oficial va por `3.31.4`, la primera variante propia sobre esa
+base es `v3.31.4-fork.1`, la segunda `v3.31.4-fork.2`, etc. Al fusionar
+`3.31.5` del oficial, la siguiente variante vuelve a `v3.31.5-fork.1`.
 
-Nunca crear un tag sin sufijo `v` en este fork — reservar los tags "pelados"
-para los que vengan replicados del oficial.
+**Por qué este formato y no otro:**
+- `vX.X.X` (prefijo `v`, sin sufijo) es lo que Xcode/SPM esperan para
+  resolver un paquete como dependencia — un sufijo pegado (`X.X.Xv`, el
+  esquema anterior) no es SemVer válido y Xcode no lo ordena.
+- El identificador va como **pre-release** (`-fork.N`), no como metadata de
+  build (`+fork.N`): SemVer ignora el metadata de build al comparar
+  precedencia, así que con `+fork.N` Xcode no garantiza resolver la
+  variante más reciente. Con `-fork.N` los identificadores numéricos se
+  comparan numéricamente, así que `-fork.3 > -fork.2 > -fork.1` siempre, y
+  la comparación de la tripleta base (`3.31.5 > 3.31.4`) tiene prioridad
+  sobre el sufijo al saltar de base oficial.
+- Como Xcode/SPM resuelven versiones por URL de repositorio, estos tags
+  nunca se comparan contra los tags del oficial (viven en repos distintos)
+  — el nombre es solo para que nosotros sepamos a qué base está pegada
+  cada variante.
+
+**Tags heredados con el esquema antiguo** (`3.31.4v`, `3.31.5v`, `3.31.6v`,
+`v3.31.5`) se dejan como están, sin retaguear — son historial, no se
+resuelven con Xcode y no hay que reproducir ese formato en tags nuevos.
+
+Crear un tag nuevo, siempre con el script — no a mano:
+
+```
+scripts/tag-fork-release.sh              # tag anotado en HEAD, push a `fork`
+scripts/tag-fork-release.sh --dry-run    # solo muestra qué tag generaría
+scripts/tag-fork-release.sh --ref <sha> --message "texto"
+```
+
+El script detecta la base oficial vía `git ls-remote --tags origin`, calcula
+`N` vía `git ls-remote --tags fork`, y publica el tag con
+`git push fork <tag>` — cada variante nueva genera siempre un tag real en
+GitHub, nunca solo local. Nunca usar `git push origin <tag>` para esto: en
+este repo `origin` empuja al fork por configuración especial (ver arriba),
+pero `fork` es el remote explícito y sin ambigüedad — el script lo usa
+siempre a propósito.
