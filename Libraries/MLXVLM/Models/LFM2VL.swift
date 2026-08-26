@@ -1013,6 +1013,10 @@ public struct LFM2VLProcessor: UserInputProcessor {
         // exactly one placeholder per image, so adjacent images produce adjacent placeholders:
         // consuming a whole run for a single image would drop every image but the first and leave
         // `mergeInputIdsWithImageFeatures` with fewer positions than features.
+        //
+        // `imageTokenId` above is already resolved per-model from the vocabulary (not
+        // hardcoded), which is what upstream's equivalent fix (#576) does for its own,
+        // run-consuming placeholder algorithm -- not applicable here.
         var newPromptTokens = [Int]()
         var imageIdx = 0
         for token in promptTokens {
