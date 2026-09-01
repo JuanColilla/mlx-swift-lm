@@ -77,11 +77,13 @@ al día con `fork/main`) — no necesitó tag de archivo, solo quedó documentad
 
 ## 4. Plan de retoma (checklist para cuando se reanude)
 
-1. En `mlx-swift-lm`, decidir el pin: seguir en `8f74acc` (ya trae el sharding, cero cambios
-   en `Package.swift`) o subir a `v0.31.6-fork.3` (`6589376`, incluye 2 commits oficiales más
-   y la documentación de ramas activas — ver §6). Si se sube el pin, **hay que actualizar
-   `MLXHub` en el mismo commit**: fija el mismo fork por `revision:` exacta y dos revisiones
-   distintas del mismo paquete no resuelven (comentario en `Package.swift:71-73`).
+1. ~~Decidir el pin~~ **Hecho el 2026-09-02** (fuera de esta rama, en `develop`): el pin subió
+   de `8f74acc` a `6589376` (`v0.31.6-fork.3`) solo por el fix oficial de
+   `StreamOrDevice.stream(_:)` (#463); `mlx-swift-lm` se retagueó como `v3.31.4-fork.3`.
+   `MLXHub` se actualiza aparte (fuera del alcance de este repo). Sigue sin haber nada de
+   tensor-parallel en el pin: sigue viajando sin usarse, ahora desde `6589376` en vez de
+   `8f74acc`. Si `develop` avanza más antes de retomar esto, revisa de nuevo si el pin sigue al
+   día — este documento no se actualiza solo.
 2. Sobre `develop` actual (no sobre el `wip/tensor-parallel` de esta fecha, que solo sirve de
    ancla), portar el diff de `archive/inferring-ios-distrib-tensor` contra su base
    (`718877e`) modelo a modelo, arquitectura por arquitectura, llamando directamente a
@@ -97,7 +99,7 @@ al día con `fork/main`) — no necesitó tag de archivo, solo quedó documentad
    atención y cada MLP, no solo en los límites de pipeline. Sobre Bonjour/TCP entre iPhones
    puede ser network-bound. Prototipar con 2 nodos reales antes de portar las 7 arquitecturas.
 
-## 5. Tags de variante publicados el 2026-09-01
+## 5. Tags de variante publicados el 2026-09-01/02
 
 Además de las referencias de archivo (§2), se publicó un tag `vX.X.X-fork.N` normal en cada
 repo con el estado del día, siguiendo la convención de `AGENTS.md`:
@@ -106,8 +108,14 @@ repo con el estado del día, siguiendo la convención de `AGENTS.md`:
 |---|---|---|---|
 | `mlx-swift-lm` | `v3.31.4-fork.2` | `c25a192` (`develop`) | `3.31.4` |
 | `mlx-swift` | `v0.31.6-fork.3` | `6589376` (`feature/distributed-group-port`) | `0.31.6` |
+| `mlx-swift-lm` | `v3.31.4-fork.3` | `01d4745` (`develop`, 2026-09-02) | `3.31.4` |
 
-Ninguno de los dos incluye trabajo de tensor-parallel nuevo: son la fusión oficial del día más
+`v3.31.4-fork.3` supersede a `.fork.2`: sube el pin de `mlx-swift` de `8f74acc` a `6589376`
+(`v0.31.6-fork.3`), así que `mlx-swift-lm` y `mlx-swift` vuelven a estar en sus respectivos
+últimos tags mutuamente consistentes. `MLXHub` necesita el mismo bump por su cuenta (lo hace
+el usuario, fuera de este repo).
+
+Ninguno de los tres incluye trabajo de tensor-parallel nuevo: son la fusión oficial del día más
 la documentación de ramas. `v0.31.6-fork.3` es la punta actual de la rama candidata a
 tensor-parallel — es el commit al que apuntaría el pin si se decide subirlo (§4.1).
 
