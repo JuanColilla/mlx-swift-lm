@@ -86,6 +86,13 @@ El criterio de integración vive en
 el upstream es la base arquitectónica y lo propio se porta encima, nunca al
 revés. Léelo antes de resolver conflictos con el oficial.
 
+**Única excepción vigente:** `wip/tensor-parallel`, empujada a `fork` (no solo
+tag local como las antiguas `archive/<rama>`). Aparca la investigación de
+tensor-parallel hasta después de la 2.1.0 — ver
+[`knowledge/2026-09-01-tensor-parallel-desorden.md`](knowledge/2026-09-01-tensor-parallel-desorden.md).
+No fusionar a `develop` sin retomar el trabajo primero; no borrarla sin
+confirmar con el usuario.
+
 ## Flujo de trabajo habitual
 
 1. `git fetch origin` para comprobar si hay novedades del oficial.
