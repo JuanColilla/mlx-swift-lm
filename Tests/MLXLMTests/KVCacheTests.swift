@@ -1215,60 +1215,62 @@ func testCacheListCopyIsIndependent() async throws {
 
 @Test
 func testQuantizedAttentionCausalMaskMatchesFullPrecision() throws {
-    MLXRandom.seed(0)
+    withRandomState(MLXRandom.RandomState(seed: 0)) {
+        let (B, nKVHeads, L, D) = (1, 2, 4, 64)
+        let scale = 1.0 / Float(D).squareRoot()
 
-    let (B, nKVHeads, L, D) = (1, 2, 4, 64)
-    let scale = 1.0 / Float(D).squareRoot()
+        // nRepeats 1 = MHA, 2 = GQA (exercises the 5-D reshape + .causal path that silently corrupts).
+        for nRepeats in [1, 2] {
+            let nQHeads = nKVHeads * nRepeats
+            let q = MLXRandom.normal([B, nQHeads, L, D])
+            let k = MLXRandom.normal([B, nKVHeads, L, D])
+            let v = MLXRandom.normal([B, nKVHeads, L, D])
 
-    // nRepeats 1 = MHA, 2 = GQA (exercises the 5-D reshape + .causal path that silently corrupts).
-    for nRepeats in [1, 2] {
-        let nQHeads = nKVHeads * nRepeats
-        let q = MLXRandom.normal([B, nQHeads, L, D])
-        let k = MLXRandom.normal([B, nKVHeads, L, D])
-        let v = MLXRandom.normal([B, nKVHeads, L, D])
+            // Reference: full-precision causal attention.
+            let reference = MLXFast.scaledDotProductAttention(
+                queries: q, keys: k, values: v, scale: scale, mask: .causal)
 
-        // Reference: full-precision causal attention.
-        let reference = MLXFast.scaledDotProductAttention(
-            queries: q, keys: k, values: v, scale: scale, mask: .causal)
+            // Path under test: quantized cache + .causal.
+            let cache = QuantizedKVCache(groupSize: 64, bits: 8)
+            let (qK, qV) = cache.updateQuantized(keys: k, values: v)
+            let out = quantizedScaledDotProductAttention(
+                queries: q, quantizedKeys: qK, quantizedValues: qV,
+                scale: scale, mask: .causal,
+                groupSize: cache.groupSize, bits: cache.bits, mode: cache.mode)
 
-        // Path under test: quantized cache + .causal.
-        let cache = QuantizedKVCache(groupSize: 64, bits: 8)
-        let (qK, qV) = cache.updateQuantized(keys: k, values: v)
-        let out = quantizedScaledDotProductAttention(
-            queries: q, quantizedKeys: qK, quantizedValues: qV,
-            scale: scale, mask: .causal,
-            groupSize: cache.groupSize, bits: cache.bits, mode: cache.mode)
-
-        #expect(out.shape == reference.shape)
-        // 8-bit quant error is << 0.1; the bug diverges by O(1).
-        let close = allClose(out, reference, rtol: 0.05, atol: 0.1).item(Bool.self)
-        #expect(
-            close, "quantized causal attention diverges from full precision (nRepeats=\(nRepeats))")
+            #expect(out.shape == reference.shape)
+            // 8-bit quant error is << 0.1; the bug diverges by O(1).
+            let close = allClose(out, reference, rtol: 0.05, atol: 0.1).item(Bool.self)
+            #expect(
+                close,
+                "quantized causal attention diverges from full precision (nRepeats=\(nRepeats))")
+        }
     }
 }
 
 @Test("quantizedScaledDotProductAttention preserves the score dtype")
 func preservesScoreDtype() {
-    MLXRandom.seed(0)
-    let (B, H, L, D) = (1, 2, 4, 64)
-    let scale = 1.0 / Float(D).squareRoot()
+    withRandomState(MLXRandom.RandomState(seed: 0)) {
+        let (B, H, L, D) = (1, 2, 4, 64)
+        let scale = 1.0 / Float(D).squareRoot()
 
-    // f32 passes even with a mis-typed fill; f16/bf16 are exactly what a
-    // float32 fill silently promotes — so assert the output keeps its dtype.
-    for dtype in [DType.float16, .bfloat16, .float32] {
-        let q = MLXRandom.normal([B, H, L, D]).asType(dtype)
-        let k = MLXRandom.normal([B, H, L, D]).asType(dtype)
-        let v = MLXRandom.normal([B, H, L, D]).asType(dtype)
+        // f32 passes even with a mis-typed fill; f16/bf16 are exactly what a
+        // float32 fill silently promotes — so assert the output keeps its dtype.
+        for dtype in [DType.float16, .bfloat16, .float32] {
+            let q = MLXRandom.normal([B, H, L, D]).asType(dtype)
+            let k = MLXRandom.normal([B, H, L, D]).asType(dtype)
+            let v = MLXRandom.normal([B, H, L, D]).asType(dtype)
 
-        let cache = QuantizedKVCache(groupSize: 64, bits: 8)
-        let (qK, qV) = cache.updateQuantized(keys: k, values: v)
-        let out = quantizedScaledDotProductAttention(
-            queries: q, quantizedKeys: qK, quantizedValues: qV,
-            scale: scale, mask: .causal,
-            groupSize: cache.groupSize, bits: cache.bits, mode: cache.mode)
+            let cache = QuantizedKVCache(groupSize: 64, bits: 8)
+            let (qK, qV) = cache.updateQuantized(keys: k, values: v)
+            let out = quantizedScaledDotProductAttention(
+                queries: q, quantizedKeys: qK, quantizedValues: qV,
+                scale: scale, mask: .causal,
+                groupSize: cache.groupSize, bits: cache.bits, mode: cache.mode)
 
-        #expect(out.dtype == dtype, "output promoted to \(out.dtype) for input \(dtype)")
-        #expect(out.asType(.float32).sum().item(Float.self).isFinite)  // no -inf → NaN
+            #expect(out.dtype == dtype, "output promoted to \(out.dtype) for input \(dtype)")
+            #expect(out.asType(.float32).sum().item(Float.self).isFinite)  // no -inf → NaN
+        }
     }
 }
 
@@ -1553,45 +1555,45 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
 /// reference that never rotated: every position kept in a plain array under an explicit
 /// causal-intersect-window mask over absolute positions.
 @Test func testRotatingCacheAttentionPastWrapMatchesLogicalOrderReference() {
-    MLXRandom.seed(0)
+    withRandomState(MLXRandom.RandomState(seed: 0)) {
+        let window = 8
+        let history = 20
+        let queries = 4
+        let heads = 2
+        let headDim = 4
+        let scale = 1.0 / Float(headDim).squareRoot()
 
-    let window = 8
-    let history = 20
-    let queries = 4
-    let heads = 2
-    let headDim = 4
-    let scale = 1.0 / Float(headDim).squareRoot()
+        let allKeys = MLXRandom.normal([1, heads, history + queries, headDim])
+        let allValues = MLXRandom.normal([1, heads, history + queries, headDim])
+        let q = MLXRandom.normal([1, heads, queries, headDim])
 
-    let allKeys = MLXRandom.normal([1, heads, history + queries, headDim])
-    let allValues = MLXRandom.normal([1, heads, history + queries, headDim])
-    let q = MLXRandom.normal([1, heads, queries, headDim])
+        let cache = RotatingKVCache(maxSize: window, keep: 0)
+        for p in 0 ..< history {
+            _ = cache.update(
+                keys: allKeys[0..., 0..., p ..< (p + 1), 0...],
+                values: allValues[0..., 0..., p ..< (p + 1), 0...])
+        }
 
-    let cache = RotatingKVCache(maxSize: window, keep: 0)
-    for p in 0 ..< history {
-        _ = cache.update(
-            keys: allKeys[0..., 0..., p ..< (p + 1), 0...],
-            values: allValues[0..., 0..., p ..< (p + 1), 0...])
+        let mask = cache.makeMask(n: queries, windowSize: window, returnArray: false)
+        let (cachedKeys, cachedValues) = cache.update(
+            keys: allKeys[0..., 0..., history ..< (history + queries), 0...],
+            values: allValues[0..., 0..., history ..< (history + queries), 0...])
+        let out = MLXFast.scaledDotProductAttention(
+            queries: q, keys: cachedKeys, values: cachedValues, scale: scale, mask: mask)
+
+        // Reference: all history retained, masked by absolute position.
+        let queryPositions = MLXArray(Int32(history) ..< Int32(history + queries))[0..., .newAxis]
+        let keyPositions = MLXArray(Int32(0) ..< Int32(history + queries))[.newAxis]
+        let referenceMask =
+            (queryPositions .>= keyPositions) & (queryPositions .< keyPositions + Int32(window))
+        let reference = MLXFast.scaledDotProductAttention(
+            queries: q, keys: allKeys, values: allValues, scale: scale, mask: .array(referenceMask))
+
+        #expect(out.shape == reference.shape)
+        #expect(
+            allClose(out, reference, rtol: 1e-5, atol: 1e-5).item(Bool.self),
+            "post-wrap attention diverged from the logical-order reference")
     }
-
-    let mask = cache.makeMask(n: queries, windowSize: window, returnArray: false)
-    let (cachedKeys, cachedValues) = cache.update(
-        keys: allKeys[0..., 0..., history ..< (history + queries), 0...],
-        values: allValues[0..., 0..., history ..< (history + queries), 0...])
-    let out = MLXFast.scaledDotProductAttention(
-        queries: q, keys: cachedKeys, values: cachedValues, scale: scale, mask: mask)
-
-    // Reference: all history retained, masked by absolute position.
-    let queryPositions = MLXArray(Int32(history) ..< Int32(history + queries))[0..., .newAxis]
-    let keyPositions = MLXArray(Int32(0) ..< Int32(history + queries))[.newAxis]
-    let referenceMask =
-        (queryPositions .>= keyPositions) & (queryPositions .< keyPositions + Int32(window))
-    let reference = MLXFast.scaledDotProductAttention(
-        queries: q, keys: allKeys, values: allValues, scale: scale, mask: .array(referenceMask))
-
-    #expect(out.shape == reference.shape)
-    #expect(
-        allClose(out, reference, rtol: 1e-5, atol: 1e-5).item(Bool.self),
-        "post-wrap attention diverged from the logical-order reference")
 }
 
 // MARK: - Variance-normalized KV cache

@@ -61,19 +61,24 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        // Fork propio: 8f74acc desciende del tag 0.31.6 oficial (git describe:
-        // 0.31.6-15-g8f74acc), asi que cubre el minimo que exige upstream, y ademas
-        // aporta Bonsai 1-bit, DistributedGroup y el diferido de errores Metal.
+        // Fork propio: 6589376 desciende del tag 0.31.6 oficial (git describe:
+        // 0.31.6-23-g6589376, tag propio v0.31.6-fork.3), asi que cubre el minimo
+        // que exige upstream, y ademas aporta Bonsai 1-bit, DistributedGroup, el
+        // diferido de errores Metal, y el fix de StreamOrDevice.stream(_:) (#463
+        // oficial) que ignoraba el stream explicito y ejecutaba en el por defecto.
+        // Bump 2026-09-02 desde 8f74acc solo por ese fix; no incluye nada de
+        // tensor-parallel (Source/MLXNN/Distributed.swift viaja igual sin usarse,
+        // ver knowledge/2026-09-01-tensor-parallel-desorden.md en wip/tensor-parallel).
         //
         // Tiene que ser `revision:` y no un requisito de version: en el fork el
-        // tag 0.31.6 apunta a 0bb916c, ANTERIOR a esos tres parches, asi que un
+        // tag 0.31.6 apunta a 0bb916c, ANTERIOR a esos parches, asi que un
         // `from: "0.31.6"` resolveria, compilaria, y los perderia en silencio.
         // Y tiene que ser ESTA revision y no otra: MLXHub pinnea el mismo fork
         // por revision exacta, y dos revisiones distintas del mismo paquete no
-        // resuelven.
+        // resuelven -- si tocas esto, actualiza tambien el pin de MLXHub.
         .package(
             url: "https://github.com/JuanColilla/mlx-swift",
-            revision: "8f74acc071f2a710bce9766769b9698398febcc9"),
+            revision: "6589376090acf7c552476cb54b31245d5e744d50"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
