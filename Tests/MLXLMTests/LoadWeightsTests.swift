@@ -181,6 +181,21 @@ final class LoadWeightsTests: XCTestCase {
         XCTAssertEqual(weightLoadConcurrency(processorCount: 32), 16)
     }
 
+    // FORK(JuanColilla): the lazy path is the default only where memory is the
+    // scarce resource, and the environment override only exists there.
+    func testLazyWeightLoadingIsPreferredOnlyOnMemoryConstrainedPlatforms() {
+        #if os(iOS) || os(tvOS) || os(visionOS)
+        XCTAssertTrue(lazyWeightLoadingPreferred(environment: [:]))
+        XCTAssertTrue(lazyWeightLoadingPreferred(environment: ["MLX_CONCURRENT_WEIGHT_LOAD": "0"]))
+        XCTAssertFalse(lazyWeightLoadingPreferred(environment: ["MLX_CONCURRENT_WEIGHT_LOAD": "1"]))
+        XCTAssertFalse(
+            lazyWeightLoadingPreferred(environment: ["MLX_CONCURRENT_WEIGHT_LOAD": " True "]))
+        #else
+        XCTAssertFalse(lazyWeightLoadingPreferred(environment: [:]))
+        XCTAssertFalse(lazyWeightLoadingPreferred(environment: ["MLX_CONCURRENT_WEIGHT_LOAD": "0"]))
+        #endif
+    }
+
     func testInferencePreparationFailureIsReportedWithoutEscaping() {
         let report = prepareInferenceState(in: FailingInferenceStateModel())
 

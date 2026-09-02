@@ -104,6 +104,33 @@ func weightLoadConcurrency(processorCount: Int = ProcessInfo.processInfo.activeP
 /// Below this size a file is loaded whole: splitting cannot beat a single sequential read.
 private let minimumBytesPerLoadGroup: Int64 = 256 * 1024 * 1024
 
+// FORK(JuanColilla): platform gate for the concurrent loader above.
+//
+// The concurrent loader trades memory for wall-clock: every tensor is realized
+// inside its work item, before `sanitize`/`prepare` run, so those steps operate
+// on a fully resident checkpoint. On iOS-family devices a 5 GB model already
+// sits within a few hundred MB of the per-process jetsam limit, and that
+// margin is exactly what the eager path spends. `MLX_CONCURRENT_WEIGHT_LOAD=1`
+// re-enables the concurrent path there for A/B measurement.
+
+/// Whether `loadWeights` should keep weight arrays lazy until `eval(model)`.
+///
+/// `true` on iOS, tvOS and visionOS unless the environment opts back into the
+/// concurrent loader; always `false` elsewhere.
+func lazyWeightLoadingPreferred(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> Bool {
+    #if os(iOS) || os(tvOS) || os(visionOS)
+    let raw = environment["MLX_CONCURRENT_WEIGHT_LOAD"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    return !(raw == "1" || raw == "true" || raw == "on")
+    #else
+    _ = environment
+    return false
+    #endif
+}
+
 /// Lock-guarded shared state for the concurrent load.
 private final class ConcurrentLoadState: @unchecked Sendable {
     private let lock = NSLock()
@@ -501,7 +528,26 @@ public func loadWeights(
             in: modelDirectory,
             selection: weightFileSelection,
             additionalFiles: additionalFiles ?? [])
-        (weights, metadata) = try loadWeightArrays(urls: weightURLs)
+        if lazyWeightLoadingPreferred() {
+            // FORK(JuanColilla): keep the arrays lazy on memory-constrained
+            // platforms. `loadWeightArrays` realizes every tensor before
+            // `sanitize`/`prepare` run, so any transform they apply (a
+            // transposed conv, stacked experts, a fused projection) is paid
+            // on top of the fully resident checkpoint. Deferring realization
+            // to `eval(model)` below lets MLX free each source tensor as its
+            // consumer finishes, which is the peak this loader had before
+            // the concurrent loader. Under the process-wide `evalLock` the
+            // concurrent path gains no wall-clock on these platforms anyway.
+            for url in weightURLs {
+                let (w, m) = try loadArraysAndMetadata(url: url)
+                weights.merge(w) { _, new in new }
+                if metadata.isEmpty {
+                    metadata = m
+                }
+            }
+        } else {
+            (weights, metadata) = try loadWeightArrays(urls: weightURLs)
+        }
     }
 
     // per-model cleanup (models can inspect metadata to customize behavior)
@@ -530,8 +576,20 @@ public func loadWeights(
     }
 
     // apply the loaded weights
-    let parameters = ModuleParameters.unflattened(weights)
-    try model.update(parameters: parameters, verify: [.all])
+    do {
+        let parameters = ModuleParameters.unflattened(weights)
+        try model.update(parameters: parameters, verify: [.all])
+    }
+    // FORK(JuanColilla): the module tree is now the only owner of the
+    // checkpoint arrays. Dropping the loader's own references before
+    // `prepareInferenceState` matters: a preparation step that replaces
+    // modules with storage-sharing views (`FusedQuantizedLinearProjectionCache`)
+    // can only release the source tensors it fuses if nothing else still
+    // holds them, and both `weights` and `parameters` did — so the whole
+    // model's worth of fused sources stayed resident until this function
+    // returned, ~630 MB on a 27B Qwen 3.5 GDN checkpoint. With the
+    // references gone the transient is one layer at a time.
+    weights.removeAll()
 
     // Build derived inference-only state while the loader still has exclusive
     // access. Forward passes must remain read-only. Realizing the arrays stays
