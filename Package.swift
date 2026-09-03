@@ -78,7 +78,7 @@ let package = Package(
         // resuelven -- si tocas esto, actualiza tambien el pin de MLXHub.
         .package(
             url: "https://github.com/JuanColilla/mlx-swift",
-            revision: "6589376090acf7c552476cb54b31245d5e744d50"),
+            revision: "b3a2bc3c5e1f732197788ad85989c873add550e7"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
