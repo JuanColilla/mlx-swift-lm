@@ -1,0 +1,280 @@
+// FORK(JuanColilla): R-56 expert streaming — the residency tier (L1).
+//
+// A fixed pool of expert slots shared by *every* layer. The 40 MoE layers of
+// a Qwen 3.5 checkpoint have identical expert geometry, so one global bank
+// lets a hot layer borrow capacity from a cold one; a per-layer bank cannot.
+//
+// The bank is deliberately NOT a module parameter. `loadWeights` verifies the
+// checkpoint against the module tree with `verify: [.all]`, which fails both
+// on unknown keys and on parameters the checkpoint does not provide — so a
+// bank registered as a parameter would break the load in both directions at
+// once. It is mutable streaming state, not a weight.
+
+import Foundation
+import MLX
+
+public struct ExpertSlotBankStatistics: Sendable, Equatable {
+    public var hits: Int = 0
+    public var misses: Int = 0
+    public var evictions: Int = 0
+    public var installSeconds: Double = 0
+
+    public var hitRate: Double {
+        let total = hits + misses
+        return total > 0 ? Double(hits) / Double(total) : 0
+    }
+}
+
+public enum ExpertSlotBankError: Error, CustomStringConvertible {
+    case requestExceedsCapacity(requested: Int, slots: Int)
+    case noEvictableSlot(slots: Int)
+
+    public var description: String {
+        switch self {
+        case .requestExceedsCapacity(let requested, let slots):
+            """
+            \(requested) experts requested at once but the bank has \(slots) slots; \
+            a prefill sweep must use the staged path, not the bank
+            """
+        case .noEvictableSlot(let slots):
+            "all \(slots) slots are pinned; the bank is too small for this top-K"
+        }
+    }
+}
+
+public final class ExpertSlotBank: @unchecked Sendable {
+
+    public struct Configuration: Sendable {
+        /// Target size of the bank. Converted to a slot count on construction;
+        /// it is sampled against the process ceiling by the caller, never
+        /// written as a constant here.
+        public var capacityBytes: Int
+        /// Upper bound on experts read in a single `pread` batch, so staging
+        /// does not scale with the number of misses.
+        public var maxLoadBatch: Int
+
+        public init(capacityBytes: Int, maxLoadBatch: Int = 64) {
+            self.capacityBytes = capacityBytes
+            self.maxLoadBatch = maxLoadBatch
+        }
+    }
+
+    public let store: ExpertResidencyStore
+    public private(set) var configuration: Configuration
+
+    private var pools: [MLXArray] = []
+    private var slotOfKey: [ExpertKey: Int] = [:]
+    private var keyOfSlot: [ExpertKey?] = []
+    private var referenced: [Bool] = []
+    private var pinned: [Bool] = []
+    private var pinnedSlots: [Int] = []
+    private var clockHand = 0
+
+    private let lock = NSLock()
+    private var statisticsStorage = ExpertSlotBankStatistics()
+
+    public init(store: ExpertResidencyStore, configuration: Configuration) {
+        self.store = store
+        self.configuration = configuration
+        allocate(slots: Self.slotCount(for: configuration.capacityBytes, store: store))
+    }
+
+    public var slotCount: Int { keyOfSlot.count }
+
+    public var bytesResident: Int { slotCount * store.index.bytesPerExpert }
+
+    public var statistics: ExpertSlotBankStatistics {
+        lock.withLock { statisticsStorage }
+    }
+
+    public func resetStatistics() {
+        lock.withLock { statisticsStorage = ExpertSlotBankStatistics() }
+    }
+
+    /// The bank array a projection's quantized matmul indexes with slot ids.
+    public func pool(_ piece: ExpertPiece) -> MLXArray { pools[piece.slot] }
+
+    public static func slotCount(for capacityBytes: Int, store: ExpertResidencyStore) -> Int {
+        max(1, capacityBytes / max(1, store.index.bytesPerExpert))
+    }
+
+    // MARK: - Residency
+
+    /// Resolve `keys` to slot ids, reading and installing whatever is missing.
+    ///
+    /// Every returned slot is pinned until the next call: an eviction must
+    /// never take a slot the layer in flight is about to read.
+    public func ensure(keys: [ExpertKey]) throws -> [Int] {
+        guard keys.count <= slotCount else {
+            throw ExpertSlotBankError.requestExceedsCapacity(
+                requested: keys.count, slots: slotCount)
+        }
+
+        for slot in pinnedSlots { pinned[slot] = false }
+        pinnedSlots.removeAll(keepingCapacity: true)
+
+        var slots = [Int](repeating: -1, count: keys.count)
+        var missing = [(position: Int, key: ExpertKey)]()
+        var duplicates = [(position: Int, resolvedBy: Int)]()
+        var hits = 0
+
+        for (position, key) in keys.enumerated() {
+            if let slot = slotOfKey[key] {
+                slots[position] = slot
+                referenced[slot] = true
+                pin(slot)
+                hits += 1
+            } else if let existing = missing.first(where: { $0.key == key }) {
+                // A repeated key inside one request must map to one slot, and
+                // its slot only exists after the install below.
+                duplicates.append((position, existing.position))
+            } else {
+                missing.append((position, key))
+            }
+        }
+
+        if !missing.isEmpty {
+            try install(missing, into: &slots)
+        }
+        for duplicate in duplicates {
+            slots[duplicate.position] = slots[duplicate.resolvedBy]
+        }
+
+        lock.withLock {
+            statisticsStorage.hits += hits
+            statisticsStorage.misses += missing.count
+        }
+        return slots
+    }
+
+    private func install(
+        _ missing: [(position: Int, key: ExpertKey)], into slots: inout [Int]
+    ) throws {
+        var pending = missing[...]
+        while !pending.isEmpty {
+            let chunk = pending.prefix(configuration.maxLoadBatch)
+            pending = pending.dropFirst(chunk.count)
+
+            var targets = [Int]()
+            for entry in chunk {
+                let slot = try evict()
+                targets.append(slot)
+                slots[entry.position] = slot
+                pin(slot)
+            }
+
+            let start = Date.timeIntervalSinceReferenceDate
+            let staged = try store.readBatch(keys: chunk.map(\.key))
+            let indices = MLXArray(targets.map { Int32($0) })
+            for piece in ExpertPiece.all {
+                pools[piece.slot][indices] = staged[piece.slot]
+            }
+            // Evaluating here is what lets MLX donate the pool buffer to the
+            // scatter instead of copying the whole bank, and it releases the
+            // staging buffers as soon as they are consumed.
+            eval(pools)
+            let elapsed = Date.timeIntervalSinceReferenceDate - start
+
+            for (entry, slot) in zip(chunk, targets) {
+                if let previous = keyOfSlot[slot] { slotOfKey[previous] = nil }
+                keyOfSlot[slot] = entry.key
+                slotOfKey[entry.key] = slot
+                referenced[slot] = true
+            }
+            lock.withLock { statisticsStorage.installSeconds += elapsed }
+        }
+    }
+
+    /// CLOCK: sweep, clearing reference bits, until an unpinned slot with a
+    /// clear bit is found. Cheaper than exact LRU and does not need a list.
+    private func evict() throws -> Int {
+        let count = slotCount
+        var examined = 0
+        while examined < 2 * count {
+            let slot = clockHand
+            clockHand = (clockHand + 1) % count
+            examined += 1
+            if pinned[slot] { continue }
+            if referenced[slot] {
+                referenced[slot] = false
+                continue
+            }
+            if keyOfSlot[slot] != nil {
+                lock.withLock { statisticsStorage.evictions += 1 }
+            }
+            return slot
+        }
+        throw ExpertSlotBankError.noEvictableSlot(slots: count)
+    }
+
+    private func pin(_ slot: Int) {
+        if !pinned[slot] {
+            pinned[slot] = true
+            pinnedSlots.append(slot)
+        }
+    }
+
+    // MARK: - Elasticity
+
+    /// Grow or shrink the bank.
+    ///
+    /// Growing preserves the resident experts, replacing one piece at a time
+    /// so the transient is one pool, not the whole bank. Shrinking releases
+    /// before allocating and restarts cold on purpose: under memory pressure
+    /// the point is to give memory back immediately, and the alternative
+    /// would need both sizes live at once.
+    public func resize(to capacityBytes: Int) {
+        let target = Self.slotCount(for: capacityBytes, store: store)
+        guard target != slotCount else {
+            configuration.capacityBytes = capacityBytes
+            return
+        }
+
+        if target > slotCount {
+            grow(to: target)
+        } else {
+            shrink(to: target)
+        }
+        configuration.capacityBytes = capacityBytes
+    }
+
+    private func grow(to target: Int) {
+        let previous = slotCount
+        for piece in ExpertPiece.all {
+            let record = store.index.layers[0][piece]
+            var pool = MLX.zeros([target] + record.rowShape, dtype: record.dtype.mlxDType)
+            pool[0 ..< previous] = pools[piece.slot]
+            eval(pool)
+            pools[piece.slot] = pool
+        }
+        keyOfSlot.append(contentsOf: [ExpertKey?](repeating: nil, count: target - previous))
+        referenced.append(contentsOf: [Bool](repeating: false, count: target - previous))
+        pinned.append(contentsOf: [Bool](repeating: false, count: target - previous))
+        clockHand = min(clockHand, target - 1)
+    }
+
+    private func shrink(to target: Int) {
+        pools.removeAll()
+        slotOfKey.removeAll()
+        keyOfSlot.removeAll()
+        referenced.removeAll()
+        pinned.removeAll()
+        pinnedSlots.removeAll()
+        clockHand = 0
+        MLX.GPU.clearCache()
+        allocate(slots: target)
+    }
+
+    private func allocate(slots: Int) {
+        pools = ExpertPiece.all.map { piece in
+            let record = store.index.layers[0][piece]
+            return MLX.zeros([slots] + record.rowShape, dtype: record.dtype.mlxDType)
+        }
+        eval(pools)
+        keyOfSlot = [ExpertKey?](repeating: nil, count: slots)
+        referenced = [Bool](repeating: false, count: slots)
+        pinned = [Bool](repeating: false, count: slots)
+        pinnedSlots = []
+        clockHand = 0
+    }
+}
