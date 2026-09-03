@@ -281,13 +281,25 @@ public struct WeightLoadingSelection: Sendable {
 
     /// Keeps a contiguous, global transformer-layer range and remaps it to
     /// the zero-based indices of a pipeline-sharded module tree.
+    /// - Parameter includesOutputHead: whether this rank keeps `lm_head`.
+    ///   Only the rank that turns hidden states into logits needs it; in a
+    ///   pipeline every other rank loads an 800 MB projection whose output
+    ///   nobody reads. Pass `false` there — and drop the module too
+    ///   (`dropPipelineOutputHead(from:)` in MLXLLM), or `update(parameters:
+    ///   verify: [.all])` will refuse a tree whose `lm_head` has no weights.
+    ///   Untied checkpoints only: when `tie_word_embeddings` is true there is
+    ///   no separate `lm_head` to leave out and this changes nothing.
     public static func pipelineLayers(
         range: Range<Int>,
         sourcePrefixes: [String],
-        destinationPrefix: String
+        destinationPrefix: String,
+        includesOutputHead: Bool = true
     ) -> Self {
         Self(
             includes: { key in
+                if !includesOutputHead, key.hasPrefix(Self.outputHeadPrefix) {
+                    return false
+                }
                 guard let layer = Self.layerIndex(in: key, prefixes: sourcePrefixes) else {
                     return true
                 }
@@ -301,6 +313,14 @@ public struct WeightLoadingSelection: Sendable {
             }
         )
     }
+
+    /// Every architecture in this package names the output projection
+    /// `lm_head`, matching the checkpoints on the Hub — the `@ModuleInfo(key:
+    /// "lm_head")` on `LlamaModel`, `Qwen35Model`, `Qwen3NextModel` and the
+    /// rest. Kept as a constant rather than a parameter because a rank that
+    /// disagreed with the model about that name would silently load nothing
+    /// and fail verification instead.
+    static let outputHeadPrefix = "lm_head."
 
     private static func layerIndex(in key: String, prefixes: [String]) -> Int? {
         layerMatch(in: key, prefixes: prefixes)?.index

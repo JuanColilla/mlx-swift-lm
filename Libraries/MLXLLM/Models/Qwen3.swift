@@ -164,6 +164,18 @@ public class Qwen3ModelInner: Module {
 }
 
 public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
+
+    /// R-55 2.3: drops the output projection on a pipeline rank that never
+    /// reads its own logits. See `dropPipelineOutputHead(from:)` in
+    /// `AutoParallel.swift` — this is only its per-architecture half, kept
+    /// here because `_lmHead`'s storage is private to the class.
+    @discardableResult
+    public func removePipelineOutputHead() -> Bool {
+        guard lmHead != nil else { return false }
+        _lmHead.wrappedValue = nil
+        return true
+    }
+
     public let vocabularySize: Int
     public var kvHeads: [Int]
 

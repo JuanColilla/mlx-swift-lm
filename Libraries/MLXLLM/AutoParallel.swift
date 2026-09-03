@@ -268,3 +268,69 @@ func setLayers(on model: any LanguageModel, newLayers: [TransformerLayer], shard
         print("Couldn't update hidden layers for model \(String(describing: type(of: model)))")
     }
 }
+
+// MARK: - Rank-aware output head (R-55 2.3, asymmetric variant)
+
+/// Removes `lm_head` from a model that is **not** the rank that samples.
+///
+/// In the current pipeline every rank ends the forward pass holding the same
+/// final hidden state (the `allGather` broadcast above) and every rank
+/// applies its own `norm` + `lm_head`, but only the sampling rank ever reads
+/// the result. On an untied checkpoint that projection is a full
+/// `vocab × hidden` matrix — 826 MB on a 248k-vocabulary 6-bit model — held
+/// resident on every device to compute logits nobody looks at.
+///
+/// Returns whether the head was actually removed, and that return value is
+/// the point: the caller must pass `includesOutputHead: false` to
+/// `WeightLoadingSelection.pipelineLayers` **exactly when** this returns
+/// `true`. Deriving both from one call is what stops the module tree and the
+/// weight selection from disagreeing — `update(parameters:verify: [.all])`
+/// rejects a tree with an unfed `lm_head`, and equally rejects weights for a
+/// module that is no longer there.
+///
+/// Returns `false`, leaving the model untouched, when:
+/// - the checkpoint ties its embedding and output matrices, so `lmHead` is
+///   already `nil` and the forward pass uses `embedTokens.asLinear` — there
+///   is nothing to save;
+/// - the architecture declares `lmHead` non-optional (`DeepseekV3Model`,
+///   `GPTOSSModel`, `GLM4MoELiteModel`). Making those optional is a change to
+///   their forward passes, not to this function, and until then they keep the
+///   old behaviour rather than failing to load.
+///
+/// **The logits are still built, just never evaluated.** With `lmHead` gone
+/// the forward falls through to `embedTokens.asLinear(out)`, which on an
+/// untied model is arithmetically wrong — and harmless, because MLX is lazy
+/// and a non-sampling rank never materializes its logits (MLXHub's
+/// `runLoop` reads `nextTokenLogits` only when `isSampler`). A caller that
+/// *does* evaluate them on a rank where this returned `true` gets garbage,
+/// which is why this is named for the pipeline and not offered as a general
+/// memory optimization.
+/// The half of `dropPipelineOutputHead(from:)` each architecture implements
+/// itself, because `@ModuleInfo`'s backing storage is private to the class
+/// that declares it. Conformance is the architecture's statement that its
+/// forward pass survives a missing head — today by falling through to
+/// `embedTokens.asLinear`.
+public protocol PipelineOutputHeadRemovable {
+    /// Removes `lm_head` if there is one to remove, and says whether it did.
+    @discardableResult
+    func removePipelineOutputHead() -> Bool
+}
+
+extension LlamaModel: PipelineOutputHeadRemovable {}
+extension Qwen3Model: PipelineOutputHeadRemovable {}
+extension Qwen3NextModel: PipelineOutputHeadRemovable {}
+/// `Qwen35MoEModel` inherits this: it subclasses `Qwen35Model`.
+extension Qwen35TextModel: PipelineOutputHeadRemovable {}
+
+@discardableResult
+public func dropPipelineOutputHead(from model: any LanguageModel) -> Bool {
+    if let removable = model as? PipelineOutputHeadRemovable {
+        return removable.removePipelineOutputHead()
+    }
+    // `Qwen35Model` is the multimodal wrapper: the text tower it delegates to
+    // is the one holding the head.
+    if let wrapper = model as? Qwen35Model {
+        return wrapper.languageModel.removePipelineOutputHead()
+    }
+    return false
+}
