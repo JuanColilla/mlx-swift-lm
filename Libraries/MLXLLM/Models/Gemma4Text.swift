@@ -883,7 +883,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         var sanitized = [String: MLXArray]()
         for (key, value) in weights {
             let k = key
-            // Skip vision/audio/rotary weights
+            // FORK(JuanColilla), TD-051: rotary buffers and quantization
+            // calibration ranges only. Vision and audio towers are NOT dropped
+            // here — `Gemma4Model.sanitize` does that, and `gemma4` /
+            // `gemma4_unified` are built with that type, not this one. The
+            // comment this replaces claimed a guarantee the filter never gave.
             if k.contains("self_attn.rotary_emb")
                 || k.contains("input_max")
                 || k.contains("input_min")
