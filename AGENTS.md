@@ -109,6 +109,21 @@ una rama viva.
 
 ## Avisos de entorno (agosto 2026)
 
+**El runner de `swift-testing` no encuentra el metallib de MLX.** Cualquier test
+escrito con Swift Testing que toque MLX muere con *"Failed to load the default
+metallib"* antes de ejecutar nada; reproducido en el árbol sin modificar con
+`MixedPrecisionQuantLoadTests`. Los tests con XCTest en el mismo target pasan
+sin problema. Hasta que se resuelva, **escribe los tests que toquen MLX con
+XCTest**, no con `@Test`.
+
+**Un worktree bajo `~/Documents` rompe la firma de los bundles de test.** Esa
+carpeta la sincroniza un fileprovider que deja `com.apple.FinderInfo` en los
+directorios recién creados, y `codesign` lo rechaza: *"resource fork, Finder
+information, or similar detritus not allowed"*. `xattr -c` no basta porque el
+atributo vuelve durante la build. `swift build` (sin tests) no se ve afectado.
+Solución: `swift test --scratch-path <ruta fuera de ~/Documents>`.
+
+
 **`MLXFoundationModelsTests` no puede ejecutarse con Xcode 27 beta.** El
 `.swiftinterface` de FoundationModels declara inicializadores con
 `metadata: [String: any ConvertibleToGeneratedContent]` que el dylib real no
