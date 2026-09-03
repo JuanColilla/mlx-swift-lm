@@ -72,7 +72,8 @@ final class Qwen35StreamedSparseMoeBlock: Module, UnaryLayer {
 
         let resolution: StreamedExpertResolution
         do {
-            resolution = try session.resolve(layer: layerIndex, experts: experts)
+            resolution = try session.resolve(
+                layer: layerIndex, tokenCount: tokenCount, experts: experts)
         } catch {
             // TD: `UnaryLayer` cannot throw, so a read failure mid-generation
             // has no path back to the caller. Phase 2 needs a cancellation

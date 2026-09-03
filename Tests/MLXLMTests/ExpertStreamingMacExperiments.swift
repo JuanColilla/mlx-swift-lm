@@ -495,7 +495,8 @@ final class ExpertStreamingMacExperiments: XCTestCase {
         let flatScores = scores.reshaped(6, 8)
         eval(flatIndices, flatScores)
         let experts = flatIndices.asArray(UInt32.self).map { Int($0) }
-        let resolution = try streamedBlock.session.resolve(layer: 0, experts: experts)
+        let resolution = try streamedBlock.session.resolve(
+            layer: 0, tokenCount: 6, experts: experts)
         eval(resolution.indices)
 
         // The rows the store serves must be the rows the resident model holds.
@@ -581,10 +582,14 @@ final class ExpertStreamingMacExperiments: XCTestCase {
         let promptTokens = vocabulary.encode(Self.promptText)
         let index = try ExpertOffsetIndex.build(modelDirectory: directory)
 
+        // 1 GiB appears twice, first and last, so the same process reports the
+        // same configuration twice: without that, a drift across the sweep
+        // would look like an effect of the bank size.
         let sizes: [(String, Int)] = [
+            ("P3 bank 1 GiB (pass 1)", 1 << 30),
             ("P3 bank 8 slots (per-token materialization)", 8 * index.bytesPerExpert),
-            ("P3 bank 1 GiB", 1 << 30),
             ("P3 bank 3 GiB", 3 << 30),
+            ("P3 bank 1 GiB (pass 2)", 1 << 30),
         ]
 
         for (label, bytes) in sizes {

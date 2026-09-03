@@ -131,10 +131,22 @@ extension ExpertStreamingSession {
     ///    holding the last experts seen instead of the working set, so by
     ///    default it is read into transient staging and dropped.
     ///
-    /// `experts` must already be the flattened, host-side routing choice.
-    public func resolve(layer: Int, experts: [Int]) throws -> StreamedExpertResolution {
+    /// `experts` must already be the flattened, host-side routing choice, and
+    /// `tokenCount` the number of tokens it covers.
+    ///
+    /// The regime is decided by `tokenCount`, never by how many assignments
+    /// came in: an earlier version tested `experts.count <= 8`, which is the
+    /// same number only while top-K happens to be 8. A checkpoint with K=4
+    /// would have sent a two-token prefill down the decode path, and one with
+    /// K=16 would have sent every decode step down the prefill path — both
+    /// silently, both correct-looking. It is the `imageTokenId = 396` shape of
+    /// bug: a constant that agrees with the truth for exactly one model.
+    public func resolve(
+        layer: Int, tokenCount: Int, experts: [Int]
+    ) throws -> StreamedExpertResolution {
         let unique = Array(Set(experts)).sorted()
-        let useBank = unique.count <= bank.slotCount && (experts.count <= 8 || configuration.admitOnSweep)
+        let isDecode = tokenCount == 1
+        let useBank = unique.count <= bank.slotCount && (isDecode || configuration.admitOnSweep)
 
         if useBank {
             let slots = try bank.ensure(

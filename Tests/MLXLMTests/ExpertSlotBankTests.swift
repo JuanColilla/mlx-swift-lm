@@ -169,6 +169,58 @@ final class ExpertSlotBankTests: XCTestCase {
         XCTAssertEqual(bank.statistics.misses, 8, "shrinking must not claim stale residency")
     }
 
+    // MARK: - Which regime a request goes to
+
+    private func makeSession(experts: Int, layers: Int, slots: Int) throws
+        -> ExpertStreamingSession
+    {
+        let directory = try temporaryDirectory()
+        try SyntheticExpertCheckpoint.writeWellFormed(
+            experts: experts, layers: layers, to: directory)
+        let index = try ExpertOffsetIndex.build(modelDirectory: directory)
+        return try ExpertStreamingSession(
+            index: index, modelDirectory: directory,
+            configuration: .init(
+                bankCapacityBytes: slots * index.bytesPerExpert, groupSize: 8, bits: 4))
+    }
+
+    /// Decode goes through the bank and prefill through transient staging, and
+    /// the two are told apart by the token count — not by how many assignments
+    /// arrived, which only equals the token count while top-K is exactly 8.
+    func testRegimeFollowsTokenCountNotAssignmentCount() throws {
+        let session = try makeSession(experts: 32, layers: 1, slots: 16)
+
+        // A single token with top-16: 16 assignments, still decode.
+        let decode = try session.resolve(
+            layer: 0, tokenCount: 1, experts: (0 ..< 16).map { $0 })
+        XCTAssertNil(decode.pools, "one token must go through the bank whatever top-K is")
+        XCTAssertEqual(decode.indices.size, 16)
+
+        // Two tokens with top-4: 8 assignments, still prefill.
+        let prefill = try session.resolve(
+            layer: 0, tokenCount: 2, experts: [1, 2, 3, 4, 5, 6, 7, 8])
+        XCTAssertNotNil(
+            prefill.pools, "a multi-token sweep must not be admitted into the bank")
+        XCTAssertEqual(prefill.indices.size, 8)
+    }
+
+    /// With `admitOnSweep` on, prefill is allowed into the bank — the A/B the
+    /// design leaves open (P2c).
+    func testSweepAdmissionIsConfigurable() throws {
+        let directory = try temporaryDirectory()
+        try SyntheticExpertCheckpoint.writeWellFormed(experts: 32, layers: 1, to: directory)
+        let index = try ExpertOffsetIndex.build(modelDirectory: directory)
+        let session = try ExpertStreamingSession(
+            index: index, modelDirectory: directory,
+            configuration: .init(
+                bankCapacityBytes: 16 * index.bytesPerExpert, admitOnSweep: true,
+                groupSize: 8, bits: 4))
+
+        let prefill = try session.resolve(
+            layer: 0, tokenCount: 4, experts: [1, 2, 3, 4, 5, 6, 7, 8])
+        XCTAssertNil(prefill.pools)
+    }
+
     // MARK: - P3: the install must not copy the bank
 
     /// MLX writes a scatter in place only when it can donate the destination
