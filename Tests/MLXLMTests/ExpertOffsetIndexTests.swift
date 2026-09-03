@@ -10,61 +10,6 @@ import XCTest
 
 final class ExpertOffsetIndexTests: XCTestCase {
 
-    // MARK: - Synthetic checkpoints
-
-    /// Writes a minimal safetensors file from `(name, dtype, shape)` tuples,
-    /// laying the payload out in the order given.
-    static func writeSafetensors(
-        _ tensors: [(name: String, dtype: String, shape: [Int])], to url: URL
-    ) throws {
-        func itemSize(_ dtype: String) -> Int {
-            switch dtype {
-            case "U8": 1
-            case "BF16", "F16": 2
-            default: 4
-            }
-        }
-
-        var header = [String: Any]()
-        var offset = 0
-        for tensor in tensors {
-            let bytes = tensor.shape.reduce(1, *) * itemSize(tensor.dtype)
-            header[tensor.name] = [
-                "dtype": tensor.dtype,
-                "shape": tensor.shape,
-                "data_offsets": [offset, offset + bytes],
-            ]
-            offset += bytes
-        }
-
-        let headerData = try JSONSerialization.data(
-            withJSONObject: header, options: [.sortedKeys])
-        var file = Data()
-        withUnsafeBytes(of: UInt64(headerData.count).littleEndian) { file.append(contentsOf: $0) }
-        file.append(headerData)
-        file.append(Data(count: offset))
-        try file.write(to: url)
-    }
-
-    /// A checkpoint with the layout the index supports: stacked `switch_mlp`
-    /// tensors whose expert rows are exact 16 KiB multiples.
-    static func writeWellFormedCheckpoint(
-        experts: Int = 4, layers: Int = 2, to directory: URL
-    ) throws {
-        var tensors = [(name: String, dtype: String, shape: [Int])]()
-        for layer in 0 ..< layers {
-            for projection in ["gate_proj", "up_proj", "down_proj"] {
-                let base = "model.layers.\(layer).mlp.switch_mlp.\(projection)"
-                tensors.append((("\(base).weight"), "U32", [experts, 64, 64]))
-                tensors.append((("\(base).scales"), "BF16", [experts, 128, 64]))
-                tensors.append((("\(base).biases"), "BF16", [experts, 128, 64]))
-            }
-            tensors.append(
-                ("model.layers.\(layer).mlp.gate.weight", "BF16", [experts, 16]))
-        }
-        try writeSafetensors(tensors, to: directory.appending(path: "model.safetensors"))
-    }
-
     func temporaryDirectory() throws -> URL {
         let url = URL(fileURLWithPath: NSTemporaryDirectory())
             .appending(path: "r56-index-\(UUID().uuidString)")
@@ -130,7 +75,7 @@ final class ExpertOffsetIndexTests: XCTestCase {
 
     func testBuildsIndexOverSyntheticCheckpoint() throws {
         let directory = try temporaryDirectory()
-        try Self.writeWellFormedCheckpoint(experts: 4, layers: 2, to: directory)
+        try SyntheticExpertCheckpoint.writeWellFormed(experts: 4, layers: 2, to: directory)
 
         let index = try ExpertOffsetIndex.build(modelDirectory: directory)
 
@@ -158,7 +103,7 @@ final class ExpertOffsetIndexTests: XCTestCase {
     /// the JSON header is the classic way to build an index that reads garbage.
     func testOffsetsIncludeTheHeader() throws {
         let directory = try temporaryDirectory()
-        try Self.writeWellFormedCheckpoint(experts: 2, layers: 1, to: directory)
+        try SyntheticExpertCheckpoint.writeWellFormed(experts: 2, layers: 1, to: directory)
         let url = directory.appending(path: "model.safetensors")
 
         let header = try SafetensorsHeader.read(url: url)
@@ -178,11 +123,14 @@ final class ExpertOffsetIndexTests: XCTestCase {
 
     func testRejectsRowsThatAreNotPageMultiples() throws {
         let directory = try temporaryDirectory()
-        try Self.writeSafetensors(
+        try SyntheticExpertCheckpoint.write(
             [
-                ("model.layers.0.mlp.switch_mlp.gate_proj.weight", "U32", [4, 8, 8]),
-                ("model.layers.0.mlp.switch_mlp.gate_proj.scales", "BF16", [4, 8, 8]),
-                ("model.layers.0.mlp.switch_mlp.gate_proj.biases", "BF16", [4, 8, 8]),
+                .init(name: "model.layers.0.mlp.switch_mlp.gate_proj.weight", dtype: "U32",
+                    shape: [4, 8, 8]),
+                .init(name: "model.layers.0.mlp.switch_mlp.gate_proj.scales", dtype: "BF16",
+                    shape: [4, 8, 8]),
+                .init(name: "model.layers.0.mlp.switch_mlp.gate_proj.biases", dtype: "BF16",
+                    shape: [4, 8, 8]),
             ], to: directory.appending(path: "model.safetensors"))
 
         XCTAssertThrowsError(try ExpertOffsetIndex.build(modelDirectory: directory)) { error in
@@ -194,10 +142,12 @@ final class ExpertOffsetIndexTests: XCTestCase {
 
     func testRejectsIncompleteLayer() throws {
         let directory = try temporaryDirectory()
-        try Self.writeSafetensors(
+        try SyntheticExpertCheckpoint.write(
             [
-                ("model.layers.0.mlp.switch_mlp.gate_proj.weight", "U32", [4, 64, 64]),
-                ("model.layers.0.mlp.switch_mlp.gate_proj.scales", "BF16", [4, 128, 64]),
+                .init(name: "model.layers.0.mlp.switch_mlp.gate_proj.weight", dtype: "U32",
+                    shape: [4, 64, 64]),
+                .init(name: "model.layers.0.mlp.switch_mlp.gate_proj.scales", dtype: "BF16",
+                    shape: [4, 128, 64]),
             ], to: directory.appending(path: "model.safetensors"))
 
         XCTAssertThrowsError(try ExpertOffsetIndex.build(modelDirectory: directory)) { error in
@@ -211,7 +161,7 @@ final class ExpertOffsetIndexTests: XCTestCase {
 
     func testRoundTripsThroughJSON() throws {
         let directory = try temporaryDirectory()
-        try Self.writeWellFormedCheckpoint(experts: 4, layers: 3, to: directory)
+        try SyntheticExpertCheckpoint.writeWellFormed(experts: 4, layers: 3, to: directory)
         let index = try ExpertOffsetIndex.build(modelDirectory: directory)
 
         let url = directory.appending(path: "expert-offsets.json")
@@ -224,7 +174,7 @@ final class ExpertOffsetIndexTests: XCTestCase {
 
     func testRejectsIndexBuiltForAnotherCheckpoint() throws {
         let directory = try temporaryDirectory()
-        try Self.writeWellFormedCheckpoint(experts: 4, layers: 1, to: directory)
+        try SyntheticExpertCheckpoint.writeWellFormed(experts: 4, layers: 1, to: directory)
         let index = try ExpertOffsetIndex.build(modelDirectory: directory)
         let url = directory.appending(path: "expert-offsets.json")
         try index.write(to: url)
