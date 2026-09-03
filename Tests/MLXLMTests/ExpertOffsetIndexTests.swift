@@ -157,6 +157,68 @@ final class ExpertOffsetIndexTests: XCTestCase {
         }
     }
 
+    /// The multi-token-prediction head is a decoder layer with the same tensor
+    /// names, so `mtp.layers.0.mlp.switch_mlp.*` collides with the real layer
+    /// 0. `Qwen35TextModel.sanitize` drops every `mtp.` key, so the module tree
+    /// never sees them and the index must not either.
+    func testIgnoresTheMultiTokenPredictionHead() throws {
+        XCTAssertNil(
+            try ExpertOffsetIndex.parse(key: "mtp.layers.0.mlp.switch_mlp.gate_proj.weight"))
+        XCTAssertNil(
+            try ExpertOffsetIndex.parse(
+                key: "model.mtp.layers.0.mlp.switch_mlp.down_proj.scales"))
+    }
+
+    func testBuildIgnoresMultiTokenPredictionTensors() throws {
+        let directory = try temporaryDirectory()
+        var tensors = SyntheticExpertCheckpoint.wellFormedTensors(experts: 4, layers: 1)
+        for projection in ["gate_proj", "up_proj", "down_proj"] {
+            let base = "mtp.layers.0.mlp.switch_mlp.\(projection)"
+            tensors.append(
+                .init(name: "\(base).weight", dtype: "U32", shape: [4, 64, 64]))
+            tensors.append(
+                .init(name: "\(base).scales", dtype: "BF16", shape: [4, 128, 64]))
+            tensors.append(
+                .init(name: "\(base).biases", dtype: "BF16", shape: [4, 128, 64]))
+        }
+        try SyntheticExpertCheckpoint.write(
+            tensors, to: directory.appending(path: "model.safetensors"))
+
+        let index = try ExpertOffsetIndex.build(modelDirectory: directory)
+        XCTAssertEqual(index.layerCount, 1)
+
+        // The real layer 0 comes first in the file, so a collision would have
+        // been resolvable by order alone; the point is that it is not indexed
+        // at all rather than indexed and then overwritten.
+        let realWeightOffset = index.layers[0][ExpertPiece(.gate, .weight)].baseOffset
+        let header = try SafetensorsHeader.read(
+            url: directory.appending(path: "model.safetensors"))
+        let real = try XCTUnwrap(
+            header.entries.first {
+                $0.name == "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+            })
+        XCTAssertEqual(realWeightOffset, header.dataStart + real.begin)
+    }
+
+    /// Any other namespace that reuses the pattern must fail loudly rather than
+    /// silently binding a layer to the wrong stack (TD-050).
+    func testRejectsTwoTensorsClaimingTheSameLayerAndPiece() throws {
+        let directory = try temporaryDirectory()
+        var tensors = SyntheticExpertCheckpoint.wellFormedTensors(experts: 4, layers: 1)
+        tensors.append(
+            .init(
+                name: "draft.layers.0.mlp.switch_mlp.gate_proj.weight", dtype: "U32",
+                shape: [4, 64, 64]))
+        try SyntheticExpertCheckpoint.write(
+            tensors, to: directory.appending(path: "model.safetensors"))
+
+        XCTAssertThrowsError(try ExpertOffsetIndex.build(modelDirectory: directory)) { error in
+            guard case ExpertOffsetIndexError.ambiguousKey = error else {
+                return XCTFail("expected ambiguousKey, got \(error)")
+            }
+        }
+    }
+
     // MARK: - Persistence
 
     func testRoundTripsThroughJSON() throws {

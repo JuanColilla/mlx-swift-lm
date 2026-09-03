@@ -93,6 +93,7 @@ public enum ExpertOffsetIndexError: Error, CustomStringConvertible {
     case unsupportedDType(String)
     case fingerprintMismatch(expected: String, found: String)
     case unsupportedFormatVersion(Int)
+    case ambiguousKey(layer: Int, piece: String, first: String, second: String)
 
     public var description: String {
         switch self {
@@ -129,6 +130,11 @@ public enum ExpertOffsetIndexError: Error, CustomStringConvertible {
             "expert offset index was built for checkpoint \(expected), found \(found)"
         case .unsupportedFormatVersion(let version):
             "expert offset index format version \(version) is not readable"
+        case .ambiguousKey(let layer, let piece, let first, let second):
+            """
+            two tensors claim layer \(layer) piece \(piece): \(first) and \(second); \
+            the index cannot tell which stack the decoder uses
+            """
         }
     }
 }
@@ -234,6 +240,14 @@ public struct ExpertOffsetIndex: Codable, Sendable, Equatable {
     /// by the multimodal wrapper.
     static func parse(key: String) throws -> (layer: Int, piece: ExpertPiece)? {
         let parts = key.split(separator: ".", omittingEmptySubsequences: false)
+
+        // The multi-token-prediction head is a decoder layer of its own, with
+        // its own `layers.N.mlp.switch_mlp.*` tensors, and `Qwen35TextModel`
+        // drops every `mtp.` key in `sanitize`. Left in, `mtp.layers.0` would
+        // collide with the real layer 0 and the streamed model would multiply
+        // one layer's tokens by the wrong experts — which is exactly what it
+        // did, silently, until a resident/streamed logit comparison caught it.
+        if parts.contains("mtp") { return nil }
 
         if let expertsIndex = parts.firstIndex(of: "experts"),
             expertsIndex + 1 < parts.count, Int(parts[expertsIndex + 1]) != nil
@@ -343,6 +357,15 @@ extension ExpertOffsetIndex {
                         layer: parsed.layer, piece: entry.name, rowBytes: rowBytes)
                 }
 
+                // Loud on collision (TD-050): a second tensor claiming the same
+                // (layer, piece) means the key pattern does not identify the
+                // decoder stack uniquely in this checkpoint.
+                if perLayer[parsed.layer]?[parsed.piece.slot] != nil {
+                    throw ExpertOffsetIndexError.ambiguousKey(
+                        layer: parsed.layer,
+                        piece: "\(parsed.piece.projection.rawValue).\(parsed.piece.component.rawValue)",
+                        first: "already indexed", second: entry.name)
+                }
                 perLayer[parsed.layer, default: [:]][parsed.piece.slot] = ExpertTensorRecord(
                     shard: shardIndex,
                     baseOffset: header.dataStart + entry.begin,
