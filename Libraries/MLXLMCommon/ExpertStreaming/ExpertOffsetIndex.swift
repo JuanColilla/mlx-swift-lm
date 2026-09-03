@@ -94,6 +94,8 @@ public enum ExpertOffsetIndexError: Error, CustomStringConvertible {
     case fingerprintMismatch(expected: String, found: String)
     case unsupportedFormatVersion(Int)
     case ambiguousKey(layer: Int, piece: String, first: String, second: String)
+    case quantizationMismatch(
+        projection: String, bits: Int, groupSize: Int, impliedInputDims: Int, scaleGroups: Int)
 
     public var description: String {
         switch self {
@@ -134,6 +136,14 @@ public enum ExpertOffsetIndexError: Error, CustomStringConvertible {
             """
             two tensors claim layer \(layer) piece \(piece): \(first) and \(second); \
             the index cannot tell which stack the decoder uses
+            """
+        case .quantizationMismatch(
+            let projection, let bits, let groupSize, let impliedInputDims, let scaleGroups):
+            """
+            \(projection) does not match \(bits)-bit / group \(groupSize): the packed \
+            weight implies \(impliedInputDims) input dims, which needs \
+            \(impliedInputDims / groupSize) scale groups, but the checkpoint has \
+            \(scaleGroups)
             """
         }
     }
@@ -273,6 +283,36 @@ public struct ExpertOffsetIndex: Codable, Sendable, Equatable {
         }
 
         return (layer, ExpertPiece(projection, component))
+    }
+
+    /// Check the checkpoint's own geometry against the quantization the caller
+    /// intends to run with.
+    ///
+    /// A `bits` or `groupSize` that does not match the checkpoint produces
+    /// fluent nonsense rather than an error: the gather matmul happily decodes
+    /// 4-bit payloads as 8-bit. The shapes already contain the answer —
+    /// a packed weight row of `[out, in * bits / 32]` and a scales row of
+    /// `[out, in / groupSize]` have to agree on `in` — so this is checkable
+    /// and therefore must be checked (TD-050's lesson, applied to the numbers
+    /// instead of the layout).
+    public func validateQuantization(groupSize: Int, bits: Int) throws {
+        guard let layer = layers.first, bits > 0, groupSize > 0 else { return }
+        for projection in ExpertProjection.allCases {
+            let weight = layer[ExpertPiece(projection, .weight)]
+            let scales = layer[ExpertPiece(projection, .scales)]
+            guard weight.rowShape.count == 2, scales.rowShape.count == 2 else { continue }
+
+            let bitsPerContainer = weight.dtype.itemSize * 8
+            let impliedInputDims = weight.rowShape[1] * bitsPerContainer / bits
+            let scaleGroups = scales.rowShape[1]
+            guard impliedInputDims % groupSize == 0,
+                impliedInputDims / groupSize == scaleGroups
+            else {
+                throw ExpertOffsetIndexError.quantizationMismatch(
+                    projection: projection.rawValue, bits: bits, groupSize: groupSize,
+                    impliedInputDims: impliedInputDims, scaleGroups: scaleGroups)
+            }
+        }
     }
 
     // MARK: Persistence

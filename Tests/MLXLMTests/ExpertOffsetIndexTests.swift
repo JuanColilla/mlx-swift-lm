@@ -219,6 +219,43 @@ final class ExpertOffsetIndexTests: XCTestCase {
         }
     }
 
+    /// A `bits` or `groupSize` that does not match the checkpoint does not
+    /// fail at the kernel: it decodes the payload wrong and the model talks
+    /// nonsense fluently. The shapes already know the answer.
+    func testQuantizationGeometryMustMatchTheCheckpoint() throws {
+        let directory = try temporaryDirectory()
+        try SyntheticExpertCheckpoint.writeWellFormed(experts: 4, layers: 1, to: directory)
+        let index = try ExpertOffsetIndex.build(modelDirectory: directory)
+
+        // The fixture's weight row packs 64 uint32 containers (512 input dims
+        // at 4 bits) against 64 scale groups, so it is consistent only at
+        // group size 8. The real checkpoint is covered by the test below.
+        XCTAssertNoThrow(try index.validateQuantization(groupSize: 8, bits: 4))
+
+        XCTAssertThrowsError(try index.validateQuantization(groupSize: 64, bits: 4)) { error in
+            guard case ExpertOffsetIndexError.quantizationMismatch = error else {
+                return XCTFail("expected quantizationMismatch, got \(error)")
+            }
+        }
+        XCTAssertThrowsError(try index.validateQuantization(groupSize: 8, bits: 8)) { error in
+            guard case ExpertOffsetIndexError.quantizationMismatch = error else {
+                return XCTFail("expected quantizationMismatch, got \(error)")
+            }
+        }
+    }
+
+    func testRealCheckpointMatchesItsDeclaredQuantization() throws {
+        let directory = try XCTUnwrap(
+            ExpertStreamingTestCheckpoint.directory(),
+            "no local Qwen 3.5 MoE checkpoint; set MLX_R56_MODEL_DIR to run this")
+        let index = try ExpertOffsetIndex.build(modelDirectory: directory)
+
+        // config.json declares group_size 64, bits 4.
+        XCTAssertNoThrow(try index.validateQuantization(groupSize: 64, bits: 4))
+        XCTAssertThrowsError(try index.validateQuantization(groupSize: 64, bits: 8))
+        XCTAssertThrowsError(try index.validateQuantization(groupSize: 32, bits: 4))
+    }
+
     // MARK: - Persistence
 
     func testRoundTripsThroughJSON() throws {

@@ -73,6 +73,11 @@ public final class ExpertStreamingSession: @unchecked Sendable {
         modelDirectory: URL,
         configuration: ExpertStreamingConfiguration
     ) throws {
+        // Loud before anything is read: a mismatched `bits`/`groupSize` does
+        // not fail, it decodes the weights wrong and generates fluent nonsense.
+        try index.validateQuantization(
+            groupSize: configuration.groupSize, bits: configuration.bits)
+
         self.configuration = configuration
         self.modelDirectory = modelDirectory
         self.store = try ExpertResidencyStore(
