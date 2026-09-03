@@ -134,13 +134,13 @@ extension ExpertStreamingSession {
     /// `experts` must already be the flattened, host-side routing choice, and
     /// `tokenCount` the number of tokens it covers.
     ///
-    /// The regime is decided by `tokenCount`, never by how many assignments
-    /// came in: an earlier version tested `experts.count <= 8`, which is the
-    /// same number only while top-K happens to be 8. A checkpoint with K=4
-    /// would have sent a two-token prefill down the decode path, and one with
-    /// K=16 would have sent every decode step down the prefill path — both
-    /// silently, both correct-looking. It is the `imageTokenId = 396` shape of
-    /// bug: a constant that agrees with the truth for exactly one model.
+    /// The regime is decided by `tokenCount`, never by the number of
+    /// assignments that came in. Those two agree only while top-K happens to
+    /// equal 8: at K=4 a two-token prefill would take the decode path, and at
+    /// K=16 every decode step would take the prefill path — both silently,
+    /// both looking correct. It is the `imageTokenId = 396` shape of bug, a
+    /// constant that agrees with the truth for exactly one model, so the
+    /// count of assignments must not appear in this decision at all.
     public func resolve(
         layer: Int, tokenCount: Int, experts: [Int]
     ) throws -> StreamedExpertResolution {
