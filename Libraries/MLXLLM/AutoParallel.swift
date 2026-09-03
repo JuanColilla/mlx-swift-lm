@@ -32,8 +32,11 @@ public enum PipelineWeightLayout {
     }
 }
 
+/// - Parameter includesOutputHead: pass `false` on a rank whose `lm_head`
+///   has already been removed with `dropPipelineOutputHead(from:)`. The two
+///   have to agree; see that function for why.
 public func pipelineAutoParallelSelection(
-    model: any LanguageModel, modelShardMeta: ShardMetadata
+    model: any LanguageModel, modelShardMeta: ShardMetadata, includesOutputHead: Bool = true
 ) -> WeightLoadingSelection? {
     let layers = getLayers(from: model)
     guard !layers.isEmpty else { return nil }
@@ -48,7 +51,8 @@ public func pipelineAutoParallelSelection(
         sourcePrefixes: PipelineWeightLayout.sourcePrefixes(
             forModelType: modelShardMeta.modelMeta.modelType) ?? ["model.layers."],
         destinationPrefix: PipelineWeightLayout.destinationPrefix(
-            forModelType: modelShardMeta.modelMeta.modelType)
+            forModelType: modelShardMeta.modelMeta.modelType),
+        includesOutputHead: includesOutputHead
     )
 }
 
