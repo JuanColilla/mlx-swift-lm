@@ -132,6 +132,82 @@ final class ExpertResidencyStoreTests: XCTestCase {
         XCTAssertThrowsError(try store.readBatch(keys: [ExpertKey(layer: 0, expert: 4)]))
     }
 
+    // MARK: - Queue depth
+
+    /// The configurable queue depth has to be the real one.
+    /// `DispatchQueue.concurrentPerform` caps its width at the number of active
+    /// CPUs, so a requested 8 or 16 would both be ~6 on a phone and the P5
+    /// sweep would measure the scheduler instead of the NAND. The store uses
+    /// its own parked threads, and reports what it actually achieved.
+    func testRequestedQueueDepthIsTheRealQueueDepth() throws {
+        let directory = try temporaryDirectory()
+        try SyntheticExpertCheckpoint.writeWellFormed(
+            experts: 32, layers: 1, to: directory)
+        let index = try ExpertOffsetIndex.build(modelDirectory: directory)
+        let store = try ExpertResidencyStore(
+            index: index, modelDirectory: directory,
+            configuration: .init(queueDepth: 8))
+
+        // 9 pieces x 32 non-consecutive experts = 288 uncoalescable reads over
+        // eight lanes; overlap is not in question at that ratio.
+        _ = try store.readBatch(
+            keys: stride(from: 0, to: 32, by: 1).map { ExpertKey(layer: 0, expert: $0) }
+                .enumerated().filter { $0.offset % 2 == 0 }.map(\.element))
+
+        let statistics = store.statistics
+        XCTAssertEqual(statistics.requestedQueueDepth, 8)
+        XCTAssertLessThanOrEqual(
+            statistics.peakConcurrentReads, statistics.requestedQueueDepth,
+            "more reads in flight than lanes exist")
+        XCTAssertGreaterThan(
+            statistics.peakConcurrentReads, 1,
+            "the lanes never overlapped; the reads were not concurrent at all")
+    }
+
+    /// A depth above the core count must still be honoured — that is the case
+    /// `concurrentPerform` silently clamped.
+    func testQueueDepthAboveTheCoreCountIsHonoured() throws {
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        let directory = try temporaryDirectory()
+        try SyntheticExpertCheckpoint.writeWellFormed(
+            experts: 64, layers: 1, to: directory)
+        let index = try ExpertOffsetIndex.build(modelDirectory: directory)
+        let store = try ExpertResidencyStore(
+            index: index, modelDirectory: directory,
+            configuration: .init(queueDepth: cores * 2))
+
+        _ = try store.readBatch(
+            keys: (0 ..< 64).filter { $0 % 2 == 0 }.map { ExpertKey(layer: 0, expert: $0) })
+
+        XCTAssertEqual(store.statistics.requestedQueueDepth, cores * 2)
+        XCTAssertLessThanOrEqual(
+            store.statistics.peakConcurrentReads, cores * 2)
+    }
+
+    func testSingleLaneStillReadsEverything() throws {
+        let directory = try temporaryDirectory()
+        let payloads = try SyntheticExpertCheckpoint.writeWellFormed(
+            experts: 8, layers: 1, to: directory)
+        let index = try ExpertOffsetIndex.build(modelDirectory: directory)
+        let store = try ExpertResidencyStore(
+            index: index, modelDirectory: directory,
+            configuration: .init(queueDepth: 1))
+
+        let keys = [0, 3, 7].map { ExpertKey(layer: 0, expert: $0) }
+        let arrays = try store.readBatch(keys: keys)
+        let piece = ExpertPiece(.down, .scales)
+        let record = index.layers[0][piece]
+        let data = bytes(arrays[piece.slot])
+        for (row, key) in keys.enumerated() {
+            XCTAssertEqual(
+                data.subdata(in: (row * record.rowBytes) ..< ((row + 1) * record.rowBytes)),
+                expectedRow(
+                    payloads: payloads, layer: 0, piece: piece, expert: key.expert,
+                    rowBytes: record.rowBytes))
+        }
+        XCTAssertEqual(store.statistics.peakConcurrentReads, 1)
+    }
+
     // MARK: - Zero-copy delivery (task 1.3)
 
     /// The definitive signal, and the reason this is not measured with

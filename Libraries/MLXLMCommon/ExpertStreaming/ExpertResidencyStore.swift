@@ -6,9 +6,16 @@
 //  * No `mmap`. MLX cannot sparsely materialize a mmap'd tensor; the
 //    page-fault route measured 6.1 MB/s in prior art, and on iOS a mapping of
 //    a 20 GB checkpoint also spends address space it cannot afford.
-//  * No actor on the critical path. This is a `final class` driven by GCD for
-//    the same reason as TD-030/031: a blocking read must not depend on the
-//    cooperative pool getting a turn.
+//  * No actor on the critical path. This is a `final class` driven by its own
+//    threads for the same reason as TD-030/031: a blocking read must not
+//    depend on the cooperative pool getting a turn.
+//  * Not `DispatchQueue.concurrentPerform`, which is the obvious tool and the
+//    wrong one: `dispatch_apply` caps its width at the number of *active*
+//    CPUs, so on a six-core phone a requested depth of 8 or 16 would both
+//    silently be 6, the configurable queue depth would be fiction, and a P5
+//    sweep would flatten out for reasons that have nothing to do with the
+//    NAND. Verified by the P0 benchmark harness. Real parked threads make the
+//    requested depth the actual depth, and the counters report both.
 //  * Page alignment is an invariant, not an optimization. MLX turns a host
 //    pointer into an `MTLBuffer` with `newBufferWithBytesNoCopy`, and when
 //    that returns null (misaligned pointer or length) `array.cpp` degrades to
@@ -70,6 +77,12 @@ public struct ExpertResidencyStatistics: Sendable, Equatable {
     public var coalescedReads: Int = 0
     public var bytes: Int = 0
     public var readSeconds: Double = 0
+    /// The queue depth the caller asked for.
+    public var requestedQueueDepth: Int = 0
+    /// The most `pread` calls ever seen in flight at once. Reported next to
+    /// the requested depth on purpose: a configurable depth that the runtime
+    /// silently caps is a lie, and this is what proves it is not being capped.
+    public var peakConcurrentReads: Int = 0
 
     public var megabytesPerSecond: Double {
         readSeconds > 0 ? Double(bytes) / readSeconds / 1_048_576 : 0
@@ -97,6 +110,7 @@ public final class ExpertResidencyStore: @unchecked Sendable {
     public let configuration: Configuration
 
     private let descriptors: [Int32]
+    private let lanes: LanePool
     private let statisticsLock = NSLock()
     private var statisticsStorage = ExpertResidencyStatistics()
 
@@ -122,9 +136,14 @@ public final class ExpertResidencyStore: @unchecked Sendable {
             descriptors.append(fd)
         }
         self.descriptors = descriptors
+        self.lanes = LanePool(lanes: max(1, configuration.queueDepth))
+        self.statisticsStorage.requestedQueueDepth = max(1, configuration.queueDepth)
     }
 
     deinit {
+        // Order matters: the lanes have to be parked and gone before the
+        // descriptors they read from are closed.
+        lanes.shutdown()
         for fd in descriptors { close(fd) }
     }
 
@@ -133,7 +152,10 @@ public final class ExpertResidencyStore: @unchecked Sendable {
     }
 
     public func resetStatistics() {
-        statisticsLock.withLock { statisticsStorage = ExpertResidencyStatistics() }
+        statisticsLock.withLock {
+            statisticsStorage = ExpertResidencyStatistics()
+            statisticsStorage.requestedQueueDepth = lanes.lanes
+        }
     }
 
     // MARK: - Reading
@@ -249,23 +271,29 @@ public final class ExpertResidencyStore: @unchecked Sendable {
         }
     }
 
+    /// Not reentrant: one forward pass at a time owns the lanes. That is the
+    /// same single-pass invariant the slot bank relies on.
     private func run(jobs: [ReadJob]) throws {
         let state = ReadState()
-        let lanes = max(1, min(configuration.queueDepth, jobs.count))
+        let inFlight = InFlightCounter()
+        let width = lanes.lanes
         let start = Date.timeIntervalSinceReferenceDate
 
-        DispatchQueue.concurrentPerform(iterations: lanes) { lane in
+        lanes.run { lane in
             var jobIndex = lane
             while jobIndex < jobs.count {
                 if state.lock.withLock({ state.error != nil }) { return }
                 let job = jobs[jobIndex]
+                inFlight.enter()
                 do {
                     try Self.readFully(job)
+                    inFlight.leave()
                 } catch {
+                    inFlight.leave()
                     state.record(error)
                     return
                 }
-                jobIndex += lanes
+                jobIndex += width
             }
         }
 
@@ -274,11 +302,14 @@ public final class ExpertResidencyStore: @unchecked Sendable {
 
         let bytes = jobs.reduce(0) { $0 + $1.byteCount }
         let rows = jobs.reduce(0) { $0 + $1.span }
+        let peak = inFlight.peak
         statisticsLock.withLock {
             statisticsStorage.reads += rows
             statisticsStorage.coalescedReads += jobs.count
             statisticsStorage.bytes += bytes
             statisticsStorage.readSeconds += elapsed
+            statisticsStorage.peakConcurrentReads = max(
+                statisticsStorage.peakConcurrentReads, peak)
         }
     }
 
@@ -304,6 +335,85 @@ public final class ExpertResidencyStore: @unchecked Sendable {
             done += read
         }
     }
+}
+
+// MARK: - Lanes
+
+/// A fixed set of parked threads, one per requested queue depth lane.
+///
+/// See the note at the top of this file for why this is not
+/// `DispatchQueue.concurrentPerform`.
+///
+/// Invariant: `job` is only written while every lane is parked on its own
+/// `start` semaphore, i.e. between `run(_:)` calls, so the hot path needs no
+/// lock. Lanes only ever touch disjoint jobs.
+private final class LanePool: @unchecked Sendable {
+    let lanes: Int
+    private let start: [DispatchSemaphore]
+    private let finished = DispatchSemaphore(value: 0)
+    private var job: ((Int) -> Void)?
+    private var stopping = false
+
+    init(lanes: Int) {
+        self.lanes = lanes
+        self.start = (0 ..< lanes).map { _ in DispatchSemaphore(value: 0) }
+        for lane in 0 ..< lanes {
+            // The thread captures the pool, so the pool outlives its owner
+            // until `shutdown()` lets the lanes return. The owner's `deinit`
+            // is what calls it.
+            let thread = Thread { [self] in
+                while true {
+                    start[lane].wait()
+                    if stopping {
+                        finished.signal()
+                        return
+                    }
+                    job?(lane)
+                    finished.signal()
+                }
+            }
+            thread.name = "expert-streaming-lane-\(lane)"
+            thread.qualityOfService = .userInitiated
+            thread.stackSize = 512 << 10
+            thread.start()
+        }
+    }
+
+    func run(_ body: (Int) -> Void) {
+        withoutActuallyEscaping(body) { escaping in
+            job = escaping
+            for semaphore in start { semaphore.signal() }
+            for _ in 0 ..< lanes { finished.wait() }
+            job = nil
+        }
+    }
+
+    func shutdown() {
+        stopping = true
+        for semaphore in start { semaphore.signal() }
+        for _ in 0 ..< lanes { finished.wait() }
+    }
+}
+
+/// Peak concurrent `pread` count, so a run can prove the queue depth it claims.
+/// A lock costs ~50 ns against reads that cost tens of microseconds.
+private final class InFlightCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = 0
+    private var peakValue = 0
+
+    func enter() {
+        lock.withLock {
+            current += 1
+            if current > peakValue { peakValue = current }
+        }
+    }
+
+    func leave() {
+        lock.withLock { current -= 1 }
+    }
+
+    var peak: Int { lock.withLock { peakValue } }
 }
 
 // MARK: - Alignment
