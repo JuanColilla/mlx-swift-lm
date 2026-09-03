@@ -548,7 +548,14 @@ public func loadWeights(
             in: modelDirectory,
             selection: weightFileSelection,
             additionalFiles: additionalFiles ?? [])
-        if lazyWeightLoadingPreferred() {
+        // FORK(JuanColilla): R-56 — a streamed model must never materialize
+        // its routed experts. The filter runs per file, right after the header
+        // is parsed and before anything merges or evaluates: `loadWeightArrays`
+        // realizes every tensor inside its work item, so dropping the keys
+        // after `sanitize` would already have paid the 18 GB this exists to
+        // avoid. Streaming therefore also forces the lazy loop below.
+        let streamsRoutedExperts = ExpertStreaming.activeSession != nil
+        if lazyWeightLoadingPreferred() || streamsRoutedExperts {
             // FORK(JuanColilla): keep the arrays lazy on memory-constrained
             // platforms. `loadWeightArrays` realizes every tensor before
             // `sanitize`/`prepare` run, so any transform they apply (a
@@ -559,7 +566,10 @@ public func loadWeights(
             // the concurrent loader. Under the process-wide `evalLock` the
             // concurrent path gains no wall-clock on these platforms anyway.
             for url in weightURLs {
-                let (w, m) = try loadArraysAndMetadata(url: url)
+                var (w, m) = try loadArraysAndMetadata(url: url)
+                if streamsRoutedExperts {
+                    w = w.filter { !ExpertOffsetIndex.isRoutedExpertKey($0.key) }
+                }
                 weights.merge(w) { _, new in new }
                 if metadata.isEmpty {
                     metadata = m

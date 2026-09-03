@@ -688,6 +688,12 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 public final class Qwen35DecoderLayer: Module {
     public let isLinear: Bool
 
+    /// FORK(JuanColilla): R-56 — whether this layer's MoE block reads its
+    /// experts from disk. It gates the traced decode route below, because the
+    /// trace covers the MLP too (`linearLayerBody`, `attentionPostBody` both
+    /// call `mlpForward`) and a streamed block runs host control flow.
+    let usesStreamedExperts: Bool
+
     @ModuleInfo(key: "self_attn") var selfAttn: Qwen35Attention?
     @ModuleInfo(key: "linear_attn") var linearAttn: Qwen35GatedDeltaNet?
 
@@ -706,13 +712,22 @@ public final class Qwen35DecoderLayer: Module {
             _selfAttn.wrappedValue = Qwen35Attention(args)
         }
 
-        if args.numExperts > 0 {
+        // FORK(JuanColilla): R-56 — streaming is chosen at construction, never
+        // by a flag on a live module: the resident block bakes its weights
+        // into a compiled trace, so the two cannot be the same object.
+        if args.numExperts > 0, let session = ExpertStreaming.activeSession {
+            _mlp.wrappedValue = Qwen35StreamedSparseMoeBlock(
+                args, layerIndex: layerIdx, session: session)
+            self.usesStreamedExperts = true
+        } else if args.numExperts > 0 {
             _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
+            self.usesStreamedExperts = false
         } else {
             _mlp.wrappedValue = Qwen3NextMLP(
                 dimensions: args.hiddenSize,
                 hiddenDimensions: args.intermediateSize
             )
+            self.usesStreamedExperts = false
         }
 
         _inputLayerNorm.wrappedValue = RMSNorm(
@@ -737,8 +752,9 @@ public final class Qwen35DecoderLayer: Module {
     ) -> MLXArray {
         // Single-token unmasked decode runs the layer as one traced function
         // (two for full attention, split at the KV write). Everything else
-        // takes the general body below.
-        if x.dim(1) == 1, ssmMask == nil {
+        // takes the general body below — including a streamed MoE layer, whose
+        // block cannot live inside a trace (FORK(JuanColilla), R-56).
+        if x.dim(1) == 1, ssmMask == nil, !usesStreamedExperts {
             if isLinear, let mambaCache = cache as? MambaCache {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
@@ -917,6 +933,11 @@ public class Qwen35TextModelInner: Module {
             linearLayers: layers.map(\.isLinear))
         self.decodeSegments = segments
         self.compiledSegments = CompiledDecodeSegmentCache(count: segments.count)
+        // FORK(JuanColilla): R-56 — the whole-step schedule traces the MLP too
+        // (`linearLayerBody` and `attentionPostBody` both call `mlpForward`),
+        // and a streamed MoE block reads its router on the host inside that
+        // call. One streamed layer disables the schedule for the whole model.
+        self.hasStreamedExperts = layers.contains { $0.usesStreamedExperts }
 
         super.init()
     }
@@ -1008,6 +1029,8 @@ public class Qwen35TextModelInner: Module {
     /// one (whose SDPA runs between this segment and the next).
     private let decodeSegments: [CompiledDecodeSegment]
     private let compiledSegments: CompiledDecodeSegmentCache
+    /// FORK(JuanColilla): R-56 — see the assignment in `init`.
+    private let hasStreamedExperts: Bool
 
     /// Flat argument/result lists because `compile` takes `[MLXArray]`.
     /// In: `[x]` (token ids for segment 0), then `[attention, gate]` when
@@ -1052,6 +1075,7 @@ public class Qwen35TextModelInner: Module {
     /// everything else on a decode step is static-shaped, so the segments
     /// compile concretely.
     private func decodeStep(_ inputs: MLXArray, _ cache: [KVCache?]) -> MLXArray? {
+        if hasStreamedExperts { return nil }
         guard cache.count == layers.count else { return nil }
         guard let ssmIdx, let faIdx else { return nil }
         // The schedule is only valid when the masks the general path would
