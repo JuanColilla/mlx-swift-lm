@@ -17,6 +17,18 @@
 //  * `supportsDirectWeightedReduction` compares the *exact* type of each
 //    projection with `ObjectIdentifier(QuantizedSwitchLinear.self)`, so even a
 //    subclass would not qualify for the fused prefill kernel.
+//
+// The rows are still permuted expert-major for prefill (`gatherSort`, the
+// same locality the resident path buys), but the kernel is never told
+// `sortedIndices: true`. Measured on the 36B-A4B checkpoint, layer 17, real
+// activations: over the full `[100, …]` pools the flag changes nothing
+// (sorted == unsorted, bit for bit), but over a compact pool — a staged batch
+// of the 39 experts the prompt touched, or a slot bank — the flagged kernel
+// lands on a different accumulation order and the logits drift by one bf16
+// ulp per layer (worst relative 0.09 after 48 layers). The permutation alone,
+// flag off, reproduces the resident model exactly. Without this the "streamed
+// equals resident" acceptance only held for decode, where top-8 never reaches
+// the 64-row sort threshold. See `K2HorizonStreamedMacExperiment`.
 
 import Foundation
 import MLX
@@ -95,10 +107,10 @@ public final class StreamedSwitchGLU: Module, @unchecked Sendable {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
-        let xUp = matmul(.up, x, idx, pools: pools, sorted: doSort)
-        let xGate = matmul(.gate, x, idx, pools: pools, sorted: doSort)
+        let xUp = matmul(.up, x, idx, pools: pools, sorted: false)
+        let xGate = matmul(.gate, x, idx, pools: pools, sorted: false)
         var out = matmul(
-            .down, activationProduct(xGate, xUp), idx, pools: pools, sorted: doSort)
+            .down, activationProduct(xGate, xUp), idx, pools: pools, sorted: false)
 
         if doSort {
             out = scatterUnsort(x: out, invOrder: inverseOrder, shape: indices.shape)
@@ -161,7 +173,7 @@ public final class StreamedSwitchLinear: Module, @unchecked Sendable {
 
         var out = streamedGatherMM(
             x, projection: .value, indices: idx, pools: pools,
-            groupSize: groupSize, bits: bits, sorted: doSort)
+            groupSize: groupSize, bits: bits, sorted: false)
 
         if doSort {
             out = scatterUnsort(x: out, invOrder: inverseOrder, shape: indices.shape)

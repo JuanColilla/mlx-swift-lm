@@ -329,4 +329,150 @@ final class K2HorizonStreamedMacExperiment: XCTestCase {
             GPU.clearCache()
         }
     }
+
+    /// Bisection: the same input into the resident and the streamed
+    /// sublayers of every sparse layer, prefill and decode, so a difference is
+    /// attributed to one family and one regime rather than to "the model".
+    func testBisectSublayersAgainstTheResidentModel() async throws {
+        let directory = try requireCheckpoint()
+        let reference = try loadReference(directory)
+        let prompt = reference?.prompt ?? [0, 3737, 9024, 1010, 12244, 1029]
+        let index = try ExpertOffsetIndex.build(modelDirectory: directory)
+
+        let (resident, _) = try await loadResident(directory)
+        let (streamed, session, _) = try await loadStreamed(directory, index: index, bankBytes: 3 << 30)
+
+        func delta(_ a: MLXArray, _ b: MLXArray) -> Float {
+            let d = MLX.max(MLX.abs(a.asType(.float32) - b.asType(.float32)))
+            eval(d)
+            return d.item(Float.self)
+        }
+
+        for regime in ["prefill", "decode"] {
+            let ids = regime == "prefill" ? prompt : [prompt.last!]
+            let input = MLXArray(ids).reshaped(1, ids.count)
+            var h = resident.model.embedTokens(input)
+            let mask = createAttentionMask(h: h, cache: nil)
+            for (i, layer) in resident.model.layers.enumerated() {
+                let r = layer as! K2HorizonDecoderLayer
+                let s = streamed.model.layers[i] as! K2HorizonDecoderLayer
+                guard r.usesStreamedExperts || s.usesStreamedExperts else {
+                    h = r(h, mask: mask, cache: nil)
+                    eval(h)
+                    continue
+                }
+                let normed = r.inputLayerNorm(h)
+                let attnR = r.selfAttn(normed, mask: mask, cache: nil)
+                let attnS = s.selfAttn(normed, mask: mask, cache: nil)
+                let h2 = h + attnR
+                let normed2 = r.postAttentionLayerNorm(h2)
+                let mlpR = r.mlp(normed2)
+                let mlpS = s.mlp(normed2)
+                eval(attnR, attnS, mlpR, mlpS)
+                let dA = delta(attnR, attnS)
+                let dM = delta(mlpR, mlpS)
+                if dA != 0 || dM != 0 || i < 5 {
+                    print(String(format: "R56 | K2 bisect %@ layer %d: attention max|d| %.6f, mlp max|d| %.6f", regime, i, dA, dM))
+                }
+                h = h2 + mlpR
+                eval(h)
+            }
+        }
+        XCTAssertNil(session.lastFailure)
+    }
+
+    /// Why the streamed layers never pass `sortedIndices: true` to the kernel.
+    ///
+    /// Same activations, same expert choice, same bytes (the staged rows are
+    /// compared with the resident parameters first): over the full
+    /// `[100, …]` pools the flag changes nothing, over the compact staged
+    /// pools it lands on a different accumulation order. The expert-major
+    /// permutation with the flag off reproduces the resident product bit for
+    /// bit. Layer 17 is the first sparse layer where the drift showed up in
+    /// the bisection above.
+    func testSortedIndicesFlagDriftsOnCompactPools() async throws {
+        setvbuf(stdout, nil, _IONBF, 0)
+        let directory = try requireCheckpoint()
+        let reference = try loadReference(directory)
+        let prompt = reference?.prompt ?? [0, 3737, 9024, 1010, 12244, 1029]
+        let index = try ExpertOffsetIndex.build(modelDirectory: directory)
+        let (resident, _) = try await loadResident(directory)
+        let (_, session, _) = try await loadStreamed(directory, index: index, bankBytes: 1 << 30)
+        let layerIndex = 17
+
+        func delta(_ a: MLXArray, _ b: MLXArray) -> Float {
+            let d = MLX.max(MLX.abs(a.asType(.float32) - b.asType(.float32)))
+            eval(d)
+            return d.item(Float.self)
+        }
+
+        let input = MLXArray(prompt).reshaped(1, prompt.count)
+        var h = resident.model.embedTokens(input)
+        let mask = createAttentionMask(h: h, cache: nil)
+        for i in 0 ..< layerIndex { h = resident.model.layers[i](h, mask: mask, cache: nil) }
+        let layer = resident.model.layers[layerIndex] as! K2HorizonDecoderLayer
+        let block = layer.mlp as! K2HorizonSparseMoEBlock
+        let x = layer.postAttentionLayerNorm(
+            h + layer.selfAttn(layer.inputLayerNorm(h), mask: mask, cache: nil))
+        eval(x)
+
+        let (indices, _) = block.route(x)
+        let tokens = x.dim(1)
+        let flatX = x.reshaped(tokens, x.dim(-1))
+        let topK = indices.dim(-1)
+        let globalIndices = indices.reshaped(tokens, topK).asType(.uint32)
+        let experts = globalIndices.asArray(UInt32.self).map { Int($0) }
+        let (staged, sorted) = try session.store.readRuns(
+            family: .mlp, layer: layerIndex, experts: experts)
+        var rank = [Int: UInt32]()
+        for (row, expert) in sorted.enumerated() { rank[expert] = UInt32(row) }
+        let localIndices = MLXArray(experts.map { rank[$0]! }).reshaped(tokens, topK)
+
+        let parameters = Dictionary(
+            uniqueKeysWithValues: block.switchMLP.parameters().flattened())
+        let pick = MLXArray(sorted.map { Int32($0) })
+        for piece in ExpertFamily.mlp.pieces {
+            let full = parameters[piece.name]!
+            XCTAssertTrue(
+                MLX.all(full[pick] .== staged[piece.slot]).item(Bool.self),
+                "staged \(piece.name) differs from the resident parameters")
+        }
+
+        func product(
+            _ projection: ExpertProjection, full: Bool, permute: Bool, flag: Bool
+        ) -> MLXArray {
+            let pools: [MLXArray] = [ExpertComponent.weight, .scales, .biases].map {
+                full ? parameters[ExpertPiece(projection, $0).name]! : staged[ExpertPiece(projection, $0).slot]
+            }
+            let idx = full ? globalIndices : localIndices
+            var rows = MLX.expandedDimensions(flatX, axes: [-2, -3])
+            var ids = idx
+            var inverse = MLXArray()
+            if permute { (rows, ids, inverse) = gatherSort(x: rows, indices: idx) }
+            var out = MLX.gatherQuantizedMM(
+                rows, pools[0], scales: pools[1], biases: pools[2], rhsIndices: ids,
+                transpose: true, groupSize: 64, bits: 4, mode: .affine, sortedIndices: flag)
+            if permute { out = scatterUnsort(x: out, invOrder: inverse, shape: idx.shape) }
+            let squeezed = MLX.squeezed(out, axis: -2)
+            eval(squeezed)
+            return squeezed
+        }
+
+        for projection in [ExpertProjection.gate, .up] {
+            let residentSorted = product(projection, full: true, permute: true, flag: true)
+            let residentPlain = product(projection, full: true, permute: false, flag: false)
+            let compactFlagged = product(projection, full: false, permute: true, flag: true)
+            let compactPermuted = product(projection, full: false, permute: true, flag: false)
+            let compactPlain = product(projection, full: false, permute: false, flag: false)
+            print(
+                String(
+                    format: "R56 | K2 layer %d %@: full flagged vs full plain %.6f | compact flagged vs full flagged %.6f | compact permuted (flag off) vs full flagged %.6f | compact plain vs full flagged %.6f",
+                    layerIndex, projection.rawValue, delta(residentSorted, residentPlain),
+                    delta(compactFlagged, residentSorted), delta(compactPermuted, residentSorted),
+                    delta(compactPlain, residentSorted)))
+            XCTAssertEqual(delta(residentSorted, residentPlain), 0)
+            XCTAssertEqual(delta(compactPermuted, residentSorted), 0)
+            XCTAssertEqual(delta(compactPlain, residentSorted), 0)
+        }
+    }
 }
