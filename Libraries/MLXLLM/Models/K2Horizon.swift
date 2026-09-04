@@ -305,7 +305,89 @@ func k2HorizonRoute(
 
 // MARK: - Attention
 
-public class K2HorizonAttention: Module {
+/// Shared by the resident attention and the streamed one of
+/// `K2HorizonStreamed.swift`, which differ only in where the routed values
+/// come from.
+///
+/// Full RoPE when `rope_head_dim == head_dim`; otherwise rotate the pairs
+/// `(i, i + head_dim / 2)` for `i < rope_head_dim / 2` and pass the rest
+/// through, which is what the split/interleave dance in the reference amounts
+/// to.
+func k2HorizonApplyRope(
+    _ rope: RoPE, to x: MLXArray, headDim: Int, ropeHeadDim: Int, offset: RoPEOffset?
+) -> MLXArray {
+    if ropeHeadDim == headDim {
+        return applyRotaryPosition(rope, to: x, offset: offset)
+    }
+    let (B, H, L) = (x.dim(0), x.dim(1), x.dim(2))
+    let half = headDim / 2
+    let rotatingHalf = ropeHeadDim / 2
+    let pairs = x.reshaped(B, H, L, 2, half)
+    let rotating = pairs[.ellipsis, ..<rotatingHalf].reshaped(B, H, L, ropeHeadDim)
+    let passthrough = pairs[.ellipsis, rotatingHalf...]
+    let rotated = applyRotaryPosition(rope, to: rotating, offset: offset)
+        .reshaped(B, H, L, 2, rotatingHalf)
+    return concatenated([rotated, passthrough], axis: -1).reshaped(B, H, L, headDim)
+}
+
+/// The optional per-head output gate.
+func k2HorizonApplyGate(
+    _ gateProj: Linear?, function: K2HorizonConfiguration.AttentionGate?,
+    output: MLXArray, input x: MLXArray, heads: Int, headDim: Int
+) -> MLXArray {
+    guard let gateProj, let function else { return output }
+    var gate = gateProj(x).reshaped(x.dim(0), x.dim(1), heads, headDim)
+    switch function {
+    case .silu:
+        gate = MLXNN.silu(gate)
+    case .softplus:
+        // `F.softplus(gate, beta=ln 2)`
+        let beta = Float(M_LN2)
+        gate = MLX.logAddExp(gate * beta, 0) / beta
+    }
+    return output * gate
+}
+
+/// Queries, keys and values (already projected, `[B, L, heads * headDim]`)
+/// through RoPE, the cache, attention, the gate and the output projection.
+func k2HorizonAttend(
+    queries: MLXArray, keys: MLXArray, values: MLXArray, input x: MLXArray,
+    heads: Int, kvHeads: Int, headDim: Int, ropeHeadDim: Int, scale: Float, rope: RoPE,
+    gateProj: Linear?, gateFunction: K2HorizonConfiguration.AttentionGate?, oProj: Linear,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+) -> MLXArray {
+    let (B, L) = (x.dim(0), x.dim(1))
+    var queries = queries.reshaped(B, L, heads, headDim).transposed(0, 2, 1, 3)
+    var keys = keys.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
+    let values = values.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
+
+    let offset = cache?.ropeOffset
+    queries = k2HorizonApplyRope(
+        rope, to: queries, headDim: headDim, ropeHeadDim: ropeHeadDim, offset: offset)
+    keys = k2HorizonApplyRope(
+        rope, to: keys, headDim: headDim, ropeHeadDim: ropeHeadDim, offset: offset)
+
+    var output = attentionWithCacheUpdate(
+        queries: queries, keys: keys, values: values, cache: cache, scale: scale, mask: mask
+    )
+    .transposed(0, 2, 1, 3)
+
+    output = k2HorizonApplyGate(
+        gateProj, function: gateFunction, output: output, input: x, heads: heads,
+        headDim: headDim)
+    return oProj(output.reshaped(B, L, -1))
+}
+
+/// What `K2HorizonDecoderLayer` holds as `self_attn`: the resident attention
+/// or, on a streamed MoVA layer, the one that reads its value experts from
+/// disk.
+public protocol K2HorizonAttentionLayer {
+    func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray
+}
+
+public class K2HorizonAttention: Module, K2HorizonAttentionLayer {
     let args: K2HorizonConfiguration
     let heads: Int
     let kvHeads: Int
@@ -389,65 +471,31 @@ public class K2HorizonAttention: Module {
         return weightedExpertSum(y, weights.asType(x.dtype))
     }
 
-    /// Full RoPE when `rope_head_dim == head_dim`; otherwise rotate the
-    /// pairs `(i, i + head_dim / 2)` for `i < rope_head_dim / 2` and pass
-    /// the rest through, which is what the split/interleave dance in the
-    /// reference amounts to.
     func applyRope(_ x: MLXArray, offset: RoPEOffset?) -> MLXArray {
-        if ropeHeadDim == headDim {
-            return applyRotaryPosition(rope, to: x, offset: offset)
-        }
-        let (B, H, L) = (x.dim(0), x.dim(1), x.dim(2))
-        let half = headDim / 2
-        let rotatingHalf = ropeHeadDim / 2
-        let pairs = x.reshaped(B, H, L, 2, half)
-        let rotating = pairs[.ellipsis, ..<rotatingHalf].reshaped(B, H, L, ropeHeadDim)
-        let passthrough = pairs[.ellipsis, rotatingHalf...]
-        let rotated = applyRotaryPosition(rope, to: rotating, offset: offset)
-            .reshaped(B, H, L, 2, rotatingHalf)
-        return concatenated([rotated, passthrough], axis: -1).reshaped(B, H, L, headDim)
+        k2HorizonApplyRope(
+            rope, to: x, headDim: headDim, ropeHeadDim: ropeHeadDim, offset: offset)
     }
 
     func applyGate(_ output: MLXArray, input x: MLXArray) -> MLXArray {
-        guard let gateProj, let gateFunction = args.attentionGate else { return output }
-        var gate = gateProj(x).reshaped(x.dim(0), x.dim(1), heads, headDim)
-        switch gateFunction {
-        case .silu:
-            gate = MLXNN.silu(gate)
-        case .softplus:
-            // `F.softplus(gate, beta=ln 2)`
-            let beta = Float(M_LN2)
-            gate = MLX.logAddExp(gate * beta, 0) / beta
-        }
-        return output * gate
+        k2HorizonApplyGate(
+            gateProj, function: args.attentionGate, output: output, input: x, heads: heads,
+            headDim: headDim)
     }
 
     public func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
-        let (B, L) = (x.dim(0), x.dim(1))
-
         var queries = qProj(x)
         var keys = kProj(x)
         if let qNorm { queries = qNorm(queries) }
         if let kNorm { keys = kNorm(keys) }
-        var values = usesMoVA ? routedValues(x) : vProj!(x)
+        let values = usesMoVA ? routedValues(x) : vProj!(x)
 
-        queries = queries.reshaped(B, L, heads, headDim).transposed(0, 2, 1, 3)
-        keys = keys.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
-
-        let offset = cache?.ropeOffset
-        queries = applyRope(queries, offset: offset)
-        keys = applyRope(keys, offset: offset)
-
-        var output = attentionWithCacheUpdate(
-            queries: queries, keys: keys, values: values, cache: cache, scale: scale, mask: mask
-        )
-        .transposed(0, 2, 1, 3)
-
-        output = applyGate(output, input: x)
-        return oProj(output.reshaped(B, L, -1))
+        return k2HorizonAttend(
+            queries: queries, keys: keys, values: values, input: x,
+            heads: heads, kvHeads: kvHeads, headDim: headDim, ropeHeadDim: ropeHeadDim,
+            scale: scale, rope: rope, gateProj: gateProj, gateFunction: args.attentionGate,
+            oProj: oProj, mask: mask, cache: cache)
     }
 }
 
@@ -509,16 +557,38 @@ public class K2HorizonSparseMoEBlock: Module, UnaryLayer {
 // MARK: - Decoder
 
 public class K2HorizonDecoderLayer: Module, TransformerLayer {
-    @ModuleInfo(key: "self_attn") var selfAttn: K2HorizonAttention
+    @ModuleInfo(key: "self_attn") var selfAttn: Module & K2HorizonAttentionLayer
     @ModuleInfo(key: "mlp") var mlp: Module & UnaryLayer
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: K2HorizonGroupedRMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: K2HorizonGroupedRMSNorm
 
+    /// FORK(JuanColilla): R-56 — whether this layer reads its routed experts
+    /// (MLP, and value experts on a MoVA layer) from disk.
+    public let usesStreamedExperts: Bool
+
     public init(_ args: K2HorizonConfiguration, layerIdx: Int) {
-        _selfAttn.wrappedValue = K2HorizonAttention(args, layerIdx: layerIdx)
-        if args.isSparseLayer(layerIdx) {
+        // FORK(JuanColilla): R-56 — streaming is chosen at construction, never
+        // by a flag on a live module. Only sparse layers stream; the dense
+        // `mlp_only_layers` have no experts and are built as always. The
+        // value experts stream only if the index actually has them, which
+        // a `switch_v` checkpoint guarantees.
+        if args.isSparseLayer(layerIdx), let session = ExpertStreaming.activeSession {
+            if args.usesMoVA(layerIdx), session.bank(for: .value) != nil {
+                _selfAttn.wrappedValue = K2HorizonStreamedAttention(
+                    args, layerIdx: layerIdx, session: session)
+            } else {
+                _selfAttn.wrappedValue = K2HorizonAttention(args, layerIdx: layerIdx)
+            }
+            _mlp.wrappedValue = K2HorizonStreamedSparseMoEBlock(
+                args, layerIndex: layerIdx, session: session)
+            self.usesStreamedExperts = true
+        } else if args.isSparseLayer(layerIdx) {
+            _selfAttn.wrappedValue = K2HorizonAttention(args, layerIdx: layerIdx)
             _mlp.wrappedValue = K2HorizonSparseMoEBlock(args)
+            self.usesStreamedExperts = false
         } else {
+            _selfAttn.wrappedValue = K2HorizonAttention(args, layerIdx: layerIdx)
+            self.usesStreamedExperts = false
             _mlp.wrappedValue = K2HorizonMLP(
                 dimensions: args.hiddenSize, hiddenDimensions: args.intermediateSize)
         }

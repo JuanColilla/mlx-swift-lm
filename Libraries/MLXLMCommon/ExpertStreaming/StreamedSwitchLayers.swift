@@ -6,7 +6,8 @@
 // why streaming needs no new kernel — only a different set of arrays and a
 // translation from expert ids to slot ids.
 //
-// Deliberately NOT a subclass of `SwitchGLU`/`QuantizedSwitchLinear`:
+// Deliberately NOT subclasses of `SwitchGLU`/`SwitchLinear`/
+// `QuantizedSwitchLinear`:
 //
 //  * `SwitchGLU.init` allocates three dense `[numExperts, out, in]` weights,
 //    which for a bank-sized module is exactly the memory streaming exists to
@@ -21,6 +22,24 @@ import Foundation
 import MLX
 import MLXNN
 
+/// The gather matmul over one piece of a bank or of a staged batch.
+private func streamedGatherMM(
+    _ x: MLXArray, projection: ExpertProjection, indices: MLXArray, pools: [MLXArray],
+    groupSize: Int, bits: Int, sorted: Bool
+) -> MLXArray {
+    MLX.gatherQuantizedMM(
+        x,
+        pools[ExpertPiece(projection, .weight).slot],
+        scales: pools[ExpertPiece(projection, .scales).slot],
+        biases: pools[ExpertPiece(projection, .biases).slot],
+        rhsIndices: indices,
+        transpose: true,
+        groupSize: groupSize,
+        bits: bits,
+        mode: .affine,
+        sortedIndices: sorted)
+}
+
 /// Bank-backed replacement for `SwitchGLU` in a streamed MoE layer.
 ///
 /// Holds no parameters: the arrays it multiplies with belong to the slot bank
@@ -33,6 +52,7 @@ public final class StreamedSwitchGLU: Module, @unchecked Sendable {
     private let activationProduct: @Sendable (MLXArray, MLXArray) -> MLXArray
 
     public init(bank: ExpertSlotBank, groupSize: Int, bits: Int) {
+        precondition(bank.family == .mlp, "StreamedSwitchGLU multiplies with the MLP bank")
         self.bank = bank
         self.groupSize = groupSize
         self.bits = bits
@@ -62,7 +82,7 @@ public final class StreamedSwitchGLU: Module, @unchecked Sendable {
     }
 
     private var bankPools: [MLXArray] {
-        ExpertPiece.all.map { bank.pool($0) }
+        bank.family.pieces.map { bank.pool($0) }
     }
 
     private func project(_ x: MLXArray, _ indices: MLXArray, pools: [MLXArray]) -> MLXArray {
@@ -90,22 +110,68 @@ public final class StreamedSwitchGLU: Module, @unchecked Sendable {
         _ projection: ExpertProjection, _ x: MLXArray, _ indices: MLXArray,
         pools: [MLXArray], sorted: Bool
     ) -> MLXArray {
-        MLX.gatherQuantizedMM(
-            x,
-            pools[ExpertPiece(projection, .weight).slot],
-            scales: pools[ExpertPiece(projection, .scales).slot],
-            biases: pools[ExpertPiece(projection, .biases).slot],
-            rhsIndices: indices,
-            transpose: true,
-            groupSize: groupSize,
-            bits: bits,
-            mode: .affine,
-            sortedIndices: sorted)
+        streamedGatherMM(
+            x, projection: projection, indices: indices, pools: pools,
+            groupSize: groupSize, bits: bits, sorted: sorted)
+    }
+}
+
+/// Bank-backed replacement for a single routed `SwitchLinear`: the value
+/// experts of a K2-Horizon MoVA attention layer.
+///
+/// Returns one output row per assignment, `[tokens, k, out]`, exactly as the
+/// resident `SwitchLinear` does; whatever the model applies after the
+/// projection (K2 applies `silu` before the weighted sum) stays in the model,
+/// so the resident and streamed attention share every line but the matmul.
+public final class StreamedSwitchLinear: Module, @unchecked Sendable {
+    public let bank: ExpertSlotBank
+    public let groupSize: Int
+    public let bits: Int
+
+    public init(bank: ExpertSlotBank, groupSize: Int, bits: Int) {
+        precondition(
+            bank.family == .value, "StreamedSwitchLinear multiplies with the value bank")
+        self.bank = bank
+        self.groupSize = groupSize
+        self.bits = bits
+        super.init()
+    }
+
+    /// Project through the slot bank. `slots` is `[tokens, k]`.
+    public func callAsFunction(_ x: MLXArray, slots: MLXArray) -> MLXArray {
+        project(x, slots, pools: bank.family.pieces.map { bank.pool($0) })
+    }
+
+    /// The prefill variant over transient staged arrays.
+    public func callAsFunction(
+        _ x: MLXArray, localIndices: MLXArray, pools: [MLXArray]
+    ) -> MLXArray {
+        project(x, localIndices, pools: pools)
+    }
+
+    private func project(_ x: MLXArray, _ indices: MLXArray, pools: [MLXArray]) -> MLXArray {
+        var x = MLX.expandedDimensions(x, axes: [-2, -3])
+
+        let doSort = indices.size >= 64
+        var idx = indices
+        var inverseOrder = MLXArray()
+        if doSort {
+            (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
+        }
+
+        var out = streamedGatherMM(
+            x, projection: .value, indices: idx, pools: pools,
+            groupSize: groupSize, bits: bits, sorted: doSort)
+
+        if doSort {
+            out = scatterUnsort(x: out, invOrder: inverseOrder, shape: indices.shape)
+        }
+        return MLX.squeezed(out, axis: -2)
     }
 }
 
 /// The routing decision, resolved on the host, plus the indices the matmul
-/// needs. Shared by every streamed MoE block so the policy lives in one place.
+/// needs. Shared by every streamed block so the policy lives in one place.
 public struct StreamedExpertResolution {
     /// Indices into whichever pools `pools` holds.
     public let indices: MLXArray
@@ -120,7 +186,7 @@ public struct StreamedExpertResolution {
 
 extension ExpertStreamingSession {
 
-    /// Resolve one layer's routing choice to slot or staged indices.
+    /// Resolve one step's routing choice to slot or staged indices.
     ///
     /// Two regimes, and the split is the point:
     ///
@@ -142,12 +208,15 @@ extension ExpertStreamingSession {
     /// constant that agrees with the truth for exactly one model, so the
     /// count of assignments must not appear in this decision at all.
     public func resolve(
-        layer: Int, tokenCount: Int, experts: [Int]
+        layer: Int, family: ExpertFamily, tokenCount: Int, experts: [Int]
     ) throws -> StreamedExpertResolution {
         // A failed session issues no more reads. Without this the remaining
         // thirty-nine layers of the token would each hammer the broken
         // descriptor before the host's handler got a turn.
         if let failure = self.lastFailure { throw failure }
+        guard let bank = banks[family] else {
+            throw ExpertResidencyError.unknownFamily(family)
+        }
 
         let unique = Array(Set(experts)).sorted()
         let isDecode = tokenCount == 1
@@ -155,14 +224,14 @@ extension ExpertStreamingSession {
 
         if useBank {
             let slots = try bank.ensure(
-                keys: unique.map { ExpertKey(layer: layer, expert: $0) })
-            // P6, and the order matters: the prediction for the next layer is
-            // issued *after* this layer has its slots, so the background lanes
+                keys: unique.map { ExpertKey(family: family, layer: layer, expert: $0) })
+            // P6, and the order matters: the prediction for the next step is
+            // issued *after* this step has its slots, so the background lanes
             // read while the GPU works on the matmul this call is about to
             // return the indices for. Issued before, it would be competing
             // with the read the forward pass is blocked on.
             if isDecode, isTemporalPrefetchEnabled {
-                predictAfter(layer: layer, experts: unique)
+                predictAfter(step: StreamedExpertStep(layer: layer, family: family), experts: unique)
             }
             let mapping = Dictionary(uniqueKeysWithValues: zip(unique, slots))
             return StreamedExpertResolution(
@@ -170,11 +239,19 @@ extension ExpertStreamingSession {
                 pools: nil)
         }
 
-        let (arrays, sortedExperts) = try store.readRuns(layer: layer, experts: unique)
+        let (arrays, sortedExperts) = try store.readRuns(
+            family: family, layer: layer, experts: unique)
         var local = [Int: UInt32]()
         for (row, expert) in sortedExperts.enumerated() { local[expert] = UInt32(row) }
         return StreamedExpertResolution(
             indices: MLXArray(experts.map { local[$0]! }),
             pools: arrays)
+    }
+
+    /// The MLP-family resolution, for the single-family blocks.
+    public func resolve(
+        layer: Int, tokenCount: Int, experts: [Int]
+    ) throws -> StreamedExpertResolution {
+        try resolve(layer: layer, family: .mlp, tokenCount: tokenCount, experts: experts)
     }
 }

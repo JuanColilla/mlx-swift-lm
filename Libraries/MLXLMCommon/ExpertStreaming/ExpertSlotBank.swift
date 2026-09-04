@@ -1,8 +1,11 @@
 // FORK(JuanColilla): R-56 expert streaming — the residency tier (L1).
 //
-// A fixed pool of expert slots shared by *every* layer. The 40 MoE layers of
-// a Qwen 3.5 checkpoint have identical expert geometry, so one global bank
-// lets a hot layer borrow capacity from a cold one; a per-layer bank cannot.
+// A fixed pool of expert slots shared by *every* layer of one family. The 40
+// MoE layers of a Qwen 3.5 checkpoint have identical expert geometry, so one
+// global bank lets a hot layer borrow capacity from a cold one; a per-layer
+// bank cannot. A checkpoint with two families (K2-Horizon MoVA: MLP experts
+// and value experts, different counts and different row sizes) gets one bank
+// per family, built by the session.
 //
 // The bank is deliberately NOT a module parameter. `loadWeights` verifies the
 // checkpoint against the module tree with `verify: [.all]`, which fails both
@@ -32,11 +35,24 @@ public struct ExpertSlotBankStatistics: Sendable, Equatable {
         let total = hits + misses
         return total > 0 ? Double(hits) / Double(total) : 0
     }
+
+    /// Sum of two banks' counters, so a session with two families can report
+    /// one hit rate.
+    public static func + (lhs: Self, rhs: Self) -> Self {
+        var sum = lhs
+        sum.hits += rhs.hits
+        sum.misses += rhs.misses
+        sum.evictions += rhs.evictions
+        sum.installSeconds += rhs.installSeconds
+        sum.installEvals += rhs.installEvals
+        return sum
+    }
 }
 
 public enum ExpertSlotBankError: Error, CustomStringConvertible {
     case requestExceedsCapacity(requested: Int, slots: Int)
     case noEvictableSlot(slots: Int)
+    case wrongFamily(expected: ExpertFamily, found: ExpertFamily)
     case concurrentForward
 
     public var description: String {
@@ -48,6 +64,8 @@ public enum ExpertSlotBankError: Error, CustomStringConvertible {
             """
         case .noEvictableSlot(let slots):
             "all \(slots) slots are pinned; the bank is too small for this top-K"
+        case .wrongFamily(let expected, let found):
+            "the \(expected.rawValue) bank was asked for a \(found.rawValue) expert"
         case .concurrentForward:
             """
             a second forward pass entered the slot bank while one was in flight; \
@@ -75,6 +93,9 @@ public final class ExpertSlotBank: @unchecked Sendable {
     }
 
     public let store: ExpertResidencyStore
+    /// The family this bank holds. Its geometry comes from the family's
+    /// template layer, and every key that enters has to name it.
+    public let family: ExpertFamily
     public private(set) var configuration: Configuration
 
     /// Skip the `eval` that closes an install and let the next mandatory
@@ -117,15 +138,26 @@ public final class ExpertSlotBank: @unchecked Sendable {
     /// concurrent `ensure` would unpin it. Rejected, not serialized.
     private let singleFlight = SingleFlightGuard()
 
-    public init(store: ExpertResidencyStore, configuration: Configuration) {
+    public init(
+        store: ExpertResidencyStore, family: ExpertFamily = .mlp, configuration: Configuration
+    ) {
+        precondition(
+            store.index.family(family) != nil,
+            "the index has no \(family.rawValue) experts to build a bank for")
         self.store = store
+        self.family = family
         self.configuration = configuration
-        allocate(slots: Self.slotCount(for: configuration.capacityBytes, store: store))
+        allocate(
+            slots: Self.slotCount(for: configuration.capacityBytes, store: store, family: family))
     }
 
     public var slotCount: Int { keyOfSlot.count }
 
-    public var bytesResident: Int { slotCount * store.index.bytesPerExpert }
+    public var bytesResident: Int { slotCount * bytesPerExpert }
+
+    private var familyIndex: ExpertFamilyIndex { store.index.family(family)! }
+    private var bytesPerExpert: Int { familyIndex.bytesPerExpert }
+    private var pieces: [ExpertPiece] { family.pieces }
 
     public var statistics: ExpertSlotBankStatistics {
         lock.withLock { statisticsStorage }
@@ -144,8 +176,11 @@ public final class ExpertSlotBank: @unchecked Sendable {
     /// that is already resident is the one read guaranteed to buy nothing.
     public func isResident(_ key: ExpertKey) -> Bool { slotOfKey[key] != nil }
 
-    public static func slotCount(for capacityBytes: Int, store: ExpertResidencyStore) -> Int {
-        max(1, capacityBytes / max(1, store.index.bytesPerExpert))
+    public static func slotCount(
+        for capacityBytes: Int, store: ExpertResidencyStore, family: ExpertFamily = .mlp
+    ) -> Int {
+        let bytesPerExpert = store.index.family(family)?.bytesPerExpert ?? 0
+        return max(1, capacityBytes / max(1, bytesPerExpert))
     }
 
     // MARK: - Residency
@@ -160,6 +195,9 @@ public final class ExpertSlotBank: @unchecked Sendable {
         try singleFlight.enter(orThrow: ExpertSlotBankError.concurrentForward)
         defer { singleFlight.leave() }
 
+        if let foreign = keys.first(where: { $0.family != family }) {
+            throw ExpertSlotBankError.wrongFamily(expected: family, found: foreign.family)
+        }
         guard keys.count <= slotCount else {
             throw ExpertSlotBankError.requestExceedsCapacity(
                 requested: keys.count, slots: slotCount)
@@ -192,7 +230,7 @@ public final class ExpertSlotBank: @unchecked Sendable {
         // leaving a batch pending would block every later prediction behind
         // one nobody wanted, and the mechanism would quietly stall after its
         // first unclaimed read.
-        let claimed = store.takePrefetched(covering: Set(missing.map(\.key)))
+        let claimed = store.takePrefetched(family: family, covering: Set(missing.map(\.key)))
 
         if !missing.isEmpty {
             try install(missing, claimed: claimed, into: &slots)
@@ -224,13 +262,12 @@ public final class ExpertSlotBank: @unchecked Sendable {
                 let rows = MLXArray(fromPrefetch.map { Int32(claimed.batch.row(of: $0.key)!) })
                 try installBatch(
                     fromPrefetch, into: &slots,
-                    staged: { ExpertPiece.all.map { claimed.arrays[$0.slot][rows] } })
+                    staged: { self.pieces.map { claimed.arrays[$0.slot][rows] } })
                 store.notePrefetchServed(keys: fromPrefetch.count)
             }
             let wasted = claimed.batch.keys.count - fromPrefetch.count
             if wasted > 0 {
-                store.notePrefetchWasted(
-                    bytes: wasted * store.index.bytesPerExpert)
+                store.notePrefetchWasted(bytes: wasted * bytesPerExpert)
             }
         }
 
@@ -265,7 +302,7 @@ public final class ExpertSlotBank: @unchecked Sendable {
         let start = Date.timeIntervalSinceReferenceDate
         let rows = try staged()
         let indices = MLXArray(targets.map { Int32($0) })
-        for piece in ExpertPiece.all {
+        for piece in pieces {
             pools[piece.slot][indices] = rows[piece.slot]
         }
         var evals = 0
@@ -350,7 +387,7 @@ public final class ExpertSlotBank: @unchecked Sendable {
         }
         defer { singleFlight.leave() }
 
-        let target = Self.slotCount(for: capacityBytes, store: store)
+        let target = Self.slotCount(for: capacityBytes, store: store, family: family)
         guard target != slotCount else {
             configuration.capacityBytes = capacityBytes
             return true
@@ -378,8 +415,9 @@ public final class ExpertSlotBank: @unchecked Sendable {
 
     private func grow(to target: Int) {
         let previous = slotCount
-        for piece in ExpertPiece.all {
-            let record = store.index.layers[0][piece]
+        let template = familyIndex.template
+        for piece in pieces {
+            let record = template[piece]
             var pool = MLX.zeros([target] + record.rowShape, dtype: record.dtype.mlxDType)
             pool[0 ..< previous] = pools[piece.slot]
             eval(pool)
@@ -404,8 +442,9 @@ public final class ExpertSlotBank: @unchecked Sendable {
     }
 
     private func allocate(slots: Int) {
-        pools = ExpertPiece.all.map { piece in
-            let record = store.index.layers[0][piece]
+        let template = familyIndex.template
+        pools = pieces.map { piece in
+            let record = template[piece]
             return MLX.zeros([slots] + record.rowShape, dtype: record.dtype.mlxDType)
         }
         eval(pools)

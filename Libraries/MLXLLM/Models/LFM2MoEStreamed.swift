@@ -91,7 +91,7 @@ final class Lfm2MoeStreamedSparseMoeBlock: Module, UnaryLayer {
         let resolution: StreamedExpertResolution
         do {
             resolution = try session.resolve(
-                layer: layerIndex, tokenCount: tokenCount, experts: experts)
+                layer: layerIndex, family: .mlp, tokenCount: tokenCount, experts: experts)
         } catch {
             // TD-054(a). `UnaryLayer` cannot throw, so the failure leaves
             // sideways: it is latched on the session, whose handler cancels

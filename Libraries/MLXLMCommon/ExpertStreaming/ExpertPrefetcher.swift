@@ -53,12 +53,17 @@ struct ExpertReadJob: @unchecked Sendable {
 /// which hands the buffers to MLX with a finalizer, or `discard`, which frees
 /// them. Doing neither leaks; `deinit` catches that.
 final class ExpertReadBatch: @unchecked Sendable {
+    let family: ExpertFamily
     let keys: [ExpertKey]
     let jobs: [ExpertReadJob]
     private var buffers: [UnsafeMutableRawPointer]
     private let rowOfKey: [ExpertKey: Int]
 
-    init(keys: [ExpertKey], buffers: [UnsafeMutableRawPointer], jobs: [ExpertReadJob]) {
+    init(
+        family: ExpertFamily, keys: [ExpertKey], buffers: [UnsafeMutableRawPointer],
+        jobs: [ExpertReadJob]
+    ) {
+        self.family = family
         self.keys = keys
         self.buffers = buffers
         self.jobs = jobs
@@ -75,19 +80,42 @@ final class ExpertReadBatch: @unchecked Sendable {
     /// Which row of the staged arrays holds `key`, if this batch read it.
     func row(of key: ExpertKey) -> Int? { rowOfKey[key] }
 
+    /// `byteCount` rounded up to a whole number of pages: the length MLX is
+    /// handed for a staging buffer, so `newBufferWithBytesNoCopy` accepts it.
+    static func paddedByteCount(_ byteCount: Int) -> Int {
+        let page = ExpertOffsetIndex.pageSize
+        return (byteCount + page - 1) / page * page
+    }
+
     /// Hand the buffers to MLX. Ownership of each moves to its `MLXArray`; the
     /// finalizer frees it when MLX releases the last reference.
+    ///
+    /// A piece whose rows are page multiples is wrapped in its final shape.
+    /// One that is not — the K2-Horizon MLP scales, 61.440 bytes per expert —
+    /// is wrapped over the *padded* length as a flat array, then sliced to
+    /// the exact element count and reshaped. Both the slice (a leading-axis
+    /// slice of a contiguous array) and the reshape are views in MLX, so the
+    /// bytes are still never copied; wrapping the exact length instead would
+    /// make `make_buffer` return null and MLX copy silently.
     func materialize(index: ExpertOffsetIndex) -> [MLXArray] {
-        let template = index.layers[0]
+        let template = index.family(family)!.template
         let taken = buffers
         buffers = []
-        return taken.enumerated().map { slot, buffer in
-            let record = template[ExpertPiece.all[slot]]
-            return MLXArray(
-                rawPointer: buffer,
-                [keys.count] + record.rowShape,
-                dtype: record.dtype.mlxDType,
+        return zip(family.pieces, taken).map { piece, buffer in
+            let record = template[piece]
+            let shape = [keys.count] + record.rowShape
+            let exactBytes = record.rowBytes * keys.count
+            let paddedBytes = Self.paddedByteCount(exactBytes)
+            if paddedBytes == exactBytes {
+                return MLXArray(
+                    rawPointer: buffer, shape, dtype: record.dtype.mlxDType,
+                    finalizer: { free(buffer) })
+            }
+            let itemSize = record.dtype.itemSize
+            let flat = MLXArray(
+                rawPointer: buffer, [paddedBytes / itemSize], dtype: record.dtype.mlxDType,
                 finalizer: { free(buffer) })
+            return flat[0 ..< (exactBytes / itemSize)].reshaped(shape)
         }
     }
 
@@ -103,10 +131,12 @@ typealias ExpertPrefetchClaim = (batch: ExpertReadBatch, arrays: [MLXArray])
 
 /// Background reader for the temporal prediction.
 ///
-/// One batch in flight at a time: issued at layer L, consumed at layer L+1. A
-/// second request while one is pending is dropped rather than queued — the
-/// prediction it carries is about to be superseded anyway, and a queue here
-/// would only spend NAND bandwidth the foreground needs.
+/// One batch in flight per family: issued at one step, consumed at the next
+/// step of the same family. A second request for a family while one is
+/// pending is dropped rather than queued — the prediction it carries is about
+/// to be superseded anyway, and a queue here would only spend NAND bandwidth
+/// the foreground needs. The families are kept apart so the MLP bank's claim
+/// cannot swallow, and count as wasted, a batch read for the value bank.
 final class ExpertPrefetcher: @unchecked Sendable {
 
     private final class Pending {
@@ -122,7 +152,7 @@ final class ExpertPrefetcher: @unchecked Sendable {
     /// depend on the cooperative pool getting a turn (TD-030/031).
     private let driver: DispatchQueue
     private let lock = NSLock()
-    private var pending: Pending?
+    private var pending: [ExpertFamily: Pending] = [:]
     private var stopped = false
 
     init(store: ExpertResidencyStore, queueDepth: Int) {
@@ -143,19 +173,24 @@ final class ExpertPrefetcher: @unchecked Sendable {
         lanes.shutdown()
     }
 
-    /// Drop whatever is in flight, waiting for it first.
+    /// Drop whatever is in flight, for every family, waiting for it first.
     func cancel() {
-        guard let pending = lock.withLock({ claimPending() }) else { return }
-        pending.done.wait()
-        pending.batch.discard()
+        let claimed: [Pending] = lock.withLock {
+            defer { pending = [:] }
+            return Array(pending.values)
+        }
+        for pending in claimed {
+            pending.done.wait()
+            pending.batch.discard()
+        }
     }
 
-    /// Issue the read for `keys` in the background. Cheap and best effort: a
-    /// planning failure is counted and forgotten.
+    /// Issue the read for `keys` — all of one family — in the background.
+    /// Cheap and best effort: a planning failure is counted and forgotten.
     func request(keys: [ExpertKey]) {
-        guard !keys.isEmpty else { return }
+        guard let family = keys.first?.family else { return }
         let admitted: Bool = lock.withLock {
-            guard !stopped, pending == nil else { return false }
+            guard !stopped, pending[family] == nil else { return false }
             return true
         }
         guard admitted else { return }
@@ -169,7 +204,7 @@ final class ExpertPrefetcher: @unchecked Sendable {
         }
 
         let entry = Pending(batch: batch)
-        lock.withLock { pending = entry }
+        lock.withLock { pending[family] = entry }
         store.notePrefetchIssued(keys: keys.count)
 
         // The store is captured strongly for the duration of the block, not
@@ -187,7 +222,7 @@ final class ExpertPrefetcher: @unchecked Sendable {
         }
     }
 
-    /// Claim the batch in flight if it covers any of `wanted`.
+    /// Claim the batch in flight for `family` if it covers any of `wanted`.
     ///
     /// Waits for it rather than skipping it: the bytes are already being read,
     /// and waiting is always cheaper than reissuing the same `pread`. The wait
@@ -196,8 +231,10 @@ final class ExpertPrefetcher: @unchecked Sendable {
     ///
     /// Returns the batch and its staged arrays; the caller decides which rows
     /// to install.
-    func take(covering wanted: Set<ExpertKey>) -> ExpertPrefetchClaim? {
-        guard let pending = lock.withLock({ claimPending() }) else { return nil }
+    func take(family: ExpertFamily, covering wanted: Set<ExpertKey>) -> ExpertPrefetchClaim? {
+        guard let pending = lock.withLock({ pending.removeValue(forKey: family) }) else {
+            return nil
+        }
 
         let start = Date.timeIntervalSinceReferenceDate
         pending.done.wait()
@@ -214,11 +251,5 @@ final class ExpertPrefetcher: @unchecked Sendable {
             return nil
         }
         return (pending.batch, pending.batch.materialize(index: store.index))
-    }
-
-    /// Caller must hold `lock`.
-    private func claimPending() -> Pending? {
-        defer { pending = nil }
-        return pending
     }
 }

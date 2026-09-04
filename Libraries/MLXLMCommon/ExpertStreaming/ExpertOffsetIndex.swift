@@ -1,26 +1,89 @@
 // FORK(JuanColilla): R-56 expert streaming — offset index over the original
 // safetensors shards (design "Option A": no repack).
 //
-// Every routed-expert tensor of a Qwen 3.5 MoE checkpoint carries the expert
+// Every routed-expert tensor of a stacked MoE checkpoint carries the expert
 // on axis 0 and is stored row-major, so expert `i` of a given tensor is the
 // contiguous byte range `[i*rowBytes, (i+1)*rowBytes)` inside its shard. This
-// index is the map from `(layer, projection, component)` to that range, built
-// once from the shard headers and persisted next to the model.
+// index is the map from `(family, layer, projection, component)` to that
+// range, built once from the shard headers and persisted next to the model.
 //
-// TD-050: the index is only valid for that layout. A checkpoint that stores
-// experts as separate `experts.N.*` tensors, or that fuses gate and up into a
-// single `gate_up_proj`, is rejected loudly here rather than degrading into a
-// silently wrong read.
+// Two families of routed experts exist. Every MoE checkpoint has the MLP
+// family (`switch_mlp.{gate,up,down}_proj`); K2-Horizon MoVA adds a value
+// family (`self_attn.switch_v`), a single projection routed per token by its
+// own router. They have their own expert counts and geometry, so the index
+// keeps them apart end to end: a slot bank is built per family.
+//
+// TD-050: the index is only valid for the stacked layout. A checkpoint that
+// stores experts as separate `experts.N.*` tensors, or that fuses gate and up
+// into a single `gate_up_proj`, is rejected loudly here rather than degrading
+// into a silently wrong read.
 
 import Foundation
 
 // MARK: - Geometry
 
-/// One of the three projections of a routed expert MLP.
+/// A group of routed experts that share a router, a count and a geometry.
+public enum ExpertFamily: String, Codable, Sendable, CaseIterable, Comparable {
+    /// The feed-forward experts of a MoE layer: `switch_mlp`.
+    case mlp
+    /// The value-projection experts of a MoVA attention layer: `switch_v`.
+    case value
+
+    /// The projections a routed expert of this family is made of.
+    public var projections: [ExpertProjection] {
+        switch self {
+        case .mlp: [.gate, .up, .down]
+        case .value: [.value]
+        }
+    }
+
+    /// The pieces of one expert, in ``ExpertPiece/slot`` order.
+    public var pieces: [ExpertPiece] {
+        projections.flatMap { projection in
+            ExpertComponent.allCases.map { ExpertPiece(projection, $0) }
+        }
+    }
+
+    /// The tensor-name segment that marks a stacked expert tensor of this
+    /// family: `switch_mlp` or `switch_v`.
+    public var stackName: String {
+        switch self {
+        case .mlp: "switch_mlp"
+        case .value: "switch_v"
+        }
+    }
+
+    /// The order in which a decoder layer visits its families: attention runs
+    /// before the feed-forward block, so the value experts of layer L come
+    /// before the MLP experts of layer L. The prefetcher's notion of "the next
+    /// step" depends on it.
+    public static func < (lhs: ExpertFamily, rhs: ExpertFamily) -> Bool {
+        lhs.forwardOrder < rhs.forwardOrder
+    }
+
+    private var forwardOrder: Int {
+        switch self {
+        case .value: 0
+        case .mlp: 1
+        }
+    }
+}
+
+/// One projection of a routed expert.
 public enum ExpertProjection: String, Codable, Sendable, CaseIterable {
     case gate = "gate_proj"
     case up = "up_proj"
     case down = "down_proj"
+    /// The single projection of a MoVA value expert. `switch_v` has no
+    /// projection segment in its key — the component follows it directly.
+    case value = "switch_v"
+
+    public var family: ExpertFamily {
+        switch self {
+        case .gate, .up, .down: .mlp
+        case .value: .value
+        }
+    }
 }
 
 /// One of the three arrays an affine-quantized projection is stored as.
@@ -30,11 +93,12 @@ public enum ExpertComponent: String, Codable, Sendable, CaseIterable {
     case biases
 }
 
-/// One of the nine contiguous byte ranges that make up a single expert.
+/// One contiguous byte range of a single expert.
 ///
-/// The raw value is the canonical slot used by every array indexed by piece
-/// (staging buffers, slot-bank pools, read batches), so it is stable and
-/// serialized.
+/// The slot is family-local: the MLP family has nine pieces (0…8) and the
+/// value family three (0…2). Every array indexed by piece — staging buffers,
+/// slot-bank pools, read batches — belongs to exactly one family, so the
+/// numbering never has to be global.
 public struct ExpertPiece: Hashable, Sendable {
     public let projection: ExpertProjection
     public let component: ExpertComponent
@@ -44,16 +108,18 @@ public struct ExpertPiece: Hashable, Sendable {
         self.component = component
     }
 
-    /// The nine pieces in canonical order.
-    public static let all: [ExpertPiece] = ExpertProjection.allCases.flatMap { projection in
-        ExpertComponent.allCases.map { ExpertPiece(projection, $0) }
-    }
+    public var family: ExpertFamily { projection.family }
+
+    /// The nine pieces of the MLP family, in canonical order.
+    public static let all: [ExpertPiece] = ExpertFamily.mlp.pieces
 
     public var slot: Int {
-        let projectionIndex = ExpertProjection.allCases.firstIndex(of: projection)!
+        let projectionIndex = family.projections.firstIndex(of: projection)!
         let componentIndex = ExpertComponent.allCases.firstIndex(of: component)!
         return projectionIndex * ExpertComponent.allCases.count + componentIndex
     }
+
+    public var name: String { "\(projection.rawValue).\(component.rawValue)" }
 }
 
 /// The subset of safetensors dtypes a quantized MoE checkpoint uses, with the
@@ -96,6 +162,7 @@ public enum ExpertOffsetIndexError: Error, CustomStringConvertible {
     case ambiguousKey(layer: Int, piece: String, first: String, second: String)
     case quantizationMismatch(
         projection: String, bits: Int, groupSize: Int, impliedInputDims: Int, scaleGroups: Int)
+    case missingFamily(ExpertFamily)
 
     public var description: String {
         switch self {
@@ -121,8 +188,8 @@ public enum ExpertOffsetIndexError: Error, CustomStringConvertible {
             "layer \(layer) is missing \(missing)"
         case .unalignedRow(let layer, let piece, let rowBytes):
             """
-            layer \(layer) piece \(piece): row of \(rowBytes) bytes is not a multiple \
-            of the 16 KiB page, so the zero-copy delivery path cannot be used
+            layer \(layer) piece \(piece): row of \(rowBytes) bytes is not a whole \
+            number of its dtype's items, so no expert row can be delivered as an array
             """
         case .byteCountMismatch(let layer, let piece, let declared, let computed):
             "layer \(layer) piece \(piece): header declares \(declared) bytes, shape implies \(computed)"
@@ -145,6 +212,8 @@ public enum ExpertOffsetIndexError: Error, CustomStringConvertible {
             \(impliedInputDims / groupSize) scale groups, but the checkpoint has \
             \(scaleGroups)
             """
+        case .missingFamily(let family):
+            "the index has no \(family.rawValue) expert family"
         }
     }
 }
@@ -159,6 +228,10 @@ public struct ExpertTensorRecord: Codable, Sendable, Equatable {
     /// the 8-byte header length field and the JSON header.
     public let baseOffset: Int64
     /// Bytes occupied by a single expert.
+    ///
+    /// Not necessarily a multiple of the 16 KiB page: the K2-Horizon MLP
+    /// scales are 61.440 bytes per expert. The staging path pads the whole
+    /// batch to a page instead — see `ExpertReadBatch.materialize`.
     public let rowBytes: Int
     /// Shape of a single expert's row (the tensor's shape without axis 0).
     public let rowShape: [Int]
@@ -170,23 +243,65 @@ public struct ExpertTensorRecord: Codable, Sendable, Equatable {
 
     /// Offset of a run of consecutive experts, for coalesced prefill reads.
     public func offset(ofRunStartingAt expert: Int) -> Int64 { offset(ofExpert: expert) }
+
+    /// Whether a row of this tensor can be handed to MLX without padding.
+    public var isPageAligned: Bool { rowBytes % ExpertOffsetIndex.pageSize == 0 }
 }
 
-/// One layer's nine records, in ``ExpertPiece/slot`` order.
+/// One layer's records for one family, in ``ExpertPiece/slot`` order.
 public struct ExpertLayerRecords: Codable, Sendable, Equatable {
     public let layer: Int
     public let pieces: [ExpertTensorRecord]
 
+    public init(layer: Int, pieces: [ExpertTensorRecord]) {
+        self.layer = layer
+        self.pieces = pieces
+    }
+
     public subscript(piece: ExpertPiece) -> ExpertTensorRecord { pieces[piece.slot] }
+}
+
+/// Every layer of one expert family, plus the geometry they share.
+public struct ExpertFamilyIndex: Codable, Sendable, Equatable {
+    public let family: ExpertFamily
+    public let expertCount: Int
+    public let layers: [ExpertLayerRecords]
+
+    public init(family: ExpertFamily, expertCount: Int, layers: [ExpertLayerRecords]) {
+        self.family = family
+        self.expertCount = expertCount
+        self.layers = layers
+    }
+
+    public var layerCount: Int { layers.count }
+
+    /// Bytes of one expert across its pieces.
+    public var bytesPerExpert: Int {
+        guard let first = layers.first else { return 0 }
+        return first.pieces.reduce(0) { $0 + $1.rowBytes }
+    }
+
+    public var routedBytes: Int { bytesPerExpert * expertCount * layers.count }
+
+    public func records(forLayer layer: Int) -> ExpertLayerRecords? {
+        layers.first { $0.layer == layer }
+    }
+
+    /// The geometry every layer of the family shares; the slot bank is
+    /// allocated from it.
+    public var template: ExpertLayerRecords { layers[0] }
 }
 
 // MARK: - Index
 
 public struct ExpertOffsetIndex: Codable, Sendable, Equatable {
-    public static let currentFormatVersion = 1
+    /// Version 2 introduced the expert family. A version-1 index has no
+    /// family records and is rebuilt rather than migrated: building one costs
+    /// a few hundred KB of header reads.
+    public static let currentFormatVersion = 2
 
-    /// The 16 KiB page of Apple silicon. A row that is not a multiple of this
-    /// cannot be handed to MLX without a copy: `MetalAllocator::make_buffer`
+    /// The 16 KiB page of Apple silicon. Staging handed to MLX has to be a
+    /// whole number of these, pointer and length: `MetalAllocator::make_buffer`
     /// returns null for a misaligned pointer or length and `array.cpp` then
     /// falls back to `malloc` + `std::copy` *silently*.
     public static let pageSize = 16384
@@ -196,39 +311,53 @@ public struct ExpertOffsetIndex: Codable, Sendable, Equatable {
     public let fingerprint: String
     /// Shard file names, relative to the model directory.
     public let shardFiles: [String]
-    public let expertCount: Int
-    public let layers: [ExpertLayerRecords]
+    /// The families present, in `ExpertFamily.allCases` order. The MLP family
+    /// is always there; the value family only for MoVA checkpoints.
+    public let families: [ExpertFamilyIndex]
 
     public init(
         formatVersion: Int = ExpertOffsetIndex.currentFormatVersion,
         fingerprint: String,
         shardFiles: [String],
-        expertCount: Int,
-        layers: [ExpertLayerRecords]
+        families: [ExpertFamilyIndex]
     ) {
         self.formatVersion = formatVersion
         self.fingerprint = fingerprint
         self.shardFiles = shardFiles
-        self.expertCount = expertCount
-        self.layers = layers
+        self.families = families
     }
 
-    public var layerCount: Int { layers.count }
-
-    /// Bytes of one expert across its nine pieces.
-    public var bytesPerExpert: Int {
-        guard let first = layers.first else { return 0 }
-        return first.pieces.reduce(0) { $0 + $1.rowBytes }
+    public func family(_ family: ExpertFamily) -> ExpertFamilyIndex? {
+        families.first { $0.family == family }
     }
 
-    public var routedBytes: Int {
-        layers.reduce(0) { total, layer in
-            total + layer.pieces.reduce(0) { $0 + $1.rowBytes * expertCount }
+    public func requireFamily(_ family: ExpertFamily) throws -> ExpertFamilyIndex {
+        guard let found = self.family(family) else {
+            throw ExpertOffsetIndexError.missingFamily(family)
         }
+        return found
     }
+
+    /// The MLP family. Every streamed checkpoint has one; `build` refuses a
+    /// directory without it.
+    public var mlp: ExpertFamilyIndex { family(.mlp)! }
+
+    // MARK: MLP-family conveniences
+    //
+    // The single-family API, kept because the host app reads it for its
+    // memory profile and its logging. They describe the MLP family only;
+    // `routedBytes` is the exception and sums every family, because it
+    // answers "how much of the checkpoint is not resident".
+
+    public var expertCount: Int { mlp.expertCount }
+    public var layers: [ExpertLayerRecords] { mlp.layers }
+    public var layerCount: Int { mlp.layerCount }
+    public var bytesPerExpert: Int { mlp.bytesPerExpert }
+
+    public var routedBytes: Int { families.reduce(0) { $0 + $1.routedBytes } }
 
     public func records(forLayer layer: Int) -> ExpertLayerRecords? {
-        layers.first { $0.layer == layer }
+        mlp.records(forLayer: layer)
     }
 
     public func shardURL(_ shard: Int, relativeTo modelDirectory: URL) -> URL {
@@ -237,10 +366,16 @@ public struct ExpertOffsetIndex: Codable, Sendable, Equatable {
 
     // MARK: Key classification
 
-    /// Whether a checkpoint key names a stacked routed-expert tensor, i.e. one
-    /// this index owns and the module tree must not load.
+    /// Whether a checkpoint key names a stacked routed-expert tensor of any
+    /// family, i.e. one this index owns and the module tree must not load.
+    ///
+    /// Both families have to be here: a `switch_v` left unrecognized is not an
+    /// error, it is 3,8 GB of value experts loaded resident with nothing
+    /// saying so.
     public static func isRoutedExpertKey(_ key: String) -> Bool {
-        key.contains(".switch_mlp.") || key.hasPrefix("switch_mlp.")
+        ExpertFamily.allCases.contains { family in
+            key.contains(".\(family.stackName).") || key.hasPrefix("\(family.stackName).")
+        }
     }
 
     /// `(layer, piece)` for a stacked routed-expert key, or `nil`.
@@ -264,14 +399,28 @@ public struct ExpertOffsetIndex: Codable, Sendable, Equatable {
         {
             throw ExpertOffsetIndexError.perExpertLayout(key)
         }
-        guard let switchIndex = parts.firstIndex(of: "switch_mlp") else { return nil }
-        if parts.contains("gate_up_proj") {
-            throw ExpertOffsetIndexError.fusedGateUpLayout(key)
-        }
-        guard switchIndex + 2 < parts.count,
-            let projection = ExpertProjection(rawValue: String(parts[switchIndex + 1])),
-            let component = ExpertComponent(rawValue: String(parts[switchIndex + 2]))
-        else {
+
+        let piece: ExpertPiece
+        if let switchIndex = parts.firstIndex(of: "switch_mlp") {
+            if parts.contains("gate_up_proj") {
+                throw ExpertOffsetIndexError.fusedGateUpLayout(key)
+            }
+            guard switchIndex + 2 < parts.count,
+                let projection = ExpertProjection(rawValue: String(parts[switchIndex + 1])),
+                projection.family == .mlp,
+                let component = ExpertComponent(rawValue: String(parts[switchIndex + 2]))
+            else {
+                return nil
+            }
+            piece = ExpertPiece(projection, component)
+        } else if let switchIndex = parts.firstIndex(of: "switch_v") {
+            guard switchIndex + 1 < parts.count,
+                let component = ExpertComponent(rawValue: String(parts[switchIndex + 1]))
+            else {
+                return nil
+            }
+            piece = ExpertPiece(.value, component)
+        } else {
             return nil
         }
 
@@ -282,11 +431,11 @@ public struct ExpertOffsetIndex: Codable, Sendable, Equatable {
             return nil
         }
 
-        return (layer, ExpertPiece(projection, component))
+        return (layer, piece)
     }
 
     /// Check the checkpoint's own geometry against the quantization the caller
-    /// intends to run with.
+    /// intends to run with, for every family.
     ///
     /// A `bits` or `groupSize` that does not match the checkpoint produces
     /// fluent nonsense rather than an error: the gather matmul happily decodes
@@ -296,21 +445,24 @@ public struct ExpertOffsetIndex: Codable, Sendable, Equatable {
     /// and therefore must be checked (TD-050's lesson, applied to the numbers
     /// instead of the layout).
     public func validateQuantization(groupSize: Int, bits: Int) throws {
-        guard let layer = layers.first, bits > 0, groupSize > 0 else { return }
-        for projection in ExpertProjection.allCases {
-            let weight = layer[ExpertPiece(projection, .weight)]
-            let scales = layer[ExpertPiece(projection, .scales)]
-            guard weight.rowShape.count == 2, scales.rowShape.count == 2 else { continue }
+        guard bits > 0, groupSize > 0 else { return }
+        for family in families {
+            guard let layer = family.layers.first else { continue }
+            for projection in family.family.projections {
+                let weight = layer[ExpertPiece(projection, .weight)]
+                let scales = layer[ExpertPiece(projection, .scales)]
+                guard weight.rowShape.count == 2, scales.rowShape.count == 2 else { continue }
 
-            let bitsPerContainer = weight.dtype.itemSize * 8
-            let impliedInputDims = weight.rowShape[1] * bitsPerContainer / bits
-            let scaleGroups = scales.rowShape[1]
-            guard impliedInputDims % groupSize == 0,
-                impliedInputDims / groupSize == scaleGroups
-            else {
-                throw ExpertOffsetIndexError.quantizationMismatch(
-                    projection: projection.rawValue, bits: bits, groupSize: groupSize,
-                    impliedInputDims: impliedInputDims, scaleGroups: scaleGroups)
+                let bitsPerContainer = weight.dtype.itemSize * 8
+                let impliedInputDims = weight.rowShape[1] * bitsPerContainer / bits
+                let scaleGroups = scales.rowShape[1]
+                guard impliedInputDims % groupSize == 0,
+                    impliedInputDims / groupSize == scaleGroups
+                else {
+                    throw ExpertOffsetIndexError.quantizationMismatch(
+                        projection: projection.rawValue, bits: bits, groupSize: groupSize,
+                        impliedInputDims: impliedInputDims, scaleGroups: scaleGroups)
+                }
             }
         }
     }
@@ -324,11 +476,14 @@ public struct ExpertOffsetIndex: Codable, Sendable, Equatable {
     }
 
     public static func decoded(from data: Data) throws -> ExpertOffsetIndex {
-        let index = try JSONDecoder().decode(ExpertOffsetIndex.self, from: data)
-        guard index.formatVersion == currentFormatVersion else {
-            throw ExpertOffsetIndexError.unsupportedFormatVersion(index.formatVersion)
+        // The version is read before the rest so a version-1 file reports
+        // itself as outdated instead of as a decoding failure.
+        struct Version: Decodable { let formatVersion: Int }
+        let version = try JSONDecoder().decode(Version.self, from: data).formatVersion
+        guard version == currentFormatVersion else {
+            throw ExpertOffsetIndexError.unsupportedFormatVersion(version)
         }
-        return index
+        return try JSONDecoder().decode(ExpertOffsetIndex.self, from: data)
     }
 
     public func write(to url: URL) throws {
@@ -362,13 +517,14 @@ extension ExpertOffsetIndex {
             throw ExpertOffsetIndexError.noShardsFound(modelDirectory)
         }
 
-        var perLayer = [Int: [Int: ExpertTensorRecord]]()
-        var expertCount: Int?
+        var perFamily = [ExpertFamily: [Int: [Int: ExpertTensorRecord]]]()
+        var expertCounts = [ExpertFamily: Int]()
 
         for (shardIndex, url) in shardURLs.enumerated() {
             let header = try SafetensorsHeader.read(url: url)
             for entry in header.entries {
                 guard let parsed = try parse(key: entry.name) else { continue }
+                let family = parsed.piece.family
                 guard let dtype = ExpertDType(rawValue: entry.dtype) else {
                     throw ExpertOffsetIndexError.unsupportedDType(entry.dtype)
                 }
@@ -377,12 +533,12 @@ extension ExpertOffsetIndex {
                 }
 
                 let experts = entry.shape[0]
-                if let expertCount, expertCount != experts {
+                if let expected = expertCounts[family], expected != experts {
                     throw ExpertOffsetIndexError.inconsistentExpertCount(
                         layer: parsed.layer, piece: entry.name,
-                        expected: expertCount, found: experts)
+                        expected: expected, found: experts)
                 }
-                expertCount = experts
+                expertCounts[family] = experts
 
                 let rowShape = Array(entry.shape.dropFirst())
                 let computed = rowShape.reduce(1, *) * dtype.itemSize * experts
@@ -392,7 +548,10 @@ extension ExpertOffsetIndex {
                         declared: entry.byteCount, computed: computed)
                 }
                 let rowBytes = entry.byteCount / experts
-                guard rowBytes % pageSize == 0 else {
+                // A row is allowed not to be a page multiple — the batch is
+                // padded — but it has to be a whole number of items, or no
+                // shape can describe it.
+                guard rowBytes % dtype.itemSize == 0 else {
                     throw ExpertOffsetIndexError.unalignedRow(
                         layer: parsed.layer, piece: entry.name, rowBytes: rowBytes)
                 }
@@ -400,70 +559,78 @@ extension ExpertOffsetIndex {
                 // Loud on collision (TD-050): a second tensor claiming the same
                 // (layer, piece) means the key pattern does not identify the
                 // decoder stack uniquely in this checkpoint.
-                if perLayer[parsed.layer]?[parsed.piece.slot] != nil {
+                if perFamily[family]?[parsed.layer]?[parsed.piece.slot] != nil {
                     throw ExpertOffsetIndexError.ambiguousKey(
-                        layer: parsed.layer,
-                        piece: "\(parsed.piece.projection.rawValue).\(parsed.piece.component.rawValue)",
+                        layer: parsed.layer, piece: parsed.piece.name,
                         first: "already indexed", second: entry.name)
                 }
-                perLayer[parsed.layer, default: [:]][parsed.piece.slot] = ExpertTensorRecord(
-                    shard: shardIndex,
-                    baseOffset: header.dataStart + entry.begin,
-                    rowBytes: rowBytes,
-                    rowShape: rowShape,
-                    dtype: dtype)
+                perFamily[family, default: [:]][parsed.layer, default: [:]][parsed.piece.slot] =
+                    ExpertTensorRecord(
+                        shard: shardIndex,
+                        baseOffset: header.dataStart + entry.begin,
+                        rowBytes: rowBytes,
+                        rowShape: rowShape,
+                        dtype: dtype)
             }
         }
 
-        guard let expertCount, !perLayer.isEmpty else {
+        guard perFamily[.mlp] != nil else {
             throw ExpertOffsetIndexError.noRoutedExperts(modelDirectory)
         }
 
-        var layers = [ExpertLayerRecords]()
-        for layer in perLayer.keys.sorted() {
-            let slots = perLayer[layer]!
-            var pieces = [ExpertTensorRecord]()
-            for piece in ExpertPiece.all {
-                guard let record = slots[piece.slot] else {
-                    throw ExpertOffsetIndexError.incompletePiece(
-                        layer: layer,
-                        missing: "switch_mlp.\(piece.projection.rawValue).\(piece.component.rawValue)"
-                    )
-                }
-                pieces.append(record)
-            }
-            layers.append(ExpertLayerRecords(layer: layer, pieces: pieces))
-        }
+        var families = [ExpertFamilyIndex]()
+        for family in ExpertFamily.allCases {
+            guard let perLayer = perFamily[family], let expertCount = expertCounts[family]
+            else { continue }
 
-        // Uniform geometry across layers is what lets one global slot bank
-        // serve every layer; a checkpoint that breaks it would silently
-        // misread rows of the wrong size.
-        if let reference = layers.first {
-            for layer in layers.dropFirst() {
-                for piece in ExpertPiece.all {
-                    let a = reference[piece]
-                    let b = layer[piece]
-                    guard a.rowBytes == b.rowBytes, a.rowShape == b.rowShape, a.dtype == b.dtype
-                    else {
-                        throw ExpertOffsetIndexError.byteCountMismatch(
-                            layer: layer.layer,
-                            piece: "\(piece.projection.rawValue).\(piece.component.rawValue)",
-                            declared: b.rowBytes, computed: a.rowBytes)
+            var layers = [ExpertLayerRecords]()
+            for layer in perLayer.keys.sorted() {
+                let slots = perLayer[layer]!
+                var pieces = [ExpertTensorRecord]()
+                for piece in family.pieces {
+                    guard let record = slots[piece.slot] else {
+                        throw ExpertOffsetIndexError.incompletePiece(
+                            layer: layer, missing: "\(family.stackName).\(piece.name)")
+                    }
+                    pieces.append(record)
+                }
+                layers.append(ExpertLayerRecords(layer: layer, pieces: pieces))
+            }
+
+            // Uniform geometry across layers is what lets one slot bank serve
+            // every layer of a family; a checkpoint that breaks it would
+            // silently misread rows of the wrong size.
+            if let reference = layers.first {
+                for layer in layers.dropFirst() {
+                    for piece in family.pieces {
+                        let a = reference[piece]
+                        let b = layer[piece]
+                        guard a.rowBytes == b.rowBytes, a.rowShape == b.rowShape,
+                            a.dtype == b.dtype
+                        else {
+                            throw ExpertOffsetIndexError.byteCountMismatch(
+                                layer: layer.layer, piece: piece.name,
+                                declared: b.rowBytes, computed: a.rowBytes)
+                        }
                     }
                 }
             }
+
+            families.append(
+                ExpertFamilyIndex(family: family, expertCount: expertCount, layers: layers))
         }
 
         return ExpertOffsetIndex(
             fingerprint: try fingerprint(modelDirectory: modelDirectory, shardURLs: shardURLs),
             shardFiles: shardURLs.map(\.lastPathComponent),
-            expertCount: expertCount,
-            layers: layers)
+            families: families)
     }
 
     /// The checkpoint's weight files, preferring the names in
     /// `model.safetensors.index.json` so auxiliary files (`mtp.safetensors`,
-    /// adapters) never enter the index.
+    /// adapters, the `k2-reference-*.safetensors` diagnostic dumps) never
+    /// enter the index. Without an index file, only `model*.safetensors`
+    /// qualify, which excludes the same auxiliaries by name.
     static func routedWeightShards(in modelDirectory: URL) throws -> [URL] {
         let indexURL = modelDirectory.appending(path: "model.safetensors.index.json")
         if let data = try? Data(contentsOf: indexURL),

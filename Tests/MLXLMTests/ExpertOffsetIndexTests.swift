@@ -121,7 +121,11 @@ final class ExpertOffsetIndexTests: XCTestCase {
             Int(first.offset(ofExpert: index.expertCount - 1)) + first.rowBytes, fileSize)
     }
 
-    func testRejectsRowsThatAreNotPageMultiples() throws {
+    /// A row that is not a page multiple is *allowed*: the staging buffer is
+    /// what has to be page-sized, and `ExpertReadBatch` pads it. K2-Horizon's
+    /// MLP scales (61.440 bytes per expert) are the real case. The index only
+    /// records the fact, for whoever wants to reason about the delivery path.
+    func testAcceptsRowsThatAreNotPageMultiples() throws {
         let directory = try temporaryDirectory()
         try SyntheticExpertCheckpoint.write(
             [
@@ -131,13 +135,25 @@ final class ExpertOffsetIndexTests: XCTestCase {
                     shape: [4, 8, 8]),
                 .init(name: "model.layers.0.mlp.switch_mlp.gate_proj.biases", dtype: "BF16",
                     shape: [4, 8, 8]),
+                .init(name: "model.layers.0.mlp.switch_mlp.up_proj.weight", dtype: "U32",
+                    shape: [4, 8, 8]),
+                .init(name: "model.layers.0.mlp.switch_mlp.up_proj.scales", dtype: "BF16",
+                    shape: [4, 8, 8]),
+                .init(name: "model.layers.0.mlp.switch_mlp.up_proj.biases", dtype: "BF16",
+                    shape: [4, 8, 8]),
+                .init(name: "model.layers.0.mlp.switch_mlp.down_proj.weight", dtype: "U32",
+                    shape: [4, 8, 8]),
+                .init(name: "model.layers.0.mlp.switch_mlp.down_proj.scales", dtype: "BF16",
+                    shape: [4, 8, 8]),
+                .init(name: "model.layers.0.mlp.switch_mlp.down_proj.biases", dtype: "BF16",
+                    shape: [4, 8, 8]),
             ], to: directory.appending(path: "model.safetensors"))
 
-        XCTAssertThrowsError(try ExpertOffsetIndex.build(modelDirectory: directory)) { error in
-            guard case ExpertOffsetIndexError.unalignedRow = error else {
-                return XCTFail("expected unalignedRow, got \(error)")
-            }
-        }
+        let index = try ExpertOffsetIndex.build(modelDirectory: directory)
+        let weight = index.layers[0][ExpertPiece(.gate, .weight)]
+        XCTAssertEqual(weight.rowBytes, 256)
+        XCTAssertFalse(weight.isPageAligned)
+        XCTAssertEqual(index.layers[0][ExpertPiece(.gate, .scales)].rowBytes, 128)
     }
 
     func testRejectsIncompleteLayer() throws {

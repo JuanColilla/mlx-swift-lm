@@ -68,14 +68,14 @@ public enum ExpertStreamingFailure: Error, Sendable, Equatable, CustomStringConv
                     shard: shard, offset: offset, requested: requested, read: read)
             case .readFailed(let shard, let offset, let code):
                 self = .readFailed(shard: shard, offset: offset, errno: code)
-            case .unknownLayer, .expertOutOfRange:
+            case .unknownLayer, .unknownFamily, .expertOutOfRange, .mixedFamilies:
                 self = .indexMismatch(error.description)
             case .concurrentRead:
                 self = .concurrentForward
             }
         case let error as ExpertSlotBankError:
             switch error {
-            case .requestExceedsCapacity, .noEvictableSlot:
+            case .requestExceedsCapacity, .noEvictableSlot, .wrongFamily:
                 self = .bankExhausted(error.description)
             case .concurrentForward:
                 self = .concurrentForward

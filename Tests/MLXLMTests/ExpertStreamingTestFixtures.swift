@@ -94,6 +94,61 @@ enum SyntheticExpertCheckpoint {
             to: directory.appending(path: "model.safetensors"))
     }
 
+    /// A checkpoint shaped like K2-Horizon MoVA: dense layers first, then
+    /// sparse layers carrying both `mlp.switch_mlp.*` (MLP family) and
+    /// `self_attn.switch_v.*` (value family), with the routers and the shared
+    /// expert alongside so the parser has something to ignore.
+    ///
+    /// The MLP `scales`/`biases` rows are 8 KiB and the value rows 12 KiB and
+    /// 4 KiB — none a page multiple, like the real checkpoint's MLP scales —
+    /// so an index over this fixture exercises the padded staging path.
+    static func movaTensors(
+        mlpExperts: Int, valueExperts: Int, denseLayers: Int, totalLayers: Int
+    ) -> [Tensor] {
+        var tensors = [Tensor]()
+        for layer in 0 ..< totalLayers {
+            let prefix = "model.layers.\(layer)"
+            tensors.append(
+                Tensor(name: "\(prefix).self_attn.q_proj.weight", dtype: "U32", shape: [64, 64]))
+            guard layer >= denseLayers else {
+                tensors.append(
+                    Tensor(name: "\(prefix).mlp.gate_proj.weight", dtype: "U32", shape: [64, 64]))
+                tensors.append(
+                    Tensor(name: "\(prefix).self_attn.v_proj.weight", dtype: "U32", shape: [64, 64]))
+                continue
+            }
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                let base = "\(prefix).mlp.switch_mlp.\(projection)"
+                tensors.append(
+                    Tensor(name: "\(base).weight", dtype: "U32", shape: [mlpExperts, 64, 64]))
+                tensors.append(
+                    Tensor(name: "\(base).scales", dtype: "BF16", shape: [mlpExperts, 64, 64]))
+                tensors.append(
+                    Tensor(name: "\(base).biases", dtype: "BF16", shape: [mlpExperts, 64, 64]))
+                tensors.append(
+                    Tensor(
+                        name: "\(prefix).mlp.shared_experts.\(projection).weight", dtype: "U32",
+                        shape: [64, 64]))
+            }
+            tensors.append(
+                Tensor(name: "\(prefix).mlp.gate.weight", dtype: "BF16", shape: [mlpExperts, 16]))
+            tensors.append(
+                Tensor(name: "\(prefix).mlp.gate.bias", dtype: "BF16", shape: [mlpExperts]))
+            let value = "\(prefix).self_attn.switch_v"
+            tensors.append(
+                Tensor(name: "\(value).weight", dtype: "U32", shape: [valueExperts, 48, 64]))
+            tensors.append(
+                Tensor(name: "\(value).scales", dtype: "BF16", shape: [valueExperts, 32, 64]))
+            tensors.append(
+                Tensor(name: "\(value).biases", dtype: "BF16", shape: [valueExperts, 32, 64]))
+            tensors.append(
+                Tensor(
+                    name: "\(prefix).self_attn.v_router.weight", dtype: "BF16",
+                    shape: [valueExperts, 16]))
+        }
+        return tensors
+    }
+
     /// Index into the tensor list produced by ``wellFormedTensors(experts:layers:)``.
     static func position(layer: Int, projection: Int, component: Int) -> Int {
         layer * 10 + projection * 3 + component

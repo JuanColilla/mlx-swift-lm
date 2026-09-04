@@ -20,7 +20,10 @@
 //    pointer into an `MTLBuffer` with `newBufferWithBytesNoCopy`, and when
 //    that returns null (misaligned pointer or length) `array.cpp` degrades to
 //    `malloc` + `std::copy` *silently* — double the memory and a copy per
-//    expert, with no error and no log.
+//    expert, with no error and no log. The invariant is on the *staging
+//    buffer*, not on the expert row: a batch whose rows are not page
+//    multiples is padded to a page and delivered as a slice of a flat array,
+//    which is still a view (see `ExpertReadBatch.materialize`).
 
 import Foundation
 import MLX
@@ -29,18 +32,22 @@ import MLX
 import Darwin
 #endif
 
-/// One routed expert of one layer.
+/// One routed expert of one layer of one family.
 public struct ExpertKey: Hashable, Sendable, Comparable {
+    public let family: ExpertFamily
     public let layer: Int
     public let expert: Int
 
-    public init(layer: Int, expert: Int) {
+    /// `family` defaults to the MLP experts, which every MoE checkpoint has;
+    /// the value family is only ever named explicitly.
+    public init(family: ExpertFamily = .mlp, layer: Int, expert: Int) {
+        self.family = family
         self.layer = layer
         self.expert = expert
     }
 
     public static func < (lhs: ExpertKey, rhs: ExpertKey) -> Bool {
-        (lhs.layer, lhs.expert) < (rhs.layer, rhs.expert)
+        (lhs.family, lhs.layer, lhs.expert) < (rhs.family, rhs.layer, rhs.expert)
     }
 }
 
@@ -50,7 +57,9 @@ public enum ExpertResidencyError: Error, CustomStringConvertible {
     case shortRead(shard: String, offset: Int64, requested: Int, read: Int)
     case readFailed(shard: String, offset: Int64, errno: Int32)
     case unknownLayer(Int)
+    case unknownFamily(ExpertFamily)
     case expertOutOfRange(ExpertKey, expertCount: Int)
+    case mixedFamilies
     case concurrentRead
 
     public var description: String {
@@ -65,8 +74,12 @@ public enum ExpertResidencyError: Error, CustomStringConvertible {
             "read from \(shard) at \(offset) failed: errno \(code)"
         case .unknownLayer(let layer):
             "layer \(layer) has no routed experts in this index"
+        case .unknownFamily(let family):
+            "the index has no \(family.rawValue) experts"
         case .expertOutOfRange(let key, let count):
-            "expert \(key.expert) of layer \(key.layer) is outside 0..<\(count)"
+            "expert \(key.expert) of layer \(key.layer) (\(key.family.rawValue)) is outside 0..<\(count)"
+        case .mixedFamilies:
+            "a read batch must hold experts of a single family"
         case .concurrentRead:
             """
             a second forward pass entered the read lanes while one was in \
@@ -248,9 +261,11 @@ public final class ExpertResidencyStore: @unchecked Sendable {
         prefetcher?.cancel()
     }
 
-    /// Claim the batch in flight if it covers any of `wanted`.
-    func takePrefetched(covering wanted: Set<ExpertKey>) -> ExpertPrefetchClaim? {
-        prefetcher?.take(covering: wanted)
+    /// Claim the batch in flight for `family` if it covers any of `wanted`.
+    func takePrefetched(family: ExpertFamily, covering wanted: Set<ExpertKey>)
+        -> ExpertPrefetchClaim?
+    {
+        prefetcher?.take(family: family, covering: wanted)
     }
 
     func notePrefetchPredicted(keys: Int) {
@@ -279,8 +294,9 @@ public final class ExpertResidencyStore: @unchecked Sendable {
 
     // MARK: - Reading
 
-    /// Read `keys` into nine freshly allocated page-aligned buffers, delivered
-    /// as `[keys.count, …rowShape]` arrays in canonical piece order.
+    /// Read `keys` — all of one family — into freshly allocated page-aligned
+    /// buffers, one per piece, delivered as `[keys.count, …rowShape]` arrays
+    /// in canonical piece order.
     ///
     /// Ownership of each buffer moves to its `MLXArray`; the finalizer frees
     /// it when MLX releases the last reference.
@@ -300,8 +316,8 @@ public final class ExpertResidencyStore: @unchecked Sendable {
         return batch.materialize(index: index)
     }
 
-    /// Validate `keys`, allocate the nine page-aligned staging buffers and
-    /// build the `pread` jobs — everything a read needs except the lanes that
+    /// Validate `keys`, allocate the page-aligned staging buffers and build
+    /// the `pread` jobs — everything a read needs except the lanes that
     /// execute it.
     ///
     /// Split out of `readBatch` so the prefetcher can run the same plan on its
@@ -309,22 +325,34 @@ public final class ExpertResidencyStore: @unchecked Sendable {
     /// so a shared fd is safe) and shares nothing else: not the lanes, and not
     /// the single-flight guard that protects them.
     func plan(keys: [ExpertKey]) throws -> ExpertReadBatch {
+        guard let family = keys.first?.family else {
+            return ExpertReadBatch(family: .mlp, keys: [], buffers: [], jobs: [])
+        }
+        guard keys.allSatisfy({ $0.family == family }) else {
+            throw ExpertResidencyError.mixedFamilies
+        }
+        guard let familyIndex = index.family(family) else {
+            throw ExpertResidencyError.unknownFamily(family)
+        }
         for key in keys {
-            guard index.records(forLayer: key.layer) != nil else {
+            guard familyIndex.records(forLayer: key.layer) != nil else {
                 throw ExpertResidencyError.unknownLayer(key.layer)
             }
-            guard key.expert >= 0, key.expert < index.expertCount else {
-                throw ExpertResidencyError.expertOutOfRange(key, expertCount: index.expertCount)
+            guard key.expert >= 0, key.expert < familyIndex.expertCount else {
+                throw ExpertResidencyError.expertOutOfRange(
+                    key, expertCount: familyIndex.expertCount)
             }
         }
 
-        let template = index.layers[0]
+        let template = familyIndex.template
         var buffers = [UnsafeMutableRawPointer]()
         var jobs = [ExpertReadJob]()
 
-        for piece in ExpertPiece.all {
+        for piece in family.pieces {
             let rowBytes = template[piece].rowBytes
-            let total = rowBytes * keys.count
+            // The staging buffer is what MLX wraps, so *it* is what has to be
+            // a whole number of pages — the rows inside it need not be.
+            let total = ExpertReadBatch.paddedByteCount(rowBytes * keys.count)
             guard let buffer = allocatePageAligned(total) else {
                 for buffer in buffers { free(buffer) }
                 throw ExpertResidencyError.allocationFailed(bytes: total)
@@ -340,7 +368,7 @@ public final class ExpertResidencyStore: @unchecked Sendable {
                 {
                     span += 1
                 }
-                let record = index.records(forLayer: keys[row].layer)![piece]
+                let record = familyIndex.records(forLayer: keys[row].layer)![piece]
                 jobs.append(
                     ExpertReadJob(
                         fd: descriptors[record.shard],
@@ -353,7 +381,7 @@ public final class ExpertResidencyStore: @unchecked Sendable {
             }
         }
 
-        return ExpertReadBatch(keys: keys, buffers: buffers, jobs: jobs)
+        return ExpertReadBatch(family: family, keys: keys, buffers: buffers, jobs: jobs)
     }
 
     /// Prefill read: every expert of one layer that the prompt touched, sorted
@@ -361,11 +389,12 @@ public final class ExpertResidencyStore: @unchecked Sendable {
     ///
     /// Returns the arrays plus the expert ids in the row order they occupy, so
     /// the caller can remap its routing indices onto them.
-    public func readRuns(layer: Int, experts: [Int]) throws -> (
+    public func readRuns(family: ExpertFamily = .mlp, layer: Int, experts: [Int]) throws -> (
         arrays: [MLXArray], experts: [Int]
     ) {
         let sorted = Array(Set(experts)).sorted()
-        let arrays = try readBatch(keys: sorted.map { ExpertKey(layer: layer, expert: $0) })
+        let arrays = try readBatch(
+            keys: sorted.map { ExpertKey(family: family, layer: layer, expert: $0) })
         return (arrays, sorted)
     }
 

@@ -408,7 +408,7 @@ final class K2HorizonTests: XCTestCase {
 
     func testSoftplusGateMatchesReference() throws {
         let model = K2HorizonModel(try tinyDense(gate: "softplus"))
-        let attention = (model.model.layers[0] as! K2HorizonDecoderLayer).selfAttn
+        let attention = (model.model.layers[0] as! K2HorizonDecoderLayer).selfAttn as! K2HorizonAttention
         try randomize(attention)
         let x = MLXRandom.normal([1, 3, 32])
         let output = MLXArray.ones([1, 3, 4, 8])
@@ -460,7 +460,7 @@ final class K2HorizonTests: XCTestCase {
         // 40 tokens x top-2 = 80 crosses the gatherSort threshold (64).
         let model = K2HorizonModel(try tinyMoE())
         try randomize(model)
-        let attention = (model.model.layers[1] as! K2HorizonDecoderLayer).selfAttn
+        let attention = (model.model.layers[1] as! K2HorizonDecoderLayer).selfAttn as! K2HorizonAttention
         let x = MLXRandom.normal([1, 40, 32])
         let batched = attention.routedValues(x)
         let perToken = concatenated(
