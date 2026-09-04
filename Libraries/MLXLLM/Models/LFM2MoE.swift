@@ -260,6 +260,39 @@ class LFM2MoEMLP: Module, UnaryLayer {
     }
 }
 
+/// FORK(JuanColilla): R-56 — the routing decision of an `lfm2_moe` layer, in
+/// one place.
+///
+/// Extracted from `Lfm2MoeSparseMoeBlock.route` so the resident block and the
+/// streamed one of `LFM2MoEStreamed.swift` cannot drift apart: two copies of
+/// this arithmetic would agree until the first change to `expert_bias`
+/// handling or to the `1e-6` in the normalisation, and the disagreement would
+/// show up as a wrong expert set, not as an error.
+func lfm2MoeRoute(
+    gateLogits: MLXArray,
+    expertBias: MLXArray?,
+    topK: Int,
+    normTopKProb: Bool,
+    routedScalingFactor: Float
+) -> (indices: MLXArray, weights: MLXArray) {
+    let routingWeights = MLX.sigmoid(gateLogits.asType(.float32))
+
+    let indices: MLXArray
+    if let expertBias {
+        let selection = routingWeights + expertBias.asType(.float32)
+        indices = argPartition(-selection, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+    } else {
+        indices = argPartition(-routingWeights, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+    }
+
+    var weights = takeAlong(routingWeights, indices, axis: -1)
+    if normTopKProb {
+        weights = weights / (weights.sum(axis: -1, keepDims: true) + 1e-6)
+    }
+    weights = weights * routedScalingFactor
+    return (indices, weights)
+}
+
 class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
     let args: LFM2MoEConfiguration
     let numExperts: Int
@@ -294,23 +327,12 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
     /// Returns top-k experts and unbiased sigmoid routing weights.
     /// `expert_bias` affects selection only.
     func route(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
-        let routingWeights = MLX.sigmoid(gate(x).asType(.float32))
-
-        let k = topK
-        let indices: MLXArray
-        if useExpertBias, let expertBias {
-            let selection = routingWeights + expertBias.asType(.float32)
-            indices = argPartition(-selection, kth: k - 1, axis: -1)[.ellipsis, ..<k]
-        } else {
-            indices = argPartition(-routingWeights, kth: k - 1, axis: -1)[.ellipsis, ..<k]
-        }
-
-        var weights = takeAlong(routingWeights, indices, axis: -1)
-        if normTopKProb {
-            weights = weights / (weights.sum(axis: -1, keepDims: true) + 1e-6)
-        }
-        weights = weights * args.routedScalingFactor
-        return (indices, weights)
+        lfm2MoeRoute(
+            gateLogits: gate(x),
+            expertBias: useExpertBias ? expertBias : nil,
+            topK: topK,
+            normTopKProb: normTopKProb,
+            routedScalingFactor: args.routedScalingFactor)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -340,8 +362,18 @@ class LFM2MoEDecoderLayer: Module {
             _conv.wrappedValue = LFM2MoEShortConv(args, layerIdx: layerIdx)
         }
 
+        // FORK(JuanColilla): R-56 — streaming is chosen at construction, never
+        // by a flag on a live module. `layerIdx` is the *decoder* index and is
+        // passed through untouched: the first `num_dense_layers` layers have
+        // no `switch_mlp`, so the checkpoint's MoE layers start at 2 and the
+        // offset index is keyed by that same number. Renumbering them by
+        // "n-th MoE layer" would multiply every layer by the previous one's
+        // experts, silently.
         if usesDenseFeedForward {
             _feedForward.wrappedValue = LFM2MoEMLP(args)
+        } else if let session = ExpertStreaming.activeSession {
+            _feedForward.wrappedValue = Lfm2MoeStreamedSparseMoeBlock(
+                args, layerIndex: layerIdx, session: session)
         } else {
             _feedForward.wrappedValue = Lfm2MoeSparseMoeBlock(args)
         }
