@@ -255,8 +255,8 @@ struct ToolCallFormatInferenceTests {
     }
 }
 
-/// A throwaway directory holding tokenizer files.
-private enum TokenizerFixture {
+/// A throwaway directory holding tokenizer files. Shared with the K2-Horizon suite.
+enum TokenizerFixture {
     static func make(_ files: [String: String]) throws -> URL {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appending(component: "tool-format-inference-\(UUID().uuidString)")

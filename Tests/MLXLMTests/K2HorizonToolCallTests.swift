@@ -122,10 +122,12 @@ struct K2HorizonToolCallTests {
         let parser = K2HorizonToolCallParser()
 
         #expect(parser.parse(content: "<ifm|tool_call></ifm|tool_call>", tools: nil) == nil)
-        #expect(parser.parse(content: "<ifm|tool_call>{\"name\": }</ifm|tool_call>", tools: nil) == nil)
+        #expect(
+            parser.parse(content: "<ifm|tool_call>{\"name\": }</ifm|tool_call>", tools: nil) == nil)
         #expect(
             parser.parse(
-                content: "<ifm|tool_call>bad name\n<ifm|arg_key>a</ifm|arg_key><ifm|arg_value>1</ifm|arg_value></ifm|tool_call>",
+                content:
+                    "<ifm|tool_call>bad name\n<ifm|arg_key>a</ifm|arg_key><ifm|arg_value>1</ifm|arg_value></ifm|tool_call>",
                 tools: nil) == nil)
         #expect(parser.parse(content: "<ifm|tool_call>{\"name\": \"f\"}", tools: nil) == nil)
     }
@@ -266,7 +268,8 @@ struct K2HorizonToolCallTests {
         cleared.reasoningContent = nil
         #expect(cleared.additionalFields["reasoning_content"] == nil)
 
-        let empty = DefaultMessageGenerator().generate(message: .assistant("Hi", reasoningContent: ""))
+        let empty = DefaultMessageGenerator().generate(
+            message: .assistant("Hi", reasoningContent: ""))
         #expect(empty["reasoning_content"] as? String == "")
     }
 
@@ -279,7 +282,8 @@ struct K2HorizonToolCallTests {
         #expect(generator.generate(message: .tool("r"))["reasoning_content"] == nil)
         #expect(generator.generate(message: .assistant("A"))["reasoning_content"] as? String == "")
         #expect(
-            generator.generate(message: .assistant("A", reasoningContent: "kept"))["reasoning_content"]
+            generator.generate(message: .assistant("A", reasoningContent: "kept"))[
+                "reasoning_content"]
                 as? String == "kept")
     }
 }

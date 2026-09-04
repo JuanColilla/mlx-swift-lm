@@ -26,6 +26,14 @@ public protocol ToolCallParser: Sendable {
     /// - Returns: A `ToolCall` if parsing succeeds, `nil` otherwise
     func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall?
 
+    /// Parse every tool call held by a complete tagged payload.
+    ///
+    /// Most formats frame exactly one call between ``startTag`` and ``endTag``,
+    /// and the default implementation returns whatever ``parse(content:tools:)``
+    /// found. Formats whose tags frame a block of several calls (K2-Horizon)
+    /// override this so the streaming processor keeps all of them.
+    func parseAll(content: String, tools: [[String: any Sendable]]?) -> [ToolCall]
+
     /// Parse remaining buffered content at end-of-sequence.
     ///
     /// Called when generation ends to extract any tool calls still in the buffer.
@@ -35,6 +43,10 @@ public protocol ToolCallParser: Sendable {
 }
 
 extension ToolCallParser {
+    public func parseAll(content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+        parse(content: content, tools: tools).map { [$0] } ?? []
+    }
+
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         if let startTag {
             return
@@ -206,7 +218,8 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return OnyxStreamAdapter(
                 tokenizer: tokenizer, tools: tools, stopStrings: stopStrings)
 
-        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .k2Horizon, .minimaxM2,
+        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .k2Horizon,
+            .minimaxM2,
             .mistral, .llama3:
             return nil
         }
@@ -228,7 +241,8 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return HarmonyToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
         case .atem:
             return OnyxToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
-        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .k2Horizon, .minimaxM2,
+        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .k2Horizon,
+            .minimaxM2,
             .mistral,
             .llama3:
             return []
@@ -250,7 +264,8 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                     count += message.tool?.calls?.count ?? 0
                 }
             }
-        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .k2Horizon, .minimaxM2,
+        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .k2Horizon,
+            .minimaxM2,
             .mistral, .llama3:
             0
         }

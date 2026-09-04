@@ -629,12 +629,14 @@ public class ToolCallProcessor {
 
                 let bufferedToolCall = toolCallBuffer
 
-                // Parse the tool call using the parser.
-                if let toolCall = parser.parse(content: bufferedToolCall, tools: tools) {
+                // Parse the tool call using the parser. `parseAll` so formats whose
+                // tags frame a block of several calls do not lose all but the first.
+                let parsedToolCalls = parser.parseAll(content: bufferedToolCall, tools: tools)
+                if !parsedToolCalls.isEmpty {
                     if !leadingTokenWasRecorded {
                         recordResponse(leadingToken ?? "")
                     }
-                    appendToolCall(toolCall, rawText: bufferedToolCall)
+                    appendToolCalls(parsedToolCalls, rawText: bufferedToolCall)
                     state = .normal
                     toolCallBuffer = ""
 

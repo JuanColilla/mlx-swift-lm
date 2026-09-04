@@ -22,7 +22,7 @@ struct K2HorizonChatTemplateTests {
     private static let template: Template = {
         let url = Bundle.module.url(forResource: "K2HorizonChatTemplate", withExtension: "jinja")!
         let source = try! String(contentsOf: url, encoding: .utf8)
-        return try! Template(source)
+        return try! Template(source, with: .init(lstripBlocks: true, trimBlocks: true))
     }()
 
     /// Mirrors `PreTrainedTokenizer.applyChatTemplate` in swift-transformers:
@@ -64,12 +64,16 @@ struct K2HorizonChatTemplateTests {
         ] as [String: any Sendable],
     ]
 
-    private static let twoTurns: [Chat.Message] = [
-        .system("You are terse."),
-        .user("Hi"),
-        .assistant("Hello.", reasoningContent: "greeting back"),
-        .user("Bye"),
-    ]
+    /// Computed rather than stored: `Chat.Message` is not `Sendable`, so a
+    /// stored static would be a mutable global under strict concurrency.
+    private static var twoTurns: [Chat.Message] {
+        [
+            .system("You are terse."),
+            .user("Hi"),
+            .assistant("Hello.", reasoningContent: "greeting back"),
+            .user("Bye"),
+        ]
+    }
 
     // MARK: - Assistant thinking field
 
@@ -77,12 +81,17 @@ struct K2HorizonChatTemplateTests {
     func priorReasoningIsRendered() throws {
         let prompt = try render(Self.twoTurns)
 
-        #expect(prompt.hasPrefix(Self.bosToken + "<|ifm|im_start|>system\nYou are terse.<|ifm|im_end|>"))
+        #expect(
+            prompt.hasPrefix(Self.bosToken + "<|ifm|im_start|>system\nYou are terse.<|ifm|im_end|>")
+        )
         #expect(prompt.contains("<|ifm|im_start|>user\nHi<|ifm|im_end|>"))
         #expect(
             prompt.contains(
-                "<|ifm|im_start|>assistant<ifm|think>\ngreeting back</ifm|think>Hello.<|ifm|im_end|>"))
-        #expect(prompt.hasSuffix("<|ifm|im_start|>user\nBye<|ifm|im_end|><|ifm|im_start|>assistant\n<ifm|think>\n"))
+                "<|ifm|im_start|>assistant\n<ifm|think>\ngreeting back</ifm|think>Hello.<|ifm|im_end|>"
+            ))
+        #expect(
+            prompt.hasSuffix(
+                "<|ifm|im_start|>user\nBye<|ifm|im_end|><|ifm|im_start|>assistant\n<ifm|think>\n"))
     }
 
     @Test("An empty reasoning string is accepted and renders an empty thinking block")
@@ -92,7 +101,9 @@ struct K2HorizonChatTemplateTests {
 
         let prompt = try render(turns)
 
-        #expect(prompt.contains("<|ifm|im_start|>assistant<ifm|think>\n</ifm|think>Hello.<|ifm|im_end|>"))
+        #expect(
+            prompt.contains(
+                "<|ifm|im_start|>assistant\n<ifm|think>\n</ifm|think>Hello.<|ifm|im_end|>"))
     }
 
     @Test("The default generator leaves the field undefined and the template raises")
@@ -114,7 +125,9 @@ struct K2HorizonChatTemplateTests {
 
         let prompt = try render(turns, generator: K2HorizonMessageGenerator())
 
-        #expect(prompt.contains("<|ifm|im_start|>assistant<ifm|think>\n</ifm|think>Hello.<|ifm|im_end|>"))
+        #expect(
+            prompt.contains(
+                "<|ifm|im_start|>assistant\n<ifm|think>\n</ifm|think>Hello.<|ifm|im_end|>"))
     }
 
     @Test("The K2 generator keeps caller-provided reasoning and other thinking fields")
@@ -133,7 +146,9 @@ struct K2HorizonChatTemplateTests {
     func singleTurnRenders() throws {
         let prompt = try render([.user("Hi")])
 
-        #expect(prompt == Self.bosToken + "<|ifm|im_start|>user\nHi<|ifm|im_end|><|ifm|im_start|>assistant\n<ifm|think>\n")
+        #expect(
+            prompt == Self.bosToken
+                + "<|ifm|im_start|>user\nHi<|ifm|im_end|><|ifm|im_start|>assistant\n<ifm|think>\n")
     }
 
     // MARK: - reasoning_effort
@@ -171,23 +186,61 @@ struct K2HorizonChatTemplateTests {
 
     // MARK: - Tools
 
+    /// The template's default `tool_presentation_format` is `markdown`, whose
+    /// schema walker asks `spec is sameas true`. swift-jinja 2.4.2 implements
+    /// `sameas` as a value comparison that throws on mismatched types
+    /// (`Sources/Jinja/Tests.swift`, `sameas` → `a.compare(to: b)`), so the
+    /// render dies before producing a prompt — for *any* value, `true is sameas
+    /// true` included. Every K2 prompt carrying tools must therefore ask for the
+    /// `json` or `xml` presentation. This pins the blocker: it turns red the day
+    /// swift-jinja fixes `sameas`, which is when the workaround can be dropped.
+    @Test("The default markdown tool presentation is blocked by swift-jinja's sameas")
+    func markdownToolPresentationIsBlockedUpstream() {
+        #expect {
+            try render([.user("Weather?")], tools: [Self.weatherTool])
+        } throws: { error in
+            String(describing: error).contains("Cannot compare values of different types")
+        }
+    }
+
     @Test("Tools are presented in the system turn and the default call dialect is xml")
     func toolsDefaultToXMLDialect() throws {
-        let prompt = try render([.user("Weather?")], tools: [Self.weatherTool])
+        let prompt = try render(
+            [.user("Weather?")], tools: [Self.weatherTool],
+            additionalContext: ["tool_presentation_format": "json"])
 
         #expect(prompt.contains("<|ifm|im_start|>system\n# Tools"))
-        #expect(prompt.contains("<ifm|tools>\n## get_weather"))
+        #expect(
+            prompt.contains(
+                "<ifm|tools>\n{\"function\":{\"description\":\"Current weather for a city.\""))
         #expect(prompt.contains("<ifm|arg_key>$PARAMETER_NAME</ifm|arg_key>"))
         #expect(!prompt.contains(#"{\"name\": <function-name>"#))
+    }
+
+    @Test("The xml presentation renders the schema as tags")
+    func xmlToolPresentation() throws {
+        let prompt = try render(
+            [.user("Weather?")], tools: [Self.weatherTool],
+            additionalContext: ["tool_presentation_format": "xml"])
+
+        #expect(
+            prompt.contains(
+                "<function name=get_weather><description>Current weather for a city.</description>")
+        )
     }
 
     @Test("tool_call_format json switches the call instructions to JSON")
     func toolCallFormatJSONSelectsJSONDialect() throws {
         let prompt = try render(
             [.user("Weather?")], tools: [Self.weatherTool],
-            additionalContext: ["tool_call_format": "json"])
+            additionalContext: [
+                "tool_presentation_format": "json", "tool_call_format": "json",
+            ])
 
-        #expect(prompt.contains("<ifm|tool_call>{\"name\": <function-name>, \"arguments\": <args-json-object>}</ifm|tool_call>"))
+        #expect(
+            prompt.contains(
+                "<ifm|tool_call>{\"name\": <function-name>, \"arguments\": <args-json-object>}</ifm|tool_call>"
+            ))
         #expect(!prompt.contains("<ifm|arg_key>$PARAMETER_NAME"))
     }
 
@@ -201,17 +254,24 @@ struct K2HorizonChatTemplateTests {
             .tool("{\"temp\": 21}", id: "call_1", name: "get_weather"),
         ]
 
-        let xml = try render(turns, tools: [Self.weatherTool])
+        let xml = try render(
+            turns, tools: [Self.weatherTool],
+            additionalContext: ["tool_presentation_format": "json"])
         #expect(
             xml.contains(
-                "<ifm|think>\nneed the tool</ifm|think><ifm|tool_calls>\n<ifm|tool_call>get_weather\n<ifm|arg_key>city</ifm|arg_key>\n<ifm|arg_value>Paris</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls><|ifm|im_end|>"))
+                "<ifm|think>\nneed the tool</ifm|think><ifm|tool_calls>\n<ifm|tool_call>get_weather\n<ifm|arg_key>city</ifm|arg_key>\n<ifm|arg_value>Paris</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls><|ifm|im_end|>"
+            ))
         #expect(xml.contains("<|ifm|im_start|>tool\n{\"temp\": 21}<|ifm|im_end|>"))
 
         let json = try render(
-            turns, tools: [Self.weatherTool], additionalContext: ["tool_call_format": "json"])
+            turns, tools: [Self.weatherTool],
+            additionalContext: [
+                "tool_presentation_format": "json", "tool_call_format": "json",
+            ])
         #expect(
             json.contains(
-                "<ifm|tool_calls>\n<ifm|tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}</ifm|tool_call>\n</ifm|tool_calls><|ifm|im_end|>"))
+                "<ifm|tool_calls>\n<ifm|tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\":\"Paris\"}}</ifm|tool_call>\n</ifm|tool_calls><|ifm|im_end|>"
+            ))
     }
 
     @Test("The real template infers the K2 tool-call format")

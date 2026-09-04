@@ -21,7 +21,8 @@ import Foundation
 /// The block tags are the ``startTag`` / ``endTag`` so the streaming processor
 /// buffers the whole block: a per-call start tag would make the processor read
 /// the opening `<ifm|tool_calls>` as a malformed `<ifm|tool_call>` and reject
-/// the turn. ``parseAll(content:tools:)`` returns every call in the block.
+/// the turn. The processor therefore reads a K2 turn through
+/// ``parseAll(content:tools:)``, which returns every call in the block.
 public struct K2HorizonToolCallParser: ToolCallParser, Sendable {
     public let startTag: String? = "<ifm|tool_calls>"
     public let endTag: String? = "</ifm|tool_calls>"
@@ -33,8 +34,9 @@ public struct K2HorizonToolCallParser: ToolCallParser, Sendable {
 
     public init() {}
 
-    /// The first call in the block; the processor uses ``parseAll(content:tools:)``
-    /// for a complete block, this is the single-call contract of ``ToolCallParser``.
+    /// The first call in the block. The processor reads a complete block through
+    /// ``parseAll(content:tools:)``; this is the single-call contract of
+    /// ``ToolCallParser``.
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         parseAll(content: content, tools: tools).first
     }
@@ -43,8 +45,7 @@ public struct K2HorizonToolCallParser: ToolCallParser, Sendable {
         callPayloads(in: content).compactMap { parseCall($0, tools: tools) }
     }
 
-    public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall]
-    {
+    public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         parseAll(content: toolCallBuffer, tools: tools)
     }
 
@@ -125,7 +126,22 @@ public struct K2HorizonToolCallParser: ToolCallParser, Sendable {
         if (declaredType ?? typeHint) == "string" {
             return value
         }
-        return tryParseJSON(value) ?? value
+        return deserializeIncludingScalars(value)
+    }
+
+    /// `JSONSerialization` rejects a bare scalar unless fragments are allowed, so
+    /// `tryParseJSON` alone would hand a declared integer written as `2` to the
+    /// tool as the string `"2"`. Wrapping in an array recovers the scalar while
+    /// keeping plain text (`Europe/Paris`) as text.
+    private func deserializeIncludingScalars(_ value: String) -> any Sendable {
+        if let parsed = tryParseJSON(value) { return parsed }
+        if let data = "[\(value)]".data(using: .utf8),
+            let wrapped = deserializeJSON(data) as? [any Sendable],
+            wrapped.count == 1
+        {
+            return wrapped[0]
+        }
+        return value
     }
 
     private func tagContent(_ open: String, _ close: String, in text: Substring) -> String? {
