@@ -51,6 +51,7 @@ public enum ExpertResidencyError: Error, CustomStringConvertible {
     case readFailed(shard: String, offset: Int64, errno: Int32)
     case unknownLayer(Int)
     case expertOutOfRange(ExpertKey, expertCount: Int)
+    case concurrentRead
 
     public var description: String {
         switch self {
@@ -66,6 +67,11 @@ public enum ExpertResidencyError: Error, CustomStringConvertible {
             "layer \(layer) has no routed experts in this index"
         case .expertOutOfRange(let key, let count):
             "expert \(key.expert) of layer \(key.layer) is outside 0..<\(count)"
+        case .concurrentRead:
+            """
+            a second forward pass entered the read lanes while one was in \
+            flight; the lane pool serves one caller at a time
+            """
         }
     }
 }
@@ -113,6 +119,15 @@ public final class ExpertResidencyStore: @unchecked Sendable {
     private let lanes: LanePool
     private let statisticsLock = NSLock()
     private var statisticsStorage = ExpertResidencyStatistics()
+
+    /// TD-054(c). `LanePool.run` publishes its job closure while the lanes are
+    /// parked; a second caller would overwrite the first one's work.
+    private let singleFlight = SingleFlightGuard()
+
+    /// Test seam: called from inside the guarded region of `run(jobs:)`,
+    /// before the lanes are woken, so a test can prove that a nested caller is
+    /// rejected instead of racing for it with two threads.
+    var reentrancyProbe: (() -> Void)?
 
     public init(
         index: ExpertOffsetIndex,
@@ -274,6 +289,10 @@ public final class ExpertResidencyStore: @unchecked Sendable {
     /// Not reentrant: one forward pass at a time owns the lanes. That is the
     /// same single-pass invariant the slot bank relies on.
     private func run(jobs: [ReadJob]) throws {
+        try singleFlight.enter(orThrow: ExpertResidencyError.concurrentRead)
+        defer { singleFlight.leave() }
+        reentrancyProbe?()
+
         let state = ReadState()
         let inFlight = InFlightCounter()
         let width = lanes.lanes

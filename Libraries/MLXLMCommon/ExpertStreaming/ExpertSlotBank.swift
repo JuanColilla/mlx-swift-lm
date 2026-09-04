@@ -28,6 +28,7 @@ public struct ExpertSlotBankStatistics: Sendable, Equatable {
 public enum ExpertSlotBankError: Error, CustomStringConvertible {
     case requestExceedsCapacity(requested: Int, slots: Int)
     case noEvictableSlot(slots: Int)
+    case concurrentForward
 
     public var description: String {
         switch self {
@@ -38,6 +39,11 @@ public enum ExpertSlotBankError: Error, CustomStringConvertible {
             """
         case .noEvictableSlot(let slots):
             "all \(slots) slots are pinned; the bank is too small for this top-K"
+        case .concurrentForward:
+            """
+            a second forward pass entered the slot bank while one was in flight; \
+            the bank holds one pass worth of pinned slots and cannot serve two
+            """
         }
     }
 }
@@ -73,6 +79,10 @@ public final class ExpertSlotBank: @unchecked Sendable {
     private let lock = NSLock()
     private var statisticsStorage = ExpertSlotBankStatistics()
 
+    /// TD-054(c). The bank's pin set belongs to the pass in flight; a second
+    /// concurrent `ensure` would unpin it. Rejected, not serialized.
+    private let singleFlight = SingleFlightGuard()
+
     public init(store: ExpertResidencyStore, configuration: Configuration) {
         self.store = store
         self.configuration = configuration
@@ -105,6 +115,11 @@ public final class ExpertSlotBank: @unchecked Sendable {
     /// Every returned slot is pinned until the next call: an eviction must
     /// never take a slot the layer in flight is about to read.
     public func ensure(keys: [ExpertKey]) throws -> [Int] {
+        // Before the unpin below, not after: a rejected second pass must not
+        // have released the slots the first one is about to read.
+        try singleFlight.enter(orThrow: ExpertSlotBankError.concurrentForward)
+        defer { singleFlight.leave() }
+
         guard keys.count <= slotCount else {
             throw ExpertSlotBankError.requestExceedsCapacity(
                 requested: keys.count, slots: slotCount)
