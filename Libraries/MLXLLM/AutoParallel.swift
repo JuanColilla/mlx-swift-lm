@@ -12,7 +12,7 @@ public enum PipelineWeightLayout {
     public static func sourcePrefixes(forModelType modelType: String) -> [String]? {
         switch modelType {
         case "llama", "deepseek_v3", "qwen3_moe", "qwen3", "lfm2", "gpt_oss", "glm4_moe_lite",
-            "qwen3_next":
+            "qwen3_next", "k2_horizon":
             return ["model.layers."]
         case "qwen3_5", "qwen3_5_moe":
             return [
@@ -224,6 +224,9 @@ func getLayers(from model: any LanguageModel) -> [TransformerLayer] {
     }
     if let glm = model as? GLM4MoELiteModel {
         return glm.model.layers
+    }
+    if let k2 = model as? K2HorizonModel {
+        return k2.model.layers
     }
 
     return []
