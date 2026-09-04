@@ -2,11 +2,19 @@
 // the real checkpoint.
 //
 // The synthetic round-trip in `LFM2MoEStreamedTests` proves the wiring; this
-// proves it against `mlx-community/LFM2.5-8B-A1B-MLX-4bit`, whose MoE layers
-// start at 2 (`num_dense_layers`), whose weights are a single
-// `model.safetensors`, and whose router is quantized to 8 bits while the
-// experts are 4-bit. Same instrument as the Qwen 3.5 P1c: teacher-forced
-// logits, resident against streamed.
+// proves it against the published checkpoint, whose MoE layers start at 2
+// (`num_dense_layers`) and whose weights are a single `model.safetensors`.
+// Same instrument as the Qwen 3.5 P1c: teacher-forced logits, resident
+// against streamed.
+//
+// `LiquidAI/LFM2.5-8B-A1B-MLX-4bit` is the canonical repository — it is what
+// the app installs — and `mlx-community` publishes a conversion of the same
+// model. They differ in how the router is stored: LiquidAI leaves
+// `feed_forward.gate.weight` unquantized, mlx-community quantizes it to 8
+// bits with a per-layer override in `config.quantization`. Neither touches
+// the routed experts, which are 4-bit affine with group 64 in both, so the
+// streaming path is identical; the quantization this test hands the session
+// is read from the checkpoint rather than written here as a constant.
 //
 // Opt-in and slow — it loads a 4.5 GB checkpoint twice:
 //
@@ -27,22 +35,31 @@ import XCTest
 
 final class LFM2MoEStreamedMacExperiment: XCTestCase {
 
-    /// `MLX_R56_LFM2_MODEL_DIR` wins; otherwise the Hugging Face cache.
+    /// `MLX_R56_LFM2_MODEL_DIR` wins; otherwise the Hugging Face cache, with
+    /// the LiquidAI repository preferred over the mlx-community conversion.
     static func checkpointDirectory() -> URL? {
         if let path = ProcessInfo.processInfo.environment["MLX_R56_LFM2_MODEL_DIR"],
             FileManager.default.fileExists(atPath: path)
         {
             return URL(fileURLWithPath: path)
         }
-        let repository = "models--mlx-community--LFM2.5-8B-A1B-MLX-4bit"
-        let cache = URL(fileURLWithPath: NSHomeDirectory())
-            .appending(path: ".cache/huggingface/hub/\(repository)/snapshots")
-        let snapshots =
-            (try? FileManager.default.contentsOfDirectory(
-                at: cache, includingPropertiesForKeys: nil)) ?? []
-        return snapshots.first {
-            FileManager.default.fileExists(atPath: $0.appending(path: "config.json").path)
+        let repositories = [
+            "models--LiquidAI--LFM2.5-8B-A1B-MLX-4bit",
+            "models--mlx-community--LFM2.5-8B-A1B-MLX-4bit",
+        ]
+        for repository in repositories {
+            let cache = URL(fileURLWithPath: NSHomeDirectory())
+                .appending(path: ".cache/huggingface/hub/\(repository)/snapshots")
+            let snapshots =
+                (try? FileManager.default.contentsOfDirectory(
+                    at: cache, includingPropertiesForKeys: nil)) ?? []
+            if let snapshot = snapshots.first(where: {
+                FileManager.default.fileExists(atPath: $0.appending(path: "config.json").path)
+            }) {
+                return snapshot
+            }
         }
+        return nil
     }
 
     private func requireCheckpoint() throws -> URL {
@@ -173,12 +190,17 @@ final class LFM2MoEStreamedMacExperiment: XCTestCase {
     ) {
         let (configuration, base) = try configurations(directory)
         let index = try ExpertOffsetIndex.build(modelDirectory: directory)
-        // The *expert* quantization, not the router's: `config.quantization`
-        // overrides `feed_forward.gate` to 8 bits on every MoE layer, and the
-        // bank only ever holds `switch_mlp` rows.
+        // The *expert* quantization: the root of `config.quantization`, read
+        // from the checkpoint rather than written here. Any per-layer override
+        // applies to `feed_forward.gate`, which the bank never holds, and a
+        // wrong pair here would not fail — it would decode the expert weights
+        // as another bit depth and generate fluent nonsense.
+        let quantization = try XCTUnwrap(base.quantization, "checkpoint is not quantized")
         let session = try ExpertStreamingSession(
             index: index, modelDirectory: directory,
-            configuration: .init(bankCapacityBytes: bankBytes, groupSize: 64, bits: 4))
+            configuration: .init(
+                bankCapacityBytes: bankBytes,
+                groupSize: quantization.groupSize, bits: quantization.bits))
 
         let start = Date.timeIntervalSinceReferenceDate
         let model = try ExpertStreaming.withSession(session) {
@@ -196,7 +218,7 @@ final class LFM2MoEStreamedMacExperiment: XCTestCase {
 
     func testIndexOverTheRealCheckpoint() throws {
         let directory = try requireCheckpoint()
-        let (configuration, _) = try configurations(directory)
+        let (configuration, base) = try configurations(directory)
         let index = try ExpertOffsetIndex.build(modelDirectory: directory)
 
         let expected = Array(configuration.numDenseLayers ..< configuration.hiddenLayers)
@@ -205,8 +227,15 @@ final class LFM2MoEStreamedMacExperiment: XCTestCase {
         for dense in 0 ..< configuration.numDenseLayers {
             XCTAssertNil(index.records(forLayer: dense))
         }
-        try index.validateQuantization(groupSize: 64, bits: 4)
+        let quantization = try XCTUnwrap(base.quantization)
+        try index.validateQuantization(
+            groupSize: quantization.groupSize, bits: quantization.bits)
 
+        print(
+            """
+            R56 | LFM2 checkpoint: \(directory.path) \
+            | quantization \(quantization.bits)-bit group \(quantization.groupSize)
+            """)
         print(
             """
             R56 | LFM2 index: \(index.layerCount) MoE layers of \
