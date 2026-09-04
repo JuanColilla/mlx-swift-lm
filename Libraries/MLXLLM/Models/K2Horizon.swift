@@ -196,7 +196,8 @@ extension K2HorizonConfiguration: ModelConfigurationValidating {
         }
         guard ropeHeadDim.isMultiple(of: 2), ropeHeadDim <= headDim else {
             throw K2HorizonConfigurationError(
-                message: "rope_head_dim (\(ropeHeadDim)) must be even and at most head_dim (\(headDim))"
+                message:
+                    "rope_head_dim (\(ropeHeadDim)) must be even and at most head_dim (\(headDim))"
             )
         }
         guard decoderSparseStep > 0 else {
@@ -280,14 +281,17 @@ func k2HorizonRoute(
     }
     let selection = selectionBias.map { scores + $0.asType(.float32) } ?? scores
 
+    // Ascending winner order, the same `argpartition(kth=-k)[..., -k:]`
+    // the Python port uses, so expert outputs are reduced in the same order.
     var indices: MLXArray
     var weights: MLXArray
     if supportsFusedRouterTopK(selection, k: topK) {
         (indices, weights) = fusedRouterTopK(
             selection: selection, values: scores, k: topK, normalize: normalize,
-            order: .descending)
+            order: .ascending)
     } else {
-        indices = MLX.argPartition(-selection, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+        let kth = selection.dim(-1) - topK
+        indices = MLX.argPartition(selection, kth: kth, axis: -1)[.ellipsis, kth...]
         weights = MLX.takeAlong(scores, indices, axis: -1)
         if normalize {
             weights = weights / weights.sum(axis: -1, keepDims: true)
@@ -508,8 +512,7 @@ public class K2HorizonDecoderLayer: Module, TransformerLayer {
     @ModuleInfo(key: "self_attn") var selfAttn: K2HorizonAttention
     @ModuleInfo(key: "mlp") var mlp: Module & UnaryLayer
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: K2HorizonGroupedRMSNorm
-    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm:
-        K2HorizonGroupedRMSNorm
+    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: K2HorizonGroupedRMSNorm
 
     public init(_ args: K2HorizonConfiguration, layerIdx: Int) {
         _selfAttn.wrappedValue = K2HorizonAttention(args, layerIdx: layerIdx)

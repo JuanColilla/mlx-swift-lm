@@ -205,7 +205,8 @@ final class K2HorizonTests: XCTestCase {
     }
 
     func testDataclassDefaultsApplyWhenKeysAreMissing() throws {
-        let config = try decode("""
+        let config = try decode(
+            """
             {"model_type": "k2_horizon", "vocab_size": 16, "hidden_size": 8,
              "num_hidden_layers": 1, "num_attention_heads": 1, "num_key_value_heads": 1,
              "head_dim": 8, "rope_theta": 5000, "num_experts": 0}
@@ -234,7 +235,8 @@ final class K2HorizonTests: XCTestCase {
         try randomize(model)
         let keys = Set(model.parameters().flattened().map(\.0))
         XCTAssertTrue(keys.contains("model.layers.0.self_attn.v_proj.weight"))
-        XCTAssertFalse(keys.contains(where: { $0.contains("gate_proj") && $0.contains("self_attn") }))
+        XCTAssertFalse(
+            keys.contains(where: { $0.contains("gate_proj") && $0.contains("self_attn") }))
         XCTAssertFalse(keys.contains(where: { $0.contains("switch_v") || $0.contains("v_router") }))
         XCTAssertTrue(keys.contains("lm_head.weight"))
 
@@ -260,8 +262,10 @@ final class K2HorizonTests: XCTestCase {
         XCTAssertTrue(keys.contains("model.layers.1.self_attn.v_router.bias"))
         XCTAssertFalse(keys.contains("model.layers.1.self_attn.v_proj.weight"))
         XCTAssertEqual(
-            model.parameters().flattened().first { $0.0 == "model.layers.1.self_attn.switch_v.weight" }?
-                .1.shape, [5, 16, 32])
+            model.parameters().flattened().first {
+                $0.0 == "model.layers.1.self_attn.switch_v.weight"
+            }?
+            .1.shape, [5, 16, 32])
         XCTAssertEqual(
             model.parameters().flattened().first {
                 $0.0 == "model.layers.1.mlp.switch_mlp.down_proj.weight"
@@ -335,7 +339,8 @@ final class K2HorizonTests: XCTestCase {
         let m = Dictionary(uniqueKeysWithValues: zip(idx, w))
         XCTAssertEqual(Set(m.keys), [0, 2], "the bias must move expert 2 into the top-k")
         XCTAssertEqual(m[0] ?? .nan, sigmoid(2), accuracy: 1e-5)
-        XCTAssertEqual(m[2] ?? .nan, sigmoid(0), accuracy: 1e-5, "weights come from unbiased scores")
+        XCTAssertEqual(
+            m[2] ?? .nan, sigmoid(0), accuracy: 1e-5, "weights come from unbiased scores")
     }
 
     func testRouterNormalizesAndScales() {
@@ -450,6 +455,40 @@ final class K2HorizonTests: XCTestCase {
         XCTAssertLessThan(MLX.max(MLX.abs(xn - yn)).item(Float.self), 1e-4)
     }
 
+    func testMoVASortedGatherMatchesPerTokenPath() throws {
+        // 20 tokens x top-2 = 40 assignments stays on the unsorted path;
+        // 40 tokens x top-2 = 80 crosses the gatherSort threshold (64).
+        let model = K2HorizonModel(try tinyMoE())
+        try randomize(model)
+        let attention = (model.model.layers[1] as! K2HorizonDecoderLayer).selfAttn
+        let x = MLXRandom.normal([1, 40, 32])
+        let batched = attention.routedValues(x)
+        let perToken = concatenated(
+            (0 ..< 40).map { attention.routedValues(x[0..., $0 ..< ($0 + 1), 0...]) }, axis: 1)
+        eval(batched, perToken)
+        XCTAssertEqual(batched.shape, [1, 40, 16])
+        XCTAssertLessThan(MLX.max(MLX.abs(batched - perToken)).item(Float.self), 1e-4)
+
+        let block =
+            (model.model.layers[1] as! K2HorizonDecoderLayer).mlp as! K2HorizonSparseMoEBlock
+        let moeBatched = block(x)
+        let moePerToken = concatenated(
+            (0 ..< 40).map { block(x[0..., $0 ..< ($0 + 1), 0...]) }, axis: 1)
+        XCTAssertLessThan(MLX.max(MLX.abs(moeBatched - moePerToken)).item(Float.self), 1e-4)
+    }
+
+    func testFullPrefillMatchesTokenByTokenDecodeOnMoE() throws {
+        let model = K2HorizonModel(try tinyMoE())
+        try randomize(model)
+        let tokens = (0 ..< 40).map { Int32(($0 * 7) % 64) }
+        let full = model(MLXArray(tokens).reshaped(1, 40), cache: nil)
+        let cache = try model.newCache(parameters: nil)
+        let stepwise = concatenated(
+            tokens.map { model(MLXArray([$0]).reshaped(1, 1), cache: cache) }, axis: 1)
+        eval(full, stepwise)
+        XCTAssertLessThan(MLX.max(MLX.abs(full - stepwise)).item(Float.self), 1e-3)
+    }
+
     // MARK: - sanitize
 
     func testSanitizeStacksHuggingFaceExpertsAndDropsRotaryBuffers() throws {
@@ -470,12 +509,17 @@ final class K2HorizonTests: XCTestCase {
         let sanitized = model.sanitize(weights: weights)
 
         XCTAssertNil(sanitized["model.layers.0.self_attn.rotary_emb.inv_freq"])
-        XCTAssertEqual(sanitized["model.layers.1.mlp.switch_mlp.up_proj.weight"]?.shape, [6, 16, 32])
-        XCTAssertEqual(sanitized["model.layers.2.mlp.switch_mlp.gate_proj.weight"]?.shape, [6, 16, 32])
-        XCTAssertEqual(sanitized["model.layers.2.mlp.switch_mlp.up_proj.weight"]?.shape, [6, 16, 32])
-        XCTAssertEqual(sanitized["model.layers.2.mlp.switch_mlp.down_proj.weight"]?.shape, [6, 32, 16])
+        XCTAssertEqual(
+            sanitized["model.layers.1.mlp.switch_mlp.up_proj.weight"]?.shape, [6, 16, 32])
+        XCTAssertEqual(
+            sanitized["model.layers.2.mlp.switch_mlp.gate_proj.weight"]?.shape, [6, 16, 32])
+        XCTAssertEqual(
+            sanitized["model.layers.2.mlp.switch_mlp.up_proj.weight"]?.shape, [6, 16, 32])
+        XCTAssertEqual(
+            sanitized["model.layers.2.mlp.switch_mlp.down_proj.weight"]?.shape, [6, 32, 16])
         XCTAssertEqual(sanitized["model.layers.2.self_attn.switch_v.weight"]?.shape, [5, 16, 32])
-        XCTAssertFalse(sanitized.keys.contains { $0.contains(".experts.") || $0.contains("v_experts") })
+        XCTAssertFalse(
+            sanitized.keys.contains { $0.contains(".experts.") || $0.contains("v_experts") })
     }
 
     func testSanitizeLeavesStackedLayoutAlone() throws {
