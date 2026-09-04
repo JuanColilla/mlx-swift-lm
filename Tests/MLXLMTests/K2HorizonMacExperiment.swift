@@ -194,6 +194,17 @@ final class K2HorizonMacExperiment: XCTestCase {
 
         let run = try generate(model: model, prompt: prompt, steps: steps, forcing: forced)
 
+        // `MLX_K2_SWIFT_DUMP=<file>` writes this run in the reference format,
+        // so two Swift builds can be compared with `MLX_K2_REFERENCE`.
+        if let dump = Self.environment("MLX_K2_SWIFT_DUMP") {
+            try MLX.save(
+                arrays: [
+                    "tokens": MLXArray(reference.tokens),
+                    "prompt_length": MLXArray([Int32(reference.promptLength)]),
+                    "logits": concatenated(run.logits.map { $0.reshaped(1, -1) }, axis: 0),
+                ], url: URL(fileURLWithPath: dump))
+        }
+
         var agreements = 0
         var worstAbsolute: Float = 0
         var worstRelative: Float = 0
