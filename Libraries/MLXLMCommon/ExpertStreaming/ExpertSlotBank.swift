@@ -131,6 +131,12 @@ public final class ExpertSlotBank: @unchecked Sendable {
     /// The bank array a projection's quantized matmul indexes with slot ids.
     public func pool(_ piece: ExpertPiece) -> MLXArray { pools[piece.slot] }
 
+    /// Whether the bank already holds `key`.
+    ///
+    /// The temporal prediction filters through this: prefetching an expert
+    /// that is already resident is the one read guaranteed to buy nothing.
+    public func isResident(_ key: ExpertKey) -> Bool { slotOfKey[key] != nil }
+
     public static func slotCount(for capacityBytes: Int, store: ExpertResidencyStore) -> Int {
         max(1, capacityBytes / max(1, store.index.bytesPerExpert))
     }
@@ -189,48 +195,85 @@ public final class ExpertSlotBank: @unchecked Sendable {
         return slots
     }
 
-    private func install(
-        _ missing: [(position: Int, key: ExpertKey)], into slots: inout [Int]
-    ) throws {
+    private typealias Missing = (position: Int, key: ExpertKey)
+
+    private func install(_ missing: [Missing], into slots: inout [Int]) throws {
+        var missing = missing
+
+        // P6. Whatever the temporal prediction already read costs no I/O here;
+        // the rest goes down the normal path. Claiming the batch is what frees
+        // the lanes for the next prediction, so it happens even when the
+        // overlap turns out to be empty.
+        if let claimed = store.takePrefetched(covering: Set(missing.map(\.key))) {
+            let fromPrefetch = missing.filter { claimed.batch.row(of: $0.key) != nil }
+            missing = missing.filter { claimed.batch.row(of: $0.key) == nil }
+            if !fromPrefetch.isEmpty {
+                let rows = MLXArray(fromPrefetch.map { Int32(claimed.batch.row(of: $0.key)!) })
+                try installBatch(
+                    fromPrefetch, into: &slots,
+                    staged: { ExpertPiece.all.map { claimed.arrays[$0.slot][rows] } })
+                store.notePrefetchServed(keys: fromPrefetch.count)
+            }
+            let wasted = claimed.batch.keys.count - fromPrefetch.count
+            if wasted > 0 {
+                store.notePrefetchWasted(
+                    bytes: wasted * store.index.bytesPerExpert)
+            }
+        }
+
         var pending = missing[...]
         while !pending.isEmpty {
-            let chunk = pending.prefix(configuration.maxLoadBatch)
+            let chunk = Array(pending.prefix(configuration.maxLoadBatch))
             pending = pending.dropFirst(chunk.count)
+            try installBatch(
+                chunk, into: &slots,
+                staged: { try self.store.readBatch(keys: chunk.map(\.key)) })
+        }
+    }
 
-            var targets = [Int]()
-            for entry in chunk {
-                let slot = try evict()
-                targets.append(slot)
-                slots[entry.position] = slot
-                pin(slot)
-            }
+    /// Evict, scatter and record, for a set of experts whose rows `staged`
+    /// knows how to produce — from a fresh read or from a prefetched batch.
+    ///
+    /// `staged` is a closure rather than an array because the eviction has to
+    /// happen *before* the read: the slots are pinned as they are taken, and a
+    /// read that runs first would leave the bank holding rows nothing points
+    /// at if it threw.
+    private func installBatch(
+        _ entries: [Missing], into slots: inout [Int], staged: () throws -> [MLXArray]
+    ) throws {
+        var targets = [Int]()
+        for entry in entries {
+            let slot = try evict()
+            targets.append(slot)
+            slots[entry.position] = slot
+            pin(slot)
+        }
 
-            let start = Date.timeIntervalSinceReferenceDate
-            let staged = try store.readBatch(keys: chunk.map(\.key))
-            let indices = MLXArray(targets.map { Int32($0) })
-            for piece in ExpertPiece.all {
-                pools[piece.slot][indices] = staged[piece.slot]
-            }
-            var evals = 0
-            if !deferInstallEval {
-                // Evaluating here is what lets MLX donate the pool buffer to
-                // the scatter instead of copying the whole bank, and it
-                // releases the staging buffers as soon as they are consumed.
-                eval(pools)
-                evals = 1
-            }
-            let elapsed = Date.timeIntervalSinceReferenceDate - start
+        let start = Date.timeIntervalSinceReferenceDate
+        let rows = try staged()
+        let indices = MLXArray(targets.map { Int32($0) })
+        for piece in ExpertPiece.all {
+            pools[piece.slot][indices] = rows[piece.slot]
+        }
+        var evals = 0
+        if !deferInstallEval {
+            // Evaluating here is what lets MLX donate the pool buffer to
+            // the scatter instead of copying the whole bank, and it
+            // releases the staging buffers as soon as they are consumed.
+            eval(pools)
+            evals = 1
+        }
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
 
-            for (entry, slot) in zip(chunk, targets) {
-                if let previous = keyOfSlot[slot] { slotOfKey[previous] = nil }
-                keyOfSlot[slot] = entry.key
-                slotOfKey[entry.key] = slot
-                referenced[slot] = true
-            }
-            lock.withLock {
-                statisticsStorage.installSeconds += elapsed
-                statisticsStorage.installEvals += evals
-            }
+        for (entry, slot) in zip(entries, targets) {
+            if let previous = keyOfSlot[slot] { slotOfKey[previous] = nil }
+            keyOfSlot[slot] = entry.key
+            slotOfKey[entry.key] = slot
+            referenced[slot] = true
+        }
+        lock.withLock {
+            statisticsStorage.installSeconds += elapsed
+            statisticsStorage.installEvals += evals
         }
     }
 
@@ -278,6 +321,10 @@ public final class ExpertSlotBank: @unchecked Sendable {
             configuration.capacityBytes = capacityBytes
             return
         }
+
+        // A batch in flight was planned against a residency map that is about
+        // to change; a shrink throws the whole map away.
+        store.cancelPrefetch()
 
         if target > slotCount {
             grow(to: target)

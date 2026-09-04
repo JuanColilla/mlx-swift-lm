@@ -156,6 +156,14 @@ extension ExpertStreamingSession {
         if useBank {
             let slots = try bank.ensure(
                 keys: unique.map { ExpertKey(layer: layer, expert: $0) })
+            // P6, and the order matters: the prediction for the next layer is
+            // issued *after* this layer has its slots, so the background lanes
+            // read while the GPU works on the matmul this call is about to
+            // return the indices for. Issued before, it would be competing
+            // with the read the forward pass is blocked on.
+            if isDecode, isTemporalPrefetchEnabled {
+                predictAfter(layer: layer, experts: unique)
+            }
             let mapping = Dictionary(uniqueKeysWithValues: zip(unique, slots))
             return StreamedExpertResolution(
                 indices: MLXArray(experts.map { UInt32(mapping[$0]!) }),

@@ -16,8 +16,12 @@ public struct ExpertStreamingConfiguration: Sendable {
     /// `F_NOCACHE`. Off by default: the kernel page cache is the free L2 tier.
     public var useNoCache: Bool
     /// Prefetch the previous token's experts while the GPU is still busy.
-    /// Off until measured (P6).
+    /// P6; see `ExpertPrefetcher` for what is and is not predictable.
     public var temporalPrefetch: Bool
+    /// Lanes the prefetch reads on. Two by default because P0 measured mobile
+    /// NAND saturating around QD2: past that, speculative reads take
+    /// bandwidth from the misses the forward pass is blocked on.
+    public var prefetchQueueDepth: Int
     /// Whether the prefill sweep is allowed to install into the bank. Off by
     /// default: a sweep touches nearly every expert of a layer and would
     /// evict the decode working set on every turn.
@@ -42,7 +46,8 @@ public struct ExpertStreamingConfiguration: Sendable {
         maxLoadBatch: Int = 64,
         groupSize: Int = 64,
         bits: Int = 4,
-        deferInstallEval: Bool = false
+        deferInstallEval: Bool = false,
+        prefetchQueueDepth: Int = 2
     ) {
         self.bankCapacityBytes = bankCapacityBytes
         self.queueDepth = queueDepth
@@ -53,6 +58,7 @@ public struct ExpertStreamingConfiguration: Sendable {
         self.groupSize = groupSize
         self.bits = bits
         self.deferInstallEval = deferInstallEval
+        self.prefetchQueueDepth = prefetchQueueDepth
     }
 }
 
@@ -88,6 +94,16 @@ public final class ExpertStreamingSession: @unchecked Sendable {
     private let countersLock = NSLock()
     private var countersStorage = ExpertStreamingSyncCounters()
 
+    /// P6 prediction state. Touched only from the forward pass's own thread,
+    /// which is the same single-pass invariant `SingleFlightGuard` enforces.
+    private var previousTokenExperts: [Int: [Int]] = [:]
+    private var currentTokenExperts: [Int: [Int]] = [:]
+    private var previousLayerOrder: [Int] = []
+    private var currentLayerOrder: [Int] = []
+    private var lastLayerSeen = Int.max
+    private let prefetchLock = NSLock()
+    private var prefetchEnabled = false
+
     private let failureLock = NSLock()
     private var failureStorage: ExpertStreamingFailure?
     private var failureHandler: (@Sendable (ExpertStreamingFailure) -> Void)?
@@ -118,13 +134,16 @@ public final class ExpertStreamingSession: @unchecked Sendable {
             modelDirectory: modelDirectory,
             configuration: .init(
                 queueDepth: configuration.queueDepth,
-                useNoCache: configuration.useNoCache))
+                useNoCache: configuration.useNoCache,
+                prefetchQueueDepth: configuration.temporalPrefetch
+                    ? configuration.prefetchQueueDepth : nil))
         self.bank = ExpertSlotBank(
             store: store,
             configuration: .init(
                 capacityBytes: configuration.bankCapacityBytes,
                 maxLoadBatch: configuration.maxLoadBatch))
         self.bank.deferInstallEval = configuration.deferInstallEval
+        self.prefetchEnabled = configuration.temporalPrefetch
     }
 
     /// Encourage the bank down a step. This is the "invisible release" a
@@ -158,6 +177,68 @@ public final class ExpertStreamingSession: @unchecked Sendable {
         bank.resetStatistics()
         store.resetStatistics()
         countersLock.withLock { countersStorage = ExpertStreamingSyncCounters() }
+    }
+
+    // MARK: - Temporal prefetch (P6)
+
+    /// Whether the prediction is running.
+    ///
+    /// Settable so an A/B can switch arms on one loaded model: comparing two
+    /// processes is not comparable in this subsystem. Turning it off drops
+    /// whatever is in flight; turning it on when the session was built without
+    /// a prefetcher does nothing, because the lanes do not exist.
+    public var isTemporalPrefetchEnabled: Bool {
+        get { prefetchLock.withLock { prefetchEnabled } && store.isPrefetching }
+        set {
+            prefetchLock.withLock { prefetchEnabled = newValue }
+            if !newValue { store.cancelPrefetch() }
+        }
+    }
+
+    /// Record this layer's choice and issue the prediction for the next one.
+    ///
+    /// The prediction: at layer L of token N, read what layer L+1 used at token
+    /// N−1. The forward pass cannot predict layer L+1 of the *current* token —
+    /// its router depends on layer L's output — so the previous token is the
+    /// only signal available while the GPU is still busy.
+    ///
+    /// "The next layer" comes from the order the previous token visited, not
+    /// from `layer + 1`: with `mlp_only_layers` or a sparse step, the MoE
+    /// layers are not consecutive and not necessarily starting at zero. At the
+    /// last MoE layer of a token it wraps to the first, which is free and
+    /// covers the boundary between tokens.
+    func predictAfter(layer: Int, experts: [Int]) {
+        // A layer index that did not move forward means a new token started.
+        if layer <= lastLayerSeen {
+            previousTokenExperts = currentTokenExperts
+            previousLayerOrder = currentLayerOrder
+            currentTokenExperts = [:]
+            currentLayerOrder = []
+        }
+        lastLayerSeen = layer
+        currentTokenExperts[layer] = experts
+        currentLayerOrder.append(layer)
+
+        guard let position = previousLayerOrder.firstIndex(of: layer),
+            !previousLayerOrder.isEmpty
+        else { return }
+        let next = previousLayerOrder[(position + 1) % previousLayerOrder.count]
+        guard let predicted = previousTokenExperts[next] else { return }
+
+        let absent = predicted.map { ExpertKey(layer: next, expert: $0) }
+            .filter { !bank.isResident($0) }
+        store.prefetch(keys: absent)
+    }
+
+    /// Forget the prediction. A new prompt, or anything that makes the
+    /// previous token stop being a predictor of the next one.
+    public func resetPrediction() {
+        store.cancelPrefetch()
+        previousTokenExperts = [:]
+        currentTokenExperts = [:]
+        previousLayerOrder = []
+        currentLayerOrder = []
+        lastLayerSeen = Int.max
     }
 
     // MARK: - Failure (TD-054(a))

@@ -90,6 +90,35 @@ public struct ExpertResidencyStatistics: Sendable, Equatable {
     /// silently caps is a lie, and this is what proves it is not being capped.
     public var peakConcurrentReads: Int = 0
 
+    // MARK: Temporal prefetch (P6)
+    //
+    // Kept apart from the counters above on purpose. A speculative read that
+    // nobody waited for does not belong in the foreground MB/s, and the waste
+    // of a bad prediction has to stay visible.
+
+    /// Experts the temporal prediction asked for.
+    public var prefetchIssued: Int = 0
+    /// Experts a layer took from a prefetched batch instead of reading.
+    public var prefetchServed: Int = 0
+    /// Bytes read by a batch that no layer claimed. The cost of a wrong
+    /// prediction, in NAND bandwidth and battery.
+    public var prefetchWastedBytes: Int = 0
+    /// Bytes read speculatively, claimed or not.
+    public var prefetchBytes: Int = 0
+    public var prefetchReadSeconds: Double = 0
+    /// Time the forward pass spent waiting for a prefetch it decided to claim.
+    /// Non-zero means the prediction was right but too late: the read did not
+    /// fit inside one layer of compute.
+    public var prefetchWaitSeconds: Double = 0
+    /// Prefetch batches that failed to plan or to read. Never fails the
+    /// session — a speculative read has no standing.
+    public var prefetchFailures: Int = 0
+
+    /// Share of the experts asked for that a layer went on to claim.
+    public var prefetchHitRate: Double {
+        prefetchIssued > 0 ? Double(prefetchServed) / Double(prefetchIssued) : 0
+    }
+
     public var megabytesPerSecond: Double {
         readSeconds > 0 ? Double(bytes) / readSeconds / 1_048_576 : 0
     }
@@ -106,9 +135,20 @@ public final class ExpertResidencyStore: @unchecked Sendable {
         /// against `phys_footprint`, which is what jetsam measures.
         public var useNoCache: Bool
 
-        public init(queueDepth: Int = 8, useNoCache: Bool = false) {
+        /// Lanes for the temporal prefetch, or `nil` for no prefetcher.
+        ///
+        /// Deliberately smaller than `queueDepth` by default: P0 measured that
+        /// mobile NAND already saturates around QD2, so speculative lanes past
+        /// that only take bandwidth away from the misses the forward pass is
+        /// actually blocked on.
+        public var prefetchQueueDepth: Int?
+
+        public init(
+            queueDepth: Int = 8, useNoCache: Bool = false, prefetchQueueDepth: Int? = nil
+        ) {
             self.queueDepth = queueDepth
             self.useNoCache = useNoCache
+            self.prefetchQueueDepth = prefetchQueueDepth
         }
     }
 
@@ -128,6 +168,9 @@ public final class ExpertResidencyStore: @unchecked Sendable {
     /// before the lanes are woken, so a test can prove that a nested caller is
     /// rejected instead of racing for it with two threads.
     var reentrancyProbe: (() -> Void)?
+
+    /// P6. `nil` unless the caller asked for a prefetch queue depth.
+    private(set) var prefetcher: ExpertPrefetcher?
 
     public init(
         index: ExpertOffsetIndex,
@@ -153,11 +196,15 @@ public final class ExpertResidencyStore: @unchecked Sendable {
         self.descriptors = descriptors
         self.lanes = LanePool(lanes: max(1, configuration.queueDepth))
         self.statisticsStorage.requestedQueueDepth = max(1, configuration.queueDepth)
+        if let depth = configuration.prefetchQueueDepth, depth > 0 {
+            self.prefetcher = ExpertPrefetcher(store: self, queueDepth: depth)
+        }
     }
 
     deinit {
-        // Order matters: the lanes have to be parked and gone before the
-        // descriptors they read from are closed.
+        // Order matters: every lane, prefetch included, has to be parked and
+        // gone before the descriptors it reads from are closed.
+        prefetcher?.shutdown()
         lanes.shutdown()
         for fd in descriptors { close(fd) }
     }
@@ -173,6 +220,53 @@ public final class ExpertResidencyStore: @unchecked Sendable {
         }
     }
 
+    // MARK: - Temporal prefetch (P6)
+
+    /// Whether this store was built with a prefetcher at all.
+    public var isPrefetching: Bool { prefetcher != nil }
+
+    /// Ask the background lanes for `keys`, best effort. Returns immediately.
+    ///
+    /// The caller is expected to have filtered out whatever is already
+    /// resident: re-reading an expert the bank already holds is the one
+    /// prefetch that is guaranteed to be useless.
+    public func prefetch(keys: [ExpertKey]) {
+        prefetcher?.request(keys: keys)
+    }
+
+    /// Drop the batch in flight. Called when the prediction is invalidated —
+    /// a new prompt, a bank resize, a failed session.
+    public func cancelPrefetch() {
+        prefetcher?.cancel()
+    }
+
+    /// Claim the batch in flight if it covers any of `wanted`.
+    func takePrefetched(covering wanted: Set<ExpertKey>) -> (
+        batch: ExpertReadBatch, arrays: [MLXArray]
+    )? {
+        prefetcher?.take(covering: wanted)
+    }
+
+    func notePrefetchIssued(keys: Int) {
+        statisticsLock.withLock { statisticsStorage.prefetchIssued += keys }
+    }
+
+    func notePrefetchServed(keys: Int) {
+        statisticsLock.withLock { statisticsStorage.prefetchServed += keys }
+    }
+
+    func notePrefetchWasted(bytes: Int) {
+        statisticsLock.withLock { statisticsStorage.prefetchWastedBytes += bytes }
+    }
+
+    func notePrefetchWait(seconds: Double) {
+        statisticsLock.withLock { statisticsStorage.prefetchWaitSeconds += seconds }
+    }
+
+    func notePrefetchFailure() {
+        statisticsLock.withLock { statisticsStorage.prefetchFailures += 1 }
+    }
+
     // MARK: - Reading
 
     /// Read `keys` into nine freshly allocated page-aligned buffers, delivered
@@ -186,6 +280,25 @@ public final class ExpertResidencyStore: @unchecked Sendable {
     /// coalesced read for free. `readRuns` is that call with the sorting done.
     public func readBatch(keys: [ExpertKey]) throws -> [MLXArray] {
         guard !keys.isEmpty else { return [] }
+        let batch = try plan(keys: keys)
+        do {
+            try run(jobs: batch.jobs)
+        } catch {
+            batch.discard()
+            throw error
+        }
+        return batch.materialize(index: index)
+    }
+
+    /// Validate `keys`, allocate the nine page-aligned staging buffers and
+    /// build the `pread` jobs — everything a read needs except the lanes that
+    /// execute it.
+    ///
+    /// Split out of `readBatch` so the prefetcher can run the same plan on its
+    /// own lanes. It shares the descriptors (`pread` carries its own offset,
+    /// so a shared fd is safe) and shares nothing else: not the lanes, and not
+    /// the single-flight guard that protects them.
+    func plan(keys: [ExpertKey]) throws -> ExpertReadBatch {
         for key in keys {
             guard index.records(forLayer: key.layer) != nil else {
                 throw ExpertResidencyError.unknownLayer(key.layer)
@@ -197,59 +310,40 @@ public final class ExpertResidencyStore: @unchecked Sendable {
 
         let template = index.layers[0]
         var buffers = [UnsafeMutableRawPointer]()
-        var jobs = [ReadJob]()
+        var jobs = [ExpertReadJob]()
 
-        do {
-            for piece in ExpertPiece.all {
-                let rowBytes = template[piece].rowBytes
-                let total = rowBytes * keys.count
-                guard let buffer = allocatePageAligned(total) else {
-                    for buffer in buffers { free(buffer) }
-                    throw ExpertResidencyError.allocationFailed(bytes: total)
-                }
-                buffers.append(buffer)
-
-                var row = 0
-                while row < keys.count {
-                    var span = 1
-                    while row + span < keys.count,
-                        keys[row + span].layer == keys[row].layer,
-                        keys[row + span].expert == keys[row].expert + span
-                    {
-                        span += 1
-                    }
-                    let record = index.records(forLayer: keys[row].layer)![piece]
-                    jobs.append(
-                        ReadJob(
-                            fd: descriptors[record.shard],
-                            shard: record.shard,
-                            destination: buffer.advanced(by: row * rowBytes),
-                            fileOffset: record.offset(ofExpert: keys[row].expert),
-                            byteCount: rowBytes * span,
-                            span: span))
-                    row += span
-                }
+        for piece in ExpertPiece.all {
+            let rowBytes = template[piece].rowBytes
+            let total = rowBytes * keys.count
+            guard let buffer = allocatePageAligned(total) else {
+                for buffer in buffers { free(buffer) }
+                throw ExpertResidencyError.allocationFailed(bytes: total)
             }
-        } catch {
-            throw error
+            buffers.append(buffer)
+
+            var row = 0
+            while row < keys.count {
+                var span = 1
+                while row + span < keys.count,
+                    keys[row + span].layer == keys[row].layer,
+                    keys[row + span].expert == keys[row].expert + span
+                {
+                    span += 1
+                }
+                let record = index.records(forLayer: keys[row].layer)![piece]
+                jobs.append(
+                    ExpertReadJob(
+                        fd: descriptors[record.shard],
+                        shard: record.shard,
+                        destination: buffer.advanced(by: row * rowBytes),
+                        fileOffset: record.offset(ofExpert: keys[row].expert),
+                        byteCount: rowBytes * span,
+                        span: span))
+                row += span
+            }
         }
 
-        do {
-            try run(jobs: jobs)
-        } catch {
-            for buffer in buffers { free(buffer) }
-            throw error
-        }
-
-        return buffers.enumerated().map { slot, buffer in
-            let piece = ExpertPiece.all[slot]
-            let record = template[piece]
-            return MLXArray(
-                rawPointer: buffer,
-                [keys.count] + record.rowShape,
-                dtype: record.dtype.mlxDType,
-                finalizer: { free(buffer) })
-        }
+        return ExpertReadBatch(keys: keys, buffers: buffers, jobs: jobs)
     }
 
     /// Prefill read: every expert of one layer that the prompt touched, sorted
@@ -267,16 +361,6 @@ public final class ExpertResidencyStore: @unchecked Sendable {
 
     // MARK: - Plumbing
 
-    private struct ReadJob: @unchecked Sendable {
-        let fd: Int32
-        let shard: Int
-        let destination: UnsafeMutableRawPointer
-        let fileOffset: Int64
-        let byteCount: Int
-        /// How many expert rows this single read covers, for the counters.
-        let span: Int
-    }
-
     private final class ReadState: @unchecked Sendable {
         let lock = NSLock()
         var error: Error?
@@ -286,13 +370,19 @@ public final class ExpertResidencyStore: @unchecked Sendable {
         }
     }
 
-    /// Not reentrant: one forward pass at a time owns the lanes. That is the
-    /// same single-pass invariant the slot bank relies on.
-    private func run(jobs: [ReadJob]) throws {
+    /// Not reentrant: one forward pass at a time owns the foreground lanes.
+    /// That is the same single-pass invariant the slot bank relies on. The
+    /// prefetcher does not come through here — it has lanes of its own.
+    private func run(jobs: [ExpertReadJob]) throws {
         try singleFlight.enter(orThrow: ExpertResidencyError.concurrentRead)
         defer { singleFlight.leave() }
         reentrancyProbe?()
 
+        try execute(jobs: jobs, on: lanes, foreground: true)
+    }
+
+    /// The lane fanout itself, with no opinion about which pool runs it.
+    func execute(jobs: [ExpertReadJob], on lanes: LanePool, foreground: Bool) throws {
         let state = ReadState()
         let inFlight = InFlightCounter()
         let width = lanes.lanes
@@ -323,6 +413,14 @@ public final class ExpertResidencyStore: @unchecked Sendable {
         let rows = jobs.reduce(0) { $0 + $1.span }
         let peak = inFlight.peak
         statisticsLock.withLock {
+            guard foreground else {
+                // Prefetch bytes are speculative and are reported apart: mixed
+                // into `bytes` they would inflate the MB/s of a read nobody
+                // waited for, and hide the waste of a bad prediction.
+                statisticsStorage.prefetchBytes += bytes
+                statisticsStorage.prefetchReadSeconds += elapsed
+                return
+            }
             statisticsStorage.reads += rows
             statisticsStorage.coalescedReads += jobs.count
             statisticsStorage.bytes += bytes
@@ -333,7 +431,7 @@ public final class ExpertResidencyStore: @unchecked Sendable {
     }
 
     /// `pread` is allowed to return short; a loop is the only correct use.
-    private static func readFully(_ job: ReadJob) throws {
+    private static func readFully(_ job: ExpertReadJob) throws {
         var done = 0
         while done < job.byteCount {
             let read = pread(
@@ -366,7 +464,7 @@ public final class ExpertResidencyStore: @unchecked Sendable {
 /// Invariant: `job` is only written while every lane is parked on its own
 /// `start` semaphore, i.e. between `run(_:)` calls, so the hot path needs no
 /// lock. Lanes only ever touch disjoint jobs.
-private final class LanePool: @unchecked Sendable {
+final class LanePool: @unchecked Sendable {
     let lanes: Int
     private let start: [DispatchSemaphore]
     private let finished = DispatchSemaphore(value: 0)
