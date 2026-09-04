@@ -38,6 +38,7 @@ extension ToolCallFormat {
     /// would reroute the whole response protocol rather than one payload shape.
     private static let signatures: [Signature] = [
         Signature(.minimaxM2, allOf: "<minimax:tool_call>"),
+        Signature(.k2Horizon, allOf: "<ifm|tool_call>"),
         Signature(.gemma4, allOf: "<|tool_call>", "<tool_call|>"),
         Signature(.gemma, allOf: "<start_function_call>"),
         Signature(.glm4, allOf: "<arg_key>"),

@@ -14,6 +14,7 @@ struct ToolCallFormatInferenceTests {
         "Each dialect is recognized by its template markers",
         arguments: [
             ("<minimax:tool_call>{...}</minimax:tool_call>", ToolCallFormat.minimaxM2),
+            ("<ifm|tool_calls>\n<ifm|tool_call>{{ name }}</ifm|tool_call>", .k2Horizon),
             (#"<|tool_call>call:{{ name }}{...}<tool_call|>"#, .gemma4),
             ("<start_function_call>call:{{ name }}<end_function_call>", .gemma),
             ("<arg_key>{{ key }}</arg_key><arg_value>{{ value }}</arg_value>", .glm4),
@@ -254,8 +255,8 @@ struct ToolCallFormatInferenceTests {
     }
 }
 
-/// A throwaway directory holding tokenizer files.
-private enum TokenizerFixture {
+/// A throwaway directory holding tokenizer files. Shared with the K2-Horizon suite.
+enum TokenizerFixture {
     static func make(_ files: [String: String]) throws -> URL {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appending(component: "tool-format-inference-\(UUID().uuidString)")
