@@ -1609,6 +1609,7 @@ struct ToolTests {
         #expect(ToolCallFormat.glm4.rawValue == "glm4")
         #expect(ToolCallFormat.gemma.rawValue == "gemma")
         #expect(ToolCallFormat.kimiK2.rawValue == "kimi_k2")
+        #expect(ToolCallFormat.k2Horizon.rawValue == "k2_horizon")
         #expect(ToolCallFormat.minimaxM2.rawValue == "minimax_m2")
         #expect(ToolCallFormat.atem.rawValue == "atem")
         #expect(ToolCallFormat.mistral.rawValue == "mistral")

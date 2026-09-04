@@ -20,6 +20,38 @@ public enum Chat {
         /// Tool-call metadata associated with this message.
         public var tool: Tool?
 
+        /// Extra keys emitted verbatim into the raw message dictionary the chat
+        /// template sees, next to `role` and `content`.
+        ///
+        /// Some templates read fields the structured message has no slot for.
+        /// K2-Horizon (IFM) is the motivating case: its template raises unless
+        /// every assistant message in the history defines a thinking field
+        /// (`reasoning_content`, `think`, ...). Keys are template-defined, so
+        /// this stays an open dictionary; ``reasoningContent`` is the typed
+        /// accessor for the one field that is common across families.
+        ///
+        /// The generator writes these *after* the structured fields, and the
+        /// structured fields win: `role`, `content` and the tool-call keys
+        /// cannot be overridden from here.
+        public var additionalFields: [String: any Sendable]
+
+        /// The `reasoning_content` entry of ``additionalFields``.
+        ///
+        /// Chat templates that render prior reasoning (DeepSeek, Qwen3, K2)
+        /// all read this key. An empty string is a valid value and differs from
+        /// `nil`: K2 requires the key to be *defined* on every assistant turn,
+        /// and renders an empty thinking block for `""`.
+        public var reasoningContent: String? {
+            get { additionalFields["reasoning_content"] as? String }
+            set {
+                if let newValue {
+                    additionalFields["reasoning_content"] = newValue
+                } else {
+                    additionalFields.removeValue(forKey: "reasoning_content")
+                }
+            }
+        }
+
         public struct Tool: Sendable {
             fileprivate enum Storage: Sendable {
                 case calls([ToolCall])
@@ -56,7 +88,8 @@ public enum Chat {
             images: [UserInput.Image] = [],
             videos: [UserInput.Video] = [],
             audios: [UserInput.Audio] = [],
-            tool: Tool? = nil
+            tool: Tool? = nil,
+            additionalFields: [String: any Sendable] = [:]
         ) {
             self.role = role
             self.content = content
@@ -64,6 +97,7 @@ public enum Chat {
             self.videos = videos
             self.audios = audios
             self.tool = tool
+            self.additionalFields = additionalFields
         }
 
         public static func system(
@@ -72,15 +106,21 @@ public enum Chat {
             Self(role: .system, content: content, images: images, videos: videos)
         }
 
+        /// - Parameter reasoningContent: prior-turn reasoning to expose to the
+        ///   template as `reasoning_content`. Pass `""` to declare the field
+        ///   without content (required by K2-Horizon); `nil` leaves it undefined.
         public static func assistant(
             _ content: String,
             images: [UserInput.Image] = [],
             videos: [UserInput.Video] = [],
-            toolCalls: [ToolCall]? = nil
+            toolCalls: [ToolCall]? = nil,
+            reasoningContent: String? = nil
         ) -> Self {
-            Self(
+            var message = Self(
                 role: .assistant, content: content, images: images, videos: videos,
                 tool: toolCalls.map { .calls($0) })
+            message.reasoningContent = reasoningContent
+            return message
         }
 
         public static func user(
@@ -145,8 +185,18 @@ extension MessageGenerator {
         ]
 
         addToolMetadata(to: &dictionary, for: message)
+        addAdditionalFields(to: &dictionary, for: message)
 
         return dictionary
+    }
+
+    /// Merges ``Chat/Message/additionalFields`` into a raw message dictionary.
+    ///
+    /// Existing keys are kept, so the structured fields already written by the
+    /// generator take precedence over anything the caller placed in the open
+    /// dictionary.
+    public func addAdditionalFields(to dictionary: inout Message, for message: Chat.Message) {
+        dictionary.merge(message.additionalFields) { current, _ in current }
     }
 
     /// Adds tool-call metadata from a structured message to a raw message dictionary.
@@ -198,7 +248,8 @@ extension MessageGenerator {
 }
 
 /// Default implementation of ``MessageGenerator`` that produces `role` and
-/// `content`, plus `name`, `tool_call_id`, and `tool_calls` when present.
+/// `content`, plus `name`, `tool_call_id`, and `tool_calls` when present, and
+/// any ``Chat/Message/additionalFields`` the caller attached.
 ///
 /// ```swift
 /// [
@@ -208,6 +259,45 @@ extension MessageGenerator {
 /// ```
 public struct DefaultMessageGenerator: MessageGenerator {
     public init() {}
+}
+
+/// ``MessageGenerator`` for K2-Horizon (IFM) checkpoints.
+///
+/// The K2 chat template raises for any assistant message in the history that
+/// does not define a thinking field, and `ChatSession` records assistant turns
+/// without one, so a second turn would fail before reaching the model. This
+/// generator declares `reasoning_content` as an empty string on assistant
+/// messages that carry no thinking field of their own, which the template
+/// renders as an empty `<ifm|think>` block; a caller-supplied
+/// ``Chat/Message/reasoningContent`` (or `think` / `think_fast` /
+/// `think_faster` in ``Chat/Message/additionalFields``) is left untouched.
+///
+/// Deliberately not folded into ``DefaultMessageGenerator``: templates that
+/// render `reasoning_content` when defined (DeepSeek, Qwen3) would otherwise
+/// start receiving empty thinking blocks on every prior turn.
+public struct K2HorizonMessageGenerator: MessageGenerator {
+    /// The keys the K2 template accepts as a thinking field, in its own lookup order.
+    static let thinkingFieldKeys = [
+        "think", "think_fast", "think_faster", "reasoning_content", "reasoning",
+    ]
+
+    public init() {}
+
+    public func generate(message: Chat.Message) -> Message {
+        var dictionary: Message = [
+            "role": message.role.rawValue,
+            "content": message.content,
+        ]
+        addToolMetadata(to: &dictionary, for: message)
+        addAdditionalFields(to: &dictionary, for: message)
+
+        if message.role == .assistant,
+            !Self.thinkingFieldKeys.contains(where: { dictionary[$0] is String })
+        {
+            dictionary["reasoning_content"] = ""
+        }
+        return dictionary
+    }
 }
 
 /// Implementation of ``MessageGenerator`` that produces a

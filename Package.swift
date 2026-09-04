@@ -83,6 +83,10 @@ let package = Package(
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "602.0.0" ..< "604.0.0"),
+        // Test-only: renders real chat templates (K2-Horizon) the way the host's
+        // tokenizer does. Same requirement swift-transformers declares, so a
+        // consumer that already resolves it through the tokenizer sees no change.
+        .package(url: "https://github.com/huggingface/swift-jinja.git", from: "2.0.0"),
     ],
     targets: [
         .target(
@@ -180,12 +184,16 @@ let package = Package(
                 "MLXVLM",
                 "MLXEmbedders",
                 "MLXRerankers",
+                .product(name: "Jinja", package: "swift-jinja"),
             ],
             path: "Tests/MLXLMTests",
             exclude: [
                 "README.md"
             ],
-            resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
+            resources: [
+                .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
+                .process("Resources/K2HorizonChatTemplate.jinja"),
+            ]
         ),
         .macro(
             name: "MLXHuggingFaceMacros",

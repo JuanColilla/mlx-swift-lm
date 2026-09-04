@@ -98,6 +98,12 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
     /// Example: `functions.name:0<|tool_call_argument_begin|>{"key": "value"}`
     case kimiK2 = "kimi_k2"
 
+    /// K2-Horizon (IFM) block format. One `<ifm|tool_calls>` block per turn
+    /// holds every `<ifm|tool_call>`, each in the JSON or the tagged
+    /// (`<ifm|arg_key>` / `<ifm|arg_value>`) dialect its prompt selected.
+    /// Example: `<ifm|tool_calls>\n<ifm|tool_call>{"name": "f", "arguments": {...}}</ifm|tool_call>\n</ifm|tool_calls>`
+    case k2Horizon = "k2_horizon"
+
     /// MiniMax M2 format with invoke/parameter tags.
     /// Example: `<invoke name="f"><parameter name="k">v</parameter></invoke>`
     case minimaxM2 = "minimax_m2"
@@ -148,6 +154,8 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                 startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: "<|\"|>")
         case .kimiK2:
             return KimiK2ToolCallParser()
+        case .k2Horizon:
+            return K2HorizonToolCallParser()
         case .minimaxM2:
             return MiniMaxM2ToolCallParser()
         case .atem:
@@ -198,7 +206,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return OnyxStreamAdapter(
                 tokenizer: tokenizer, tools: tools, stopStrings: stopStrings)
 
-        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
+        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .k2Horizon, .minimaxM2,
             .mistral, .llama3:
             return nil
         }
@@ -220,7 +228,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return HarmonyToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
         case .atem:
             return OnyxToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
-        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
+        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .k2Horizon, .minimaxM2,
             .mistral,
             .llama3:
             return []
@@ -242,7 +250,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                     count += message.tool?.calls?.count ?? 0
                 }
             }
-        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
+        case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .k2Horizon, .minimaxM2,
             .mistral, .llama3:
             0
         }
