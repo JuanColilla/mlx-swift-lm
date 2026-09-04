@@ -28,6 +28,9 @@ final class ExpertStreamingMacExperiments: XCTestCase {
         var peakGPUBytes: Int
         var hitRate: Double?
         var readMegabytesPerSecond: Double?
+        var syncCounters: ExpertStreamingSyncCounters?
+        var prefetch: ExpertResidencyStatistics?
+        var decodeTokens: Int = 0
         var tokens: [Int32]
         /// One logits row per step, kept only when the caller asks: the
         /// resident/streamed comparison has to be made on logits, not on a
@@ -149,6 +152,9 @@ final class ExpertStreamingMacExperiments: XCTestCase {
             peakGPUBytes: GPU.peakMemory,
             hitRate: session?.bank.statistics.hitRate,
             readMegabytesPerSecond: session?.store.statistics.megabytesPerSecond,
+            syncCounters: session?.syncCounters,
+            prefetch: session?.store.statistics,
+            decodeTokens: tokens - 1,
             tokens: produced,
             logits: captured)
     }
@@ -164,14 +170,20 @@ final class ExpertStreamingMacExperiments: XCTestCase {
         return (model, Date.timeIntervalSinceReferenceDate - start)
     }
 
-    private func loadStreamed(_ directory: URL, bankBytes: Int) throws -> (
+    private func loadStreamed(
+        _ directory: URL, bankBytes: Int, temporalPrefetch: Bool = false,
+        deferInstallEval: Bool = false
+    ) throws -> (
         Qwen35MoEModel, ExpertStreamingSession, Double
     ) {
         let (configuration, base) = try configurations(directory)
         let index = try ExpertOffsetIndex.build(modelDirectory: directory)
         let session = try ExpertStreamingSession(
             index: index, modelDirectory: directory,
-            configuration: .init(bankCapacityBytes: bankBytes))
+            configuration: .init(
+                bankCapacityBytes: bankBytes,
+                temporalPrefetch: temporalPrefetch,
+                deferInstallEval: deferInstallEval))
 
         let start = Date.timeIntervalSinceReferenceDate
         let model = try ExpertStreaming.withSession(session) {
@@ -195,6 +207,24 @@ final class ExpertStreamingMacExperiments: XCTestCase {
             | decode \(String(format: "%.2f", measurement.decodeTokensPerSecond)) tok/s \
             | peak GPU \(String(format: "%.2f", Double(measurement.peakGPUBytes) / 1_073_741_824)) GiB \
             | hit \(hit) | read \(read) MB/s
+            """)
+        guard let counters = measurement.syncCounters, let prefetch = measurement.prefetch,
+            measurement.decodeTokens > 0
+        else { return }
+        let tokens = Double(measurement.decodeTokens)
+        print(
+            """
+            R56 |   \(measurement.label) | evals/token \
+            \(String(format: "%.1f", Double(counters.total) / tokens)) \
+            (router \(String(format: "%.1f", Double(counters.routerEvals) / tokens)) \
+            + install \(String(format: "%.1f", Double(counters.installEvals) / tokens))) \
+            | layers/token \(String(format: "%.1f", Double(counters.layerForwards) / tokens)) \
+            | prefetch predicted \(prefetch.prefetchPredicted) \
+            issued \(prefetch.prefetchIssued) served \(prefetch.prefetchServed) \
+            (\(String(format: "%.1f%%", prefetch.prefetchHitRate * 100))) \
+            | wasted \(String(format: "%.2f", Double(prefetch.prefetchWastedBytes) / 1_073_741_824)) GiB \
+            | wait \(String(format: "%.3f", prefetch.prefetchWaitSeconds)) s \
+            | prefetch read \(String(format: "%.2f", Double(prefetch.prefetchBytes) / 1_073_741_824)) GiB
             """)
     }
 
@@ -602,6 +632,71 @@ final class ExpertStreamingMacExperiments: XCTestCase {
                 model: model, tokens: 16, label: label, loadSeconds: loadSeconds,
                 session: session, promptTokens: promptTokens)
             report(measurement)
+            GPU.clearCache()
+        }
+    }
+
+    // MARK: - P6 · temporal prefetch, and the synchronizations underneath it
+
+    /// Four arms on **one loaded model**, per bank size, plus a repeat of the
+    /// baseline at the end.
+    ///
+    /// Two things this shape buys, both learned the hard way in Phase 1:
+    /// the arms cannot be split across processes (the resident arm alone moved
+    /// 42% between two runs), and the first arm of any sweep reads with a cold
+    /// page cache, so the baseline is repeated last and only the pair with the
+    /// same temperature is comparable.
+    func testP6TemporalPrefetchAndSynchronization() throws {
+        let directory = try requireCheckpoint()
+        let vocabulary = try MinimalVocabulary(directory: directory)
+        let promptTokens = vocabulary.encode(Self.promptText)
+        let steps = 33
+
+        let banks: [(String, Int)] = [
+            // 256 MiB is below any shippable configuration on purpose: it is
+            // the only regime where eviction, rather than the router changing
+            // its mind, is what causes a miss — which is the only regime the
+            // temporal prediction can possibly help.
+            ("256 MiB", 256 << 20), ("1 GiB", 1 << 30), ("3 GiB", 3 << 30),
+        ]
+        for (bankLabel, bankBytes) in banks {
+            let (model, session, loadSeconds) = try loadStreamed(
+                directory, bankBytes: bankBytes, temporalPrefetch: true)
+
+            // Warm-up, so no arm pays for a cold bank.
+            _ = try generate(
+                model: model, tokens: 6, label: "warm-up", loadSeconds: 0,
+                session: session, promptTokens: promptTokens)
+
+            let arms: [(String, prefetch: Bool, defer: Bool)] = [
+                ("baseline", false, false),
+                ("prefetch", true, false),
+                ("deferred eval", false, true),
+                ("prefetch + deferred", true, true),
+                ("baseline (repeat)", false, false),
+            ]
+
+            var reference: [Int32]?
+            for arm in arms {
+                session.isTemporalPrefetchEnabled = arm.prefetch
+                session.bank.deferInstallEval = arm.defer
+                session.resetPrediction()
+                session.resetStatistics()
+
+                let measurement = try generate(
+                    model: model, tokens: steps,
+                    label: "P6 \(bankLabel) \(arm.0)", loadSeconds: loadSeconds,
+                    session: session, promptTokens: promptTokens)
+                report(measurement)
+
+                // Every arm must produce the same tokens. A speedup that
+                // changes the output is not a speedup.
+                if let reference {
+                    XCTAssertEqual(measurement.tokens, reference, "arm \(arm.0) diverged")
+                } else {
+                    reference = measurement.tokens
+                }
+            }
             GPU.clearCache()
         }
     }

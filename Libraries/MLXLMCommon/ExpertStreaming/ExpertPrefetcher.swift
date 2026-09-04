@@ -97,6 +97,10 @@ final class ExpertReadBatch: @unchecked Sendable {
     }
 }
 
+/// A prefetched batch handed to the forward pass, with its rows already in
+/// MLX's hands.
+typealias ExpertPrefetchClaim = (batch: ExpertReadBatch, arrays: [MLXArray])
+
 /// Background reader for the temporal prediction.
 ///
 /// One batch in flight at a time: issued at layer L, consumed at layer L+1. A
@@ -188,7 +192,7 @@ final class ExpertPrefetcher: @unchecked Sendable {
     ///
     /// Returns the batch and its staged arrays; the caller decides which rows
     /// to install.
-    func take(covering wanted: Set<ExpertKey>) -> (batch: ExpertReadBatch, arrays: [MLXArray])? {
+    func take(covering wanted: Set<ExpertKey>) -> ExpertPrefetchClaim? {
         guard let pending = lock.withLock({ claimPending() }) else { return nil }
 
         let start = Date.timeIntervalSinceReferenceDate

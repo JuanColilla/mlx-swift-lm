@@ -68,6 +68,8 @@ final class ExpertStreamingSyncTests: XCTestCase {
         let (model, session) = try loadStreamed(from: directory, bankSlots: 16)
         let tokens = MLXArray([Int32(1)]).reshaped(1, 1)
 
+        // The default is on; this arm is the "before" it replaced.
+        session.bank.deferInstallEval = false
         session.resetStatistics()
         eval(model(tokens, cache: nil))
         let eager = session.syncCounters
@@ -96,7 +98,8 @@ final class ExpertStreamingSyncTests: XCTestCase {
         let directory = try writeCheckpoint()
         let tokens = MLXArray([Int32(1), 2, 3, 4]).reshaped(1, 4)
 
-        let (eagerModel, _) = try loadStreamed(from: directory, bankSlots: 12)
+        let (eagerModel, eagerSession) = try loadStreamed(from: directory, bankSlots: 12)
+        eagerSession.bank.deferInstallEval = false
         let eager = eagerModel(tokens, cache: nil)
         eval(eager)
 

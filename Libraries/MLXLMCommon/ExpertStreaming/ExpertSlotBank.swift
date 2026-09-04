@@ -90,9 +90,16 @@ public final class ExpertSlotBank: @unchecked Sendable {
     /// scatter. Nothing is deferred beyond one layer, so the staging buffers
     /// are still released layer by layer and the prefill peak does not move.
     ///
+    /// Measured on the real 35B checkpoint, 32 decode tokens per arm, all arms
+    /// on one loaded model: 12,22 → 13,72 tok/s with a 1 GiB bank, 14,00 →
+    /// 15,26 with 3 GiB, 10,35 → 12,29 with 256 MiB. Output bit-for-bit
+    /// identical, peak memory unchanged.
+    ///
     /// Toggleable at runtime so an A/B can run against one loaded model
     /// instead of two processes, which is the only way to compare numbers in
     /// this subsystem (see the variance warning in the Phase 1 write-up).
+    ///
+    /// The session sets it from its configuration, where it defaults to on.
     public var deferInstallEval: Bool = false
 
     private var pools: [MLXArray] = []
@@ -181,8 +188,14 @@ public final class ExpertSlotBank: @unchecked Sendable {
             }
         }
 
+        // P6. Claimed on every request, not only when this layer missed:
+        // leaving a batch pending would block every later prediction behind
+        // one nobody wanted, and the mechanism would quietly stall after its
+        // first unclaimed read.
+        let claimed = store.takePrefetched(covering: Set(missing.map(\.key)))
+
         if !missing.isEmpty {
-            try install(missing, into: &slots)
+            try install(missing, claimed: claimed, into: &slots)
         }
         for duplicate in duplicates {
             slots[duplicate.position] = slots[duplicate.resolvedBy]
@@ -197,14 +210,14 @@ public final class ExpertSlotBank: @unchecked Sendable {
 
     private typealias Missing = (position: Int, key: ExpertKey)
 
-    private func install(_ missing: [Missing], into slots: inout [Int]) throws {
+    private func install(
+        _ missing: [Missing], claimed: ExpertPrefetchClaim?, into slots: inout [Int]
+    ) throws {
         var missing = missing
 
-        // P6. Whatever the temporal prediction already read costs no I/O here;
-        // the rest goes down the normal path. Claiming the batch is what frees
-        // the lanes for the next prediction, so it happens even when the
-        // overlap turns out to be empty.
-        if let claimed = store.takePrefetched(covering: Set(missing.map(\.key))) {
+        // Whatever the temporal prediction already read costs no I/O here; the
+        // rest goes down the normal path.
+        if let claimed {
             let fromPrefetch = missing.filter { claimed.batch.row(of: $0.key) != nil }
             missing = missing.filter { claimed.batch.row(of: $0.key) == nil }
             if !fromPrefetch.isEmpty {

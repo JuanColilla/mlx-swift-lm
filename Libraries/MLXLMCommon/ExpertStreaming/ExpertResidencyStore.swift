@@ -96,7 +96,15 @@ public struct ExpertResidencyStatistics: Sendable, Equatable {
     // nobody waited for does not belong in the foreground MB/s, and the waste
     // of a bad prediction has to stay visible.
 
-    /// Experts the temporal prediction asked for.
+    /// Experts the temporal prediction proposed, before the residency filter.
+    ///
+    /// Reported next to `prefetchIssued` because the gap between them *is* the
+    /// answer to whether temporal prefetch can help at a given bank size: what
+    /// the previous token used is worth reading only if it has been evicted
+    /// since.
+    public var prefetchPredicted: Int = 0
+    /// Experts the temporal prediction asked for, after dropping the ones the
+    /// bank already holds.
     public var prefetchIssued: Int = 0
     /// Experts a layer took from a prefetched batch instead of reading.
     public var prefetchServed: Int = 0
@@ -241,10 +249,12 @@ public final class ExpertResidencyStore: @unchecked Sendable {
     }
 
     /// Claim the batch in flight if it covers any of `wanted`.
-    func takePrefetched(covering wanted: Set<ExpertKey>) -> (
-        batch: ExpertReadBatch, arrays: [MLXArray]
-    )? {
+    func takePrefetched(covering wanted: Set<ExpertKey>) -> ExpertPrefetchClaim? {
         prefetcher?.take(covering: wanted)
+    }
+
+    func notePrefetchPredicted(keys: Int) {
+        statisticsLock.withLock { statisticsStorage.prefetchPredicted += keys }
     }
 
     func notePrefetchIssued(keys: Int) {
