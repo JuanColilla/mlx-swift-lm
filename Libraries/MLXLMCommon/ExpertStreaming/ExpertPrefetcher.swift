@@ -172,7 +172,11 @@ final class ExpertPrefetcher: @unchecked Sendable {
         lock.withLock { pending = entry }
         store.notePrefetchIssued(keys: keys.count)
 
-        driver.async { [self] in
+        // The store is captured strongly for the duration of the block, not
+        // through the `unowned` field: if the store started deallocating with
+        // this block still queued, `shutdown()` would be waiting on it while
+        // the block loaded an `unowned` reference to an object in `deinit`.
+        driver.async { [self, store = self.store] in
             do {
                 try store.execute(jobs: entry.batch.jobs, on: lanes, foreground: false)
             } catch {
