@@ -70,16 +70,27 @@ final class Qwen35StreamedSparseMoeBlock: Module, UnaryLayer {
         eval(flatIndices)
         let experts = flatIndices.asArray(UInt32.self).map { Int($0) }
 
+        var sharedY = sharedExpert(x)
+        sharedY = sigmoid(sharedExpertGate(x)) * sharedY
+
         let resolution: StreamedExpertResolution
         do {
             resolution = try session.resolve(
                 layer: layerIndex, tokenCount: tokenCount, experts: experts)
         } catch {
-            // TD: `UnaryLayer` cannot throw, so a read failure mid-generation
-            // has no path back to the caller. Phase 2 needs a cancellation
-            // route through the generation loop; until then failing loudly
-            // beats returning a silently wrong activation.
-            fatalError("expert streaming failed on layer \(layerIndex): \(error)")
+            // TD-054(a). `UnaryLayer` cannot throw, so the failure leaves
+            // sideways: it is latched on the session, whose handler cancels
+            // the generation, and this layer degrades to the shared expert
+            // alone — the routed contribution is zero.
+            //
+            // This is a degradation, not a recovery. The token's activations
+            // are wrong and are already being written into the KV cache, so
+            // the host must discard the turn's cache as well as stop the
+            // stream. Returning something the process survives is what buys
+            // the host the chance to do either; a `fatalError` here used to
+            // take the whole app with it.
+            session.recordFailure(error)
+            return sharedY
         }
 
         let indices = resolution.indices.reshaped(tokenCount, topK)
@@ -91,9 +102,6 @@ final class Qwen35StreamedSparseMoeBlock: Module, UnaryLayer {
             combined = switchMLP.callAndWeightedReduce(
                 flatX, slots: indices, weights: flatScores)
         }
-
-        var sharedY = sharedExpert(x)
-        sharedY = sigmoid(sharedExpertGate(x)) * sharedY
 
         return combined.reshaped(x.shape) + sharedY
     }

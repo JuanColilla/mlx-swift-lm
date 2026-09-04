@@ -59,6 +59,10 @@ public final class ExpertStreamingSession: @unchecked Sendable {
 
     public var index: ExpertOffsetIndex { store.index }
 
+    private let failureLock = NSLock()
+    private var failureStorage: ExpertStreamingFailure?
+    private var failureHandler: (@Sendable (ExpertStreamingFailure) -> Void)?
+
     public convenience init(
         modelDirectory: URL, configuration: ExpertStreamingConfiguration
     ) throws {
@@ -97,6 +101,53 @@ public final class ExpertStreamingSession: @unchecked Sendable {
     /// memory-pressure ladder wants: the model survives, the hit rate drops.
     public func resizeBank(toCapacityBytes bytes: Int) {
         bank.resize(to: bytes)
+    }
+
+    // MARK: - Failure (TD-054(a))
+
+    /// The failure that took this session out, or `nil` while it is healthy.
+    ///
+    /// Latched: a session never recovers. The model has to be unloaded.
+    public var failure: ExpertStreamingFailure? {
+        failureLock.withLock { failureStorage }
+    }
+
+    /// Register the host's cancellation route. Called at most once, on the
+    /// forward pass's own thread, from inside `callAsFunction`.
+    ///
+    /// The handler must cancel the generation **and discard the turn's KV
+    /// cache**: the degraded token is already in it. See the note at the top
+    /// of `ExpertStreamingFailure.swift`.
+    ///
+    /// Registering after the session already failed calls the handler
+    /// immediately, so a host that installs it late does not miss the event.
+    public func onFailure(_ handler: @escaping @Sendable (ExpertStreamingFailure) -> Void) {
+        let alreadyFailed: ExpertStreamingFailure? = failureLock.withLock {
+            if let failure = failureStorage { return failure }
+            failureHandler = handler
+            return nil
+        }
+        if let alreadyFailed { handler(alreadyFailed) }
+    }
+
+    /// Latch a failure and notify the host exactly once.
+    ///
+    /// Returns the recorded failure, which is the *first* one seen — a later
+    /// error on the same session does not overwrite the diagnosis.
+    @discardableResult
+    public func recordFailure(_ error: Error) -> ExpertStreamingFailure {
+        let failure = ExpertStreamingFailure(error)
+        let handler: (@Sendable (ExpertStreamingFailure) -> Void)? = failureLock.withLock {
+            guard failureStorage == nil else { return nil }
+            failureStorage = failure
+            let handler = failureHandler
+            failureHandler = nil
+            return handler
+        }
+        // Outside the lock: the host's handler reaches into its own actors and
+        // must not be able to deadlock against a `failure` read from here.
+        handler?(failure)
+        return failureLock.withLock { failureStorage ?? failure }
     }
 }
 

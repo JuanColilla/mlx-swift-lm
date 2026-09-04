@@ -144,6 +144,11 @@ extension ExpertStreamingSession {
     public func resolve(
         layer: Int, tokenCount: Int, experts: [Int]
     ) throws -> StreamedExpertResolution {
+        // A failed session issues no more reads. Without this the remaining
+        // thirty-nine layers of the token would each hammer the broken
+        // descriptor before the host's handler got a turn.
+        if let failure = self.failure { throw failure }
+
         let unique = Array(Set(experts)).sorted()
         let isDecode = tokenCount == 1
         let useBank = unique.count <= bank.slotCount && (isDecode || configuration.admitOnSweep)
