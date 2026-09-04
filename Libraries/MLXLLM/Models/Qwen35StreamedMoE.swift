@@ -68,6 +68,7 @@ final class Qwen35StreamedSparseMoeBlock: Module, UnaryLayer {
         // what lets the bank's scatter donate its buffer instead of copying
         // the whole bank.
         eval(flatIndices)
+        session.noteRouterEval()
         let experts = flatIndices.asArray(UInt32.self).map { Int($0) }
 
         var sharedY = sharedExpert(x)

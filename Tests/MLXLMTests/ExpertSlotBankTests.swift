@@ -233,8 +233,13 @@ final class ExpertSlotBankTests: XCTestCase {
             ProcessInfo.processInfo.environment["MLX_R56_BENCHMARKS"] == "1",
             "opt-in benchmark")
 
-        func installSeconds(slots: Int) throws -> Double {
+        /// With `deferred`, `installSeconds` would time a lazy operation and
+        /// report nearly zero, so the clock is taken here instead and the
+        /// scatter is forced inside the window. Otherwise the two arms would
+        /// not be measuring the same thing.
+        func installSeconds(slots: Int, deferred: Bool = false) throws -> Double {
             let (bank, _) = try makeBank(experts: 256, layers: 1, slots: slots)
+            bank.deferInstallEval = deferred
             var expert = 0
             // Warm-up, then 20 installs of eight fresh experts each.
             for _ in 0 ..< 2 {
@@ -243,12 +248,15 @@ final class ExpertSlotBankTests: XCTestCase {
                 expert += 8
             }
             bank.resetStatistics()
+            let start = Date.timeIntervalSinceReferenceDate
             for _ in 0 ..< 20 {
                 _ = try bank.ensure(
                     keys: (0 ..< 8).map { ExpertKey(layer: 0, expert: ($0 + expert) % 256) })
                 expert += 8
+                if deferred { eval(ExpertPiece.all.map { bank.pool($0) }) }
             }
-            return bank.statistics.installSeconds / 20
+            let elapsed = Date.timeIntervalSinceReferenceDate - start
+            return (deferred ? elapsed : bank.statistics.installSeconds) / 20
         }
 
         let small = try installSeconds(slots: 128)
@@ -267,6 +275,30 @@ final class ExpertSlotBankTests: XCTestCase {
             installing eight experts got \(String(format: "%.1f", ratio))x more expensive \
             on a 32x larger bank: the scatter is copying the bank instead of \
             donating it
+            """)
+
+        // The same question again with the install's `eval` deferred. The risk
+        // of deferring is precisely here: if holding the pending scatter costs
+        // MLX the donation, every install rewrites the whole bank and the cost
+        // starts scaling with the bank size — silently, with no error and a
+        // doubled transient.
+        let smallDeferred = try installSeconds(slots: 128, deferred: true)
+        let largeDeferred = try installSeconds(slots: 4096, deferred: true)
+        let deferredRatio = largeDeferred / smallDeferred
+        print(
+            """
+            P3 install cost (deferred eval): 128 slots \
+            \(String(format: "%.3f", smallDeferred * 1000)) ms/install, 4096 slots \
+            \(String(format: "%.3f", largeDeferred * 1000)) ms/install, ratio \
+            \(String(format: "%.2f", deferredRatio))x
+            """)
+
+        XCTAssertLessThan(
+            deferredRatio, 4.0,
+            """
+            with the install eval deferred the cost scaled \
+            \(String(format: "%.1f", deferredRatio))x with a 32x larger bank: \
+            deferring cost MLX the buffer donation
             """)
     }
 }

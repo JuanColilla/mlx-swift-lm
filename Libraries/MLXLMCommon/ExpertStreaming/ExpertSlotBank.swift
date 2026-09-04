@@ -17,7 +17,16 @@ public struct ExpertSlotBankStatistics: Sendable, Equatable {
     public var hits: Int = 0
     public var misses: Int = 0
     public var evictions: Int = 0
+    /// Wall time of the install: the `pread` batch plus the scatter.
+    ///
+    /// With `deferInstallEval` on, the scatter is only *recorded* inside this
+    /// window and executed later, so the number stops being comparable with
+    /// the eager one. It measures the read in that mode, nothing more.
     public var installSeconds: Double = 0
+    /// `eval` calls the install path forced. One of the two synchronization
+    /// sources of a streamed token; the other is the router read, counted on
+    /// the session. Zero when `deferInstallEval` is on.
+    public var installEvals: Int = 0
 
     public var hitRate: Double {
         let total = hits + misses
@@ -67,6 +76,24 @@ public final class ExpertSlotBank: @unchecked Sendable {
 
     public let store: ExpertResidencyStore
     public private(set) var configuration: Configuration
+
+    /// Skip the `eval` that closes an install and let the next mandatory
+    /// synchronization absorb the scatter.
+    ///
+    /// The measurement that justifies the switch: 90% of what a streamed token
+    /// costs over a resident one is CPU↔GPU synchronization, not I/O. A
+    /// streamed token pays two per MoE layer — the router's `asArray`, which
+    /// is unavoidable because a `pread` cannot be issued before the routing
+    /// choice is on the host, and this one. Dropping this one halves them,
+    /// because the scatter is evaluated anyway at the next layer's router
+    /// read: that read depends on this layer's output, which depends on the
+    /// scatter. Nothing is deferred beyond one layer, so the staging buffers
+    /// are still released layer by layer and the prefill peak does not move.
+    ///
+    /// Toggleable at runtime so an A/B can run against one loaded model
+    /// instead of two processes, which is the only way to compare numbers in
+    /// this subsystem (see the variance warning in the Phase 1 write-up).
+    public var deferInstallEval: Bool = false
 
     private var pools: [MLXArray] = []
     private var slotOfKey: [ExpertKey: Int] = [:]
@@ -184,10 +211,14 @@ public final class ExpertSlotBank: @unchecked Sendable {
             for piece in ExpertPiece.all {
                 pools[piece.slot][indices] = staged[piece.slot]
             }
-            // Evaluating here is what lets MLX donate the pool buffer to the
-            // scatter instead of copying the whole bank, and it releases the
-            // staging buffers as soon as they are consumed.
-            eval(pools)
+            var evals = 0
+            if !deferInstallEval {
+                // Evaluating here is what lets MLX donate the pool buffer to
+                // the scatter instead of copying the whole bank, and it
+                // releases the staging buffers as soon as they are consumed.
+                eval(pools)
+                evals = 1
+            }
             let elapsed = Date.timeIntervalSinceReferenceDate - start
 
             for (entry, slot) in zip(chunk, targets) {
@@ -196,7 +227,10 @@ public final class ExpertSlotBank: @unchecked Sendable {
                 slotOfKey[entry.key] = slot
                 referenced[slot] = true
             }
-            lock.withLock { statisticsStorage.installSeconds += elapsed }
+            lock.withLock {
+                statisticsStorage.installSeconds += elapsed
+                statisticsStorage.installEvals += evals
+            }
         }
     }
 
