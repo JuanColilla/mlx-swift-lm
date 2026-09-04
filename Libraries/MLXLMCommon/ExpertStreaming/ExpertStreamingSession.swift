@@ -152,7 +152,12 @@ public final class ExpertStreamingSession: @unchecked Sendable {
 
     /// Encourage the bank down a step. This is the "invisible release" a
     /// memory-pressure ladder wants: the model survives, the hit rate drops.
-    public func resizeBank(toCapacityBytes bytes: Int) {
+    ///
+    /// Returns `false` if a forward pass held the bank and nothing was
+    /// resized; the caller retries between tokens. See `ExpertSlotBank.resize`
+    /// for why this refuses instead of trapping.
+    @discardableResult
+    public func resizeBank(toCapacityBytes bytes: Int) -> Bool {
         bank.resize(to: bytes)
     }
 
@@ -250,10 +255,15 @@ public final class ExpertStreamingSession: @unchecked Sendable {
 
     /// The failure that took this session out, or `nil` while it is healthy.
     ///
-    /// Latched: a session never recovers. The model has to be unloaded.
-    public var failure: ExpertStreamingFailure? {
+    /// Latched and read under a lock: a session never recovers, so the host
+    /// can poll this between tokens and abort the generation cleanly without
+    /// having to register a callback. The model then has to be unloaded.
+    public var lastFailure: ExpertStreamingFailure? {
         failureLock.withLock { failureStorage }
     }
+
+    @available(*, deprecated, renamed: "lastFailure")
+    public var failure: ExpertStreamingFailure? { lastFailure }
 
     /// Register the host's cancellation route. Called at most once, on the
     /// forward pass's own thread, from inside `callAsFunction`.
@@ -313,13 +323,56 @@ public enum ExpertStreaming {
     public static func withSession<R>(
         _ session: ExpertStreamingSession, _ body: () throws -> R
     ) rethrows -> R {
+        activate(session)
+        defer { deactivate() }
+        return try body()
+    }
+
+    /// The async form, for a load that has to `await`.
+    ///
+    /// Separate from the synchronous overload rather than replacing it: the
+    /// activation is a *global*, not a task-local, so nothing about crossing a
+    /// suspension point is free. See `activate(_:)` for what the caller owes.
+    public static func withSession<R>(
+        _ session: ExpertStreamingSession, _ body: () async throws -> R
+    ) async rethrows -> R {
+        activate(session)
+        defer { deactivate() }
+        return try await body()
+    }
+
+    /// Make `session` the one a model constructor will pick up, until
+    /// `deactivate()`.
+    ///
+    /// For callers that cannot be expressed as a closure — a factory whose
+    /// load is `async throws` and returns a container, typically. **Pair it
+    /// with `defer { ExpertStreaming.deactivate() }` at the call site**: a
+    /// load that throws between the two would otherwise leave the activation
+    /// standing, and the next model built in the process would silently be
+    /// constructed against a session that belongs to a load that failed.
+    ///
+    /// Two invariants the caller owns, because this is a process-wide global
+    /// and not a task-local value:
+    ///
+    ///  * **One load at a time.** Two concurrent loads would interleave across
+    ///    their suspension points and each could build against the other's
+    ///    session. This is INV-MODEL-01, which the host already enforces; the
+    ///    precondition below turns a violation into a crash at the load rather
+    ///    than a wrong model at generation time.
+    ///  * **Same process, any thread.** The storage is lock-protected, so
+    ///    reading it from the construction path is safe wherever that runs.
+    public static func activate(_ session: ExpertStreamingSession) {
         lock.withLock {
             precondition(
                 Self.session == nil,
                 "an expert streaming session is already active; loads must be serialized")
             Self.session = session
         }
-        defer { lock.withLock { Self.session = nil } }
-        return try body()
+    }
+
+    /// End the activation. Idempotent, so a `defer` that runs after an early
+    /// return or a thrown error is always correct.
+    public static func deactivate() {
+        lock.withLock { session = nil }
     }
 }

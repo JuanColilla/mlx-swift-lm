@@ -131,4 +131,49 @@ final class ExpertStreamingReentrancyTests: XCTestCase {
         XCTAssertEqual(try bank.ensure(keys: keys), slots)
         XCTAssertEqual(bank.statistics.misses, 0)
     }
+
+    // MARK: - Resize
+
+    /// `resize` tears down `pools`, `slotOfKey` and `keyOfSlot` and calls
+    /// `GPU.clearCache()`. Racing that against an `ensure` is memory
+    /// corruption, not a stale read — and the intended caller is a
+    /// memory-pressure ladder on its own queue, which is exactly a caller that
+    /// cannot see the forward pass.
+    func testResizeIsRefusedWhileAForwardHoldsTheBank() throws {
+        let bank = try makeBank(slots: 16)
+        let keys = (0 ..< 8).map { ExpertKey(layer: 0, expert: $0) }
+        let before = bank.slotCount
+
+        var refused: Bool?
+        bank.store.reentrancyProbe = {
+            refused = bank.resize(to: 4 * bank.store.index.bytesPerExpert) == false
+        }
+        _ = try bank.ensure(keys: keys)
+        bank.store.reentrancyProbe = nil
+
+        XCTAssertEqual(refused, true, "a resize during a forward pass must be refused")
+        XCTAssertEqual(bank.slotCount, before, "the refused resize must not have torn anything down")
+
+        // And it works once the pass is over.
+        XCTAssertTrue(bank.resize(to: 4 * bank.store.index.bytesPerExpert))
+        XCTAssertEqual(bank.slotCount, 4)
+    }
+
+    /// Refusing must be a no-op, not a partial teardown: the bank still serves
+    /// the experts it held.
+    func testARefusedResizeLeavesTheBankUsable() throws {
+        let bank = try makeBank(slots: 16)
+        let keys = (0 ..< 8).map { ExpertKey(layer: 0, expert: $0) }
+        let slots = try bank.ensure(keys: keys)
+
+        bank.store.reentrancyProbe = {
+            _ = bank.resize(to: 2 * bank.store.index.bytesPerExpert)
+        }
+        _ = try bank.ensure(keys: (8 ..< 16).map { ExpertKey(layer: 0, expert: $0) })
+        bank.store.reentrancyProbe = nil
+
+        bank.resetStatistics()
+        XCTAssertEqual(try bank.ensure(keys: keys), slots)
+        XCTAssertEqual(bank.statistics.misses, 0)
+    }
 }

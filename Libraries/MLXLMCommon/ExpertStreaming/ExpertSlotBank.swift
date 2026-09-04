@@ -328,16 +328,44 @@ public final class ExpertSlotBank: @unchecked Sendable {
     /// before allocating and restarts cold on purpose: under memory pressure
     /// the point is to give memory back immediately, and the alternative
     /// would need both sizes live at once.
-    public func resize(to capacityBytes: Int) {
+    ///
+    /// **Invariant: no forward pass may be in flight.** This tears down
+    /// `pools`, `slotOfKey` and `keyOfSlot` — a Swift array and two
+    /// dictionaries — and calls `GPU.clearCache()`. A concurrent `ensure`
+    /// mutating those same containers is memory corruption, not a stale read.
+    /// The intended caller is a memory-pressure ladder on its own queue, which
+    /// is precisely a caller that cannot see the forward pass, so the bank
+    /// checks rather than trusting.
+    ///
+    /// Returns `false` and does nothing when a forward pass holds the bank.
+    /// Refusing rather than trapping is deliberate: the moment this races is
+    /// memory pressure, and killing the app to avoid a resize is strictly
+    /// worse than not resizing. The caller retries between tokens.
+    @discardableResult
+    public func resize(to capacityBytes: Int) -> Bool {
+        do {
+            try singleFlight.enter(orThrow: ExpertSlotBankError.concurrentForward)
+        } catch {
+            return false
+        }
+        defer { singleFlight.leave() }
+
         let target = Self.slotCount(for: capacityBytes, store: store)
         guard target != slotCount else {
             configuration.capacityBytes = capacityBytes
-            return
+            return true
         }
 
         // A batch in flight was planned against a residency map that is about
         // to change; a shrink throws the whole map away.
         store.cancelPrefetch()
+
+        // With `deferInstallEval` the last install may still be an unevaluated
+        // scatter over these pools. MLX retains its inputs, so dropping the
+        // references here is safe on its own — but evaluating first means the
+        // teardown releases buffers instead of stranding them behind a graph
+        // node until the next unrelated `eval`.
+        eval(pools)
 
         if target > slotCount {
             grow(to: target)
@@ -345,6 +373,7 @@ public final class ExpertSlotBank: @unchecked Sendable {
             shrink(to: target)
         }
         configuration.capacityBytes = capacityBytes
+        return true
     }
 
     private func grow(to target: Int) {

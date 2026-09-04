@@ -79,7 +79,7 @@ final class ExpertStreamingFailureTests: XCTestCase {
 
         let healthy = model(tokens, cache: nil)
         eval(healthy)
-        XCTAssertNil(session.failure, "the session starts healthy")
+        XCTAssertNil(session.lastFailure, "the session starts healthy")
 
         let reported = FailureRecorder()
         session.onFailure { reported.record($0) }
@@ -93,7 +93,7 @@ final class ExpertStreamingFailureTests: XCTestCase {
         let degraded = model(tokens, cache: nil)
         eval(degraded)
 
-        let failure = try XCTUnwrap(session.failure, "the failure must be published")
+        let failure = try XCTUnwrap(session.lastFailure, "the failure must be published")
         guard case .shortRead = failure else {
             return XCTFail("expected a shortRead, got \(failure)")
         }
@@ -117,7 +117,7 @@ final class ExpertStreamingFailureTests: XCTestCase {
         try truncateCheckpoint(directory)
         session.resizeBank(toCapacityBytes: 12 * session.index.bytesPerExpert)
         eval(model(tokens, cache: nil))
-        XCTAssertNotNil(session.failure)
+        XCTAssertNotNil(session.lastFailure)
 
         session.store.resetStatistics()
         eval(model(tokens, cache: nil))
@@ -140,7 +140,7 @@ final class ExpertStreamingFailureTests: XCTestCase {
         let reported = FailureRecorder()
         session.onFailure { reported.record($0) }
         XCTAssertEqual(reported.count, 1)
-        XCTAssertEqual(reported.last, session.failure)
+        XCTAssertEqual(reported.last, session.lastFailure)
     }
 
     /// The diagnosis is the first failure, not the last: a later error on the
@@ -152,7 +152,7 @@ final class ExpertStreamingFailureTests: XCTestCase {
         session.recordFailure(ExpertStreamingFailure.allocationFailed(bytes: 1 << 20))
         session.recordFailure(ExpertStreamingFailure.concurrentForward)
 
-        XCTAssertEqual(session.failure, .allocationFailed(bytes: 1 << 20))
+        XCTAssertEqual(session.lastFailure, .allocationFailed(bytes: 1 << 20))
     }
 
     /// The mapping from the subsystem's own errors, which is what the host

@@ -144,11 +144,11 @@ final class ExpertPrefetchTests: XCTestCase {
 
         session.store.prefetch(keys: [ExpertKey(layer: 0, expert: 9_999)])
         XCTAssertEqual(session.store.statistics.prefetchFailures, 1)
-        XCTAssertNil(session.failure)
+        XCTAssertNil(session.lastFailure)
 
         // And the model still runs.
         XCTAssertEqual(decode(model, steps: 2).count, 2)
-        XCTAssertNil(session.failure)
+        XCTAssertNil(session.lastFailure)
     }
 
     /// Shrinking the bank invalidates the residency map the prediction was
@@ -162,6 +162,6 @@ final class ExpertPrefetchTests: XCTestCase {
         session.resizeBank(toCapacityBytes: 8 * session.index.bytesPerExpert)
         session.resetPrediction()
         XCTAssertEqual(decode(model, steps: 2).count, 2)
-        XCTAssertNil(session.failure)
+        XCTAssertNil(session.lastFailure)
     }
 }

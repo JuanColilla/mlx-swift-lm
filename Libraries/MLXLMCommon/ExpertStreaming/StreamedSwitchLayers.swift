@@ -147,7 +147,7 @@ extension ExpertStreamingSession {
         // A failed session issues no more reads. Without this the remaining
         // thirty-nine layers of the token would each hammer the broken
         // descriptor before the host's handler got a turn.
-        if let failure = self.failure { throw failure }
+        if let failure = self.lastFailure { throw failure }
 
         let unique = Array(Set(experts)).sorted()
         let isDecode = tokenCount == 1
