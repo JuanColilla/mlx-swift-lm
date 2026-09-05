@@ -86,13 +86,10 @@ El criterio de integración vive en
 el upstream es la base arquitectónica y lo propio se porta encima, nunca al
 revés. Léelo antes de resolver conflictos con el oficial.
 
-**Única excepción vigente:** `wip/tensor-parallel`, empujada a `fork` (no solo
-tag local como las antiguas `archive/<rama>`). Aparca la investigación de
-tensor-parallel hasta después de la 2.1.0 — ver
-[`knowledge/2026-09-01-tensor-parallel-desorden.md`](knowledge/2026-09-01-tensor-parallel-desorden.md)
-(el documento solo existe en esa rama, no en `develop`). No fusionar a
-`develop` sin retomar el trabajo primero; no borrarla sin confirmar con el
-usuario.
+**Investigación aparcada:** tensor-parallel, hasta después de la 2.1.0 — ver
+[`knowledge/2026-09-01-tensor-parallel-desorden.md`](knowledge/2026-09-01-tensor-parallel-desorden.md).
+La rama `wip/tensor-parallel` que la guardaba solo contenía ese documento y se
+integró en `develop` el 2026-09-05; ya no existe ni en local ni en `fork`.
 
 ## Flujo de trabajo habitual
 
